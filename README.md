@@ -1,4 +1,3 @@
-```markdown
 # Windows Voice Assistant
 
 A Windows voice assistant built on [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx). Local-first, with pluggable local (Ollama) and remote (OpenAI-compatible) LLM backends. Supports speaker verification, wake word detection, and desktop automation.
@@ -381,4 +380,3 @@ Third-party dependencies and model weights are governed by their own licenses.
 - [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)
 - [Ollama](https://ollama.com/)
 - [3D-Speaker](https://github.com/modelscope/3D-Speaker)
-```
