@@ -1,0 +1,84 @@
+# Windows Voice Assistant Configuration
+# All paths relative to project root unless absolute
+
+audio:
+  input_device: "default"      # Audio input device (default = system default)
+  sample_rate: 16000           # Sample rate for all audio processing
+  half_duplex: true            # Pause ASR/VAD during TTS playback
+  kws_during_tts: true         # Keep KWS active during TTS for barge-in
+
+kws:
+  model: "models/kws/zipformer-zh-en"
+  keywords:
+    - "assistant"
+    - "hey assistant"
+  threshold: 0.25              # Detection threshold (0.0-1.0)
+
+vad:
+  model: "models/vad/silero"
+  min_silence_ms: 500          # Minimum silence to end segment
+  min_speech_ms: 250           # Minimum speech to start segment
+
+asr:
+  model: "models/asr/sense-voice"
+  language: "auto"             # auto, zh, en, ja, ko, yue
+
+sv:
+  model: "models/sv/campplus"
+  enabled: true
+  threshold_high: 0.60         # Provisional; calibrated after enrollment
+  threshold_low: 0.40          # Provisional; calibrated after enrollment
+  adaptive_update: true        # Update embeddings on successful verification
+  update_weight: 0.05          # EMA weight for adaptive update
+  anchor_check_days: 30        # Days between anchor checks
+
+llm:
+  local:
+    base_url: "http://localhost:11434/v1"
+    api_key: "ollama"
+    model: "qwen2.5:7b-instruct"
+    confidence_threshold: 0.70  # Escalate to cloud if below this
+
+  remote:
+    enabled: true
+    base_url: "https://your-api-endpoint/v1"
+    api_key: "${REMOTE_API_KEY}"  # Expanded from environment variable
+    model: "gpt-4o"
+    guest_allowed: false        # Guests cannot trigger cloud calls
+
+tts:
+  model: "models/tts/piper-zh"
+  voice: "default"             # default or guest
+  guest_voice: "guest"
+
+tools:
+  whitelist:
+    - "open_app"
+    - "close_app"
+    - "set_volume"
+    - "media_control"
+    - "search_web"
+    - "read_file"
+    - "write_file"
+    - "run_script"
+  guest_denied:
+    - "read_file"
+    - "write_file"
+    - "run_script"
+  destructive:
+    - "write_file"
+    - "run_script"
+  confirm_required: true       # Require double confirmation for destructive tools
+
+snapshot:
+  enabled: true
+  path: "snapshots/"
+  max_size_gb: 10
+
+context:
+  enabled: true
+  scope: "session"             # cleared on sleep
+  max_turns: 10
+
+storage:
+  max_total_gb: 10             # Total disk quota (models + logs + snapshots)

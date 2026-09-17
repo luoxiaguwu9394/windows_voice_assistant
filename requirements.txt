@@ -1,0 +1,37 @@
+# Windows Voice Assistant - Requirements
+
+# Core dependencies
+sherpa-onnx>=1.10.0
+numpy>=1.24.0
+pydantic>=2.5.0
+pyyaml>=6.0
+watchdog>=3.0.0
+structlog>=24.0.0
+orjson>=3.9.0
+httpx>=0.25.0
+tqdm>=4.66.0
+requests>=2.31.0
+
+# Audio I/O
+sounddevice>=0.4.6
+scipy>=1.11.0
+
+# Windows automation
+pywin32>=306
+pyautogui>=0.9.54
+
+# UI (optional)
+PySide6>=6.6.0
+
+# Metrics (optional)
+prometheus-client>=0.19.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+
+# Type checking
+mypy>=1.7.0
+types-requests>=2.31.0
+types-PyYAML>=6.0.0

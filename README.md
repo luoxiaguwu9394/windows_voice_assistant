@@ -113,11 +113,17 @@ cd windows_voice_assistant
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+# Or with dev dependencies:
+pip install -e .[dev]
 ```
 
 ### Download models
 
 ```powershell
+# Download all models
+python scripts/download_models.py --all
+
+# Or download individually
 python scripts/download_models.py --kws zipformer-zh-en
 python scripts/download_models.py --vad silero
 python scripts/download_models.py --asr sense-voice
@@ -127,11 +133,17 @@ python scripts/download_models.py --sv campplus
 
 Models are downloaded to `models/` by default; paths are configurable.
 
-### Local LLM
+### Local LLM (Ollama)
 
 ```powershell
 ollama pull qwen2.5:7b-instruct
 ollama serve
+```
+
+For constrained decoding (required for intent classifier), run llama.cpp server with GBNF grammar:
+```powershell
+# Build llama.cpp, then:
+llama-server -m qwen2.5-7b-instruct.gguf -mgf grammar.gbnf --port 8080
 ```
 
 ### Speaker enrollment
@@ -147,7 +159,30 @@ Thresholds `T_high` and `T_low` are computed automatically. If `min_intra < 0.4`
 ### Run
 
 ```powershell
+# With real audio (requires models)
 python -m winvoice
+
+# With stub audio (no sherpa-onnx/models needed - for development)
+python -m winvoice --stub-audio
+
+# Test pipeline initialization only
+python -m winvoice --test-pipeline
+```
+
+### Development commands
+
+```powershell
+# Run unit tests
+pytest tests/unit -v
+
+# Run integration tests (requires models)
+pytest tests/integration -v
+
+# Type checking
+mypy winvoice
+
+# Lint
+ruff check winvoice
 ```
 
 ---
@@ -339,6 +374,50 @@ The following are **not yet decided**. They are documented here so they aren't s
 | No AEC | Echo is avoided via half-duplex; full-duplex is not implemented |
 | Local LLM | Below 7B, tool-calling accuracy is insufficient; do not downgrade |
 | Windows only | Execution layer depends on pywin32 / pyautogui |
+
+---
+
+## Design Decisions (from Grilling Session)
+
+### Architecture
+- **MVP: Single-process asyncio** — Prototype with `asyncio` + `ThreadPoolExecutor` first; split to 4 processes (Main/Audio/LLM/Execution) only if audio jitter > 20ms or GIL contention measured
+- **IPC (post-prototype)**: Audio frames via `shared_memory.SharedMemory` ring buffer (8 slots, 10ms @ 16kHz); control plane via ZeroMQ `PUSH/PULL` + `PUB/SUB` with `orjson` + Pydantic schemas (`schema_version` for compat)
+
+### Intent Routing
+- **Three-tier waterfall**: Rules (regex, 0 latency) → Local LLM (Qwen2.5 7B, constrained decoding via llama.cpp GBNF) → Cloud LLM (OpenAI-compatible)
+- **Constrained decoding**: llama.cpp server with GBNF grammar; HTTP API guarantees valid JSON; failure retry ≤2 times or >2s → escalate to cloud
+- **Confidence threshold 0.70**: To be calibrated with ≥200 real queries in Roadmap Step 1; small model outputs only intent+args, never tool selection
+
+### Speaker Verification
+- **Thresholds configurable**: `T_high = min_intra - 0.05`, `T_low = max_inter + 0.05` (offsets configurable)
+- **Enrollment UI**: Histogram + suggested band + manual sliders → writes final `threshold_high/low` to config
+- **Adaptive update**: EMA with `update_weight=0.05` on successful verification; anchor check every 30 days
+
+### Tool System
+- **Irreversible ops blocked**: Registry edits, software uninstall, system config changes rejected via `IRREVERSIBLE_PATTERNS` regex scan
+- **`run_script`**: Content scanned pre-execution; matches → reject + audit log
+- **`write_file`**: Restricted to `C:\Users\<user>\` subtree
+- **Destructive flow**: Double confirmation → snapshot declared `modified_paths` → execute → auto-restore on failure
+
+### Audio Pipeline
+- **KWS barge-in**: Immediate TTS interrupt on KWS trigger; `tts_stream.stop()` + silence frames to drain DMA; no cooldown
+- **Half-duplex**: ASR/VAD paused during TTS; KWS stays active
+
+### LLM Backends
+- **Local whitelist**: Only `qwen2.5:7b-instruct`, `qwen2.5:14b-instruct`, etc. (configurable); <7B → direct cloud fallback
+- **Cloud fallback**: Dual trigger — local unavailable ∨ confidence < threshold → cloud; cloud also fails → "暂时无法处理"
+
+### Configuration & Observability
+- **Env var expansion**: `${VAR}` via `os.path.expandvars`; missing → explicit error with field path
+- **Hot-reload**: `watchdog` → ZeroMQ PUB/SUB; allowlist: `llm.local.confidence_threshold`, `tools.whitelist`, `tts.voice`, etc.
+- **Structured logging**: `structlog` + JSON Lines, `trace_id` propagated end-to-end (KWS trigger → UUID)
+- **Metrics**: Prometheus pushgateway (Main `/metrics` + children push every 10s)
+- **Model integrity**: Startup quick `size+mtime` check; mismatch → full SHA256 → corrupt backup to `.corrupt/` + modal "Auto-repair" dialog
+
+### Testing Strategy
+- **Unit**: Pure logic (intent, tool validation, SV scoring) — `pytest -m unit` (CI required, <30s)
+- **Integration**: Audio pipeline with synthetic WAV → `pytest -m integration` (requires `models/`)
+- **E2E**: Real mic/models/network — `pytest -m manual` (local only)
 
 ---
 

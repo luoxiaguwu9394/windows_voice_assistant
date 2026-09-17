@@ -1,0 +1,91 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "winvoice"
+version = "0.1.0-dev"
+description = "Windows Voice Assistant - Local-first voice assistant with sherpa-onnx"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Windows Voice Assistant Team"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "sherpa-onnx>=1.10.0",
+    "numpy>=1.24.0",
+    "pydantic>=2.5.0",
+    "pyyaml>=6.0",
+    "watchdog>=3.0.0",
+    "structlog>=24.0.0",
+    "orjson>=3.9.0",
+    "httpx>=0.25.0",
+    "tqdm>=4.66.0",
+    "requests>=2.31.0",
+    "sounddevice>=0.4.6",
+    "scipy>=1.11.0",
+    "pywin32>=306",
+    "pyautogui>=0.9.54",
+]
+
+[project.optional-dependencies]
+ui = ["PySide6>=6.6.0"]
+metrics = ["prometheus-client>=0.19.0"]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    "mypy>=1.7.0",
+    "types-requests>=2.31.0",
+    "types-PyYAML>=6.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+winvoice = "winvoice.__main__:main"
+download-models = "scripts.download_models:main"
+analyze-sv = "scripts.analyze_sv_scores:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["winvoice*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests",
+    "manual: Manual E2E tests",
+]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = ["E", "F", "I", "W", "UP", "B", "C4", "SIM", "T20"]
+ignore = ["E501", "SIM103"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
