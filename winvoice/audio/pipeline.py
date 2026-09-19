@@ -1,36 +1,48 @@
 """
-Audio Pipeline Orchestrator.
+Audio Pipeline Orchestrator (single-process asyncio).
 
-Single-process async pipeline: KWS → SV → VAD → ASR → Intent → LLM → Tool → TTS.
-Manages half-duplex (ASR paused during TTS) and KWS barge-in.
+    KWS -> SV verify -> VAD segment -> ASR -> intent routing -> tools -> TTS
+
+Half-duplex: ASR/VAD are paused while TTS plays, but KWS stays fed so the
+wake word can interrupt playback (barge-in).
+
+Audio arrives through `push_audio()` (called from the microphone callback)
+and is consumed by `run()` in a cooperative loop.
 """
 
 from __future__ import annotations
 
 import asyncio
-import uuid
+import inspect
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import AsyncIterator, Callable, Deque, List, Optional
+from typing import Any, Callable, Deque, List, Optional
 
 import numpy as np
 
 from winvoice.config import get_config
-from winvoice.logging import get_logger, set_trace_context, clear_trace_context, bind_trace_context
 from winvoice.contracts import (
-    AudioFrame, KwsTriggered, SvResult, VadSegment, AsrResult,
-    IntentResult, ToolCall, ToolResult, TtsRequest, TtsChunk,
-    InterruptTTS, SystemState, SystemStateName, ProcessName,
+    IntentResult,
+    SystemState,
+    SystemStateName,
+    ToolCall,
+    ToolResult,
+    TtsRequest,
 )
-from .kws import create_kws_engine, KwsEngine
-from .vad import create_vad_engine, VadEngine
-from .asr import create_asr_engine, AsrEngine
-from .sv import create_sv_engine, SvEngine
-from .tts import create_tts_engine, TtsEngine
+from winvoice.logging import clear_trace_context, get_logger, set_trace_context
+from .asr import AsrEngine, AsrResult, create_asr_engine
+from .kws import KwsEngine, KwsResult, create_kws_engine
+from .sv import SvEngine, SvResult, create_sv_engine
+from .tts import TtsChunk, TtsEngine, create_tts_engine
+from .vad import VadEngine, VadSegment, create_vad_engine
 
 logger = get_logger(__name__)
+
+# How many recent 10 ms frames (~1 s) to keep for speaker verification.
+SV_WINDOW_FRAMES = 100
 
 
 class PipelineState(Enum):
@@ -44,38 +56,43 @@ class PipelineState(Enum):
 
 @dataclass
 class PipelineContext:
-    """Carries state across pipeline stages for one request."""
+    """State carried across the stages of one utterance."""
+
     trace_id: str
     state: PipelineState = PipelineState.IDLE
     speaker_id: str = "me"
     sv_result: Optional[SvResult] = None
-    vad_frames: List[AudioFrame] = field(default_factory=list)
     asr_text: str = ""
     intent: Optional[IntentResult] = None
     tool_calls: List[ToolCall] = field(default_factory=list)
     tts_text: str = ""
 
 
-class AudioPipeline:
-    """
-    Main audio processing pipeline.
+async def _maybe_await(value: Any) -> Any:
+    """Await `value` if it is awaitable, so sync and async callbacks both work."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
-    Coordinates KWS, SV, VAD, ASR, and TTS with half-duplex and barge-in.
-    """
+
+class AudioPipeline:
+    """Coordinates the audio engines for one voice-assistant session."""
 
     def __init__(
         self,
-        on_state_change: Optional[Callable[[SystemState], None]] = None,
-        on_intent: Optional[Callable[[IntentResult], None]] = None,
-        on_tool_call: Optional[Callable[[ToolCall], ToolResult]] = None,
-        on_tts_chunk: Optional[Callable[[TtsChunk], None]] = None,
+        on_state_change: Optional[Callable[[SystemState], Any]] = None,
+        on_intent: Optional[Callable[[IntentResult], Any]] = None,
+        on_tool_call: Optional[Callable[[ToolCall], Any]] = None,
+        on_tts_chunk: Optional[Callable[[TtsChunk], Any]] = None,
         use_stub: bool = False,
     ):
+        cfg = get_config()
+        self.use_stub = use_stub
+
         self.on_state_change = on_state_change
         self.on_intent = on_intent
-        on_tool_call = on_tool_call or (lambda _: None)
+        self.on_tool_call = on_tool_call
         self.on_tts_chunk = on_tts_chunk
-        self.use_stub = use_stub
 
         # Engines
         self.kws: KwsEngine = create_kws_engine(use_stub)
@@ -84,28 +101,31 @@ class AudioPipeline:
         self.sv: SvEngine = create_sv_engine(use_stub)
         self.tts: TtsEngine = create_tts_engine(use_stub)
 
-        # State
-        self._state = PipelineState.IDLE
-        self._running = False
-        self._half_duplex = get_config().get("audio.half_duplex", True)
-        self._kws_during_tts = get_config().get("audio.kws_during_tts", True)
-        self._audio_queue: Deque[AudioFrame] = deque()
-        self._current_context: Optional[PipelineContext] = None
+        # Behaviour
+        self.half_duplex = bool(cfg.get("audio.half_duplex", True))
+        self.kws_during_tts = bool(cfg.get("audio.kws_during_tts", True))
 
-        # Callbacks for external integration
+        # Wiring (optional collaborators)
         self._intent_router = None
         self._tool_executor = None
 
+        # Runtime
+        self._state = PipelineState.IDLE
+        self._running = False
+        self._audio_queue: Deque[bytes] = deque(maxlen=2000)
+        self._recent: Deque[bytes] = deque(maxlen=SV_WINDOW_FRAMES)
+        self._context: Optional[PipelineContext] = None
+
+    # ── wiring ─────────────────────────────────────────────────
+
     async def initialize(self) -> None:
-        """Initialize all engines."""
-        await asyncio.gather(
-            self.kws.initialize(),
-            self.vad.initialize(),
-            self.asr.initialize(),
-            self.sv.initialize(),
-            self.tts.initialize(),
-        )
-        logger.info("pipeline_initialized", use_stub=self.use_stub)
+        """Initialize every engine (sequentially, for clear error messages)."""
+        await self.kws.initialize()
+        await self.vad.initialize()
+        await self.asr.initialize()
+        await self.sv.initialize()
+        await self.tts.initialize()
+        logger.info("pipeline_initialized", stub=self.use_stub)
 
     def set_intent_router(self, router) -> None:
         self._intent_router = router
@@ -113,157 +133,192 @@ class AudioPipeline:
     def set_tool_executor(self, executor) -> None:
         self._tool_executor = executor
 
-    def _set_state(self, state: PipelineState) -> None:
-        self._state = state
-        if self.on_state_change:
-            self.on_state_change(SystemState(
-                state=SystemStateName(state.value),
-                message=f"Pipeline: {state.value}",
-            ))
+    # ── state ──────────────────────────────────────────────────
 
-    def push_audio(self, pcm_bytes: bytes, timestamp_ms: int) -> None:
-        """Push raw PCM from microphone callback."""
-        frame = AudioFrame(
-            trace_id=self._current_context.trace_id if self._current_context else uuid.uuid4().hex[:16],
-            timestamp_ms=timestamp_ms,
-            data=pcm_bytes,
-        )
-        self._audio_queue.append(frame)
+    @property
+    def state(self) -> PipelineState:
+        return self._state
+
+    def _set_state(self, state: PipelineState) -> None:
+        if state == self._state:
+            return
+        self._state = state
+        logger.debug("pipeline_state", state=state.value)
+        if self.on_state_change:
+            try:
+                self.on_state_change(
+                    SystemState(state=SystemStateName(state.value), message=f"pipeline: {state.value}")
+                )
+            except Exception as e:  # callbacks must never kill the pipeline
+                logger.error("state_callback_failed", error=str(e))
+
+    # ── audio ingress ──────────────────────────────────────────
+
+    def push_audio(self, pcm_bytes: bytes) -> None:
+        """Enqueue one block of int16 PCM from the microphone callback."""
+        self._audio_queue.append(pcm_bytes)
+
+    # ── main loop ──────────────────────────────────────────────
 
     async def run(self) -> None:
-        """Main pipeline loop."""
+        """Consume queued audio forever, driving the state machine."""
         self._running = True
-        self._set_state(PipelineState.IDLE)
+        self._set_state(PipelineState.KWS_LISTENING)
+        logger.info("pipeline_started")
 
         try:
             while self._running:
-                if self._state == PipelineState.IDLE:
-                    await self._run_kws()
-                elif self._state == PipelineState.VAD_ACTIVE:
-                    await self._run_vad_asr()
-                elif self._state == PipelineState.LLM_THINKING:
-                    await self._run_llm_and_tools()
-                elif self._state == PipelineState.TTS_PLAYING:
-                    await self._run_tts()
-                else:
-                    await asyncio.sleep(0.01)
+                if not self._audio_queue:
+                    await asyncio.sleep(0.005)
+                    continue
+
+                chunk = self._audio_queue.popleft()
+                self._recent.append(chunk)
+
+                try:
+                    await self._tick(chunk)
+                except Exception as e:
+                    logger.error("pipeline_tick_failed", error=str(e), state=self._state.value)
+                    await self._abort_utterance()
         finally:
             self._running = False
+            logger.info("pipeline_stopped")
 
-    async def _run_kws(self) -> None:
-        """KWS listening loop."""
+    async def _tick(self, chunk: bytes) -> None:
+        """Route one audio block according to the current state."""
+        if self._state in (PipelineState.IDLE, PipelineState.KWS_LISTENING):
+            await self._tick_kws(chunk)
+
+        elif self._state == PipelineState.VAD_ACTIVE:
+            await self._tick_vad(chunk)
+
+        elif self._state == PipelineState.TTS_PLAYING:
+            # Half-duplex: ASR/VAD pause, but KWS keeps listening for barge-in.
+            if self.half_duplex and self.kws_during_tts:
+                await self._tick_kws(chunk, barge_in=True)
+
+        # ASR_RUNNING / LLM_THINKING fall through: those stages are
+        # driven by awaited calls, not by inbound audio.
+
+    # ── KWS ────────────────────────────────────────────────────
+
+    async def _tick_kws(self, chunk: bytes, barge_in: bool = False) -> None:
         self._set_state(PipelineState.KWS_LISTENING)
+        self.kws.accept_waveform(chunk)
 
-        while self._running and self._state == PipelineState.KWS_LISTENING:
-            # Process queued audio
-            while self._audio_queue:
-                frame = self._audio_queue.popleft()
-                self.kws.accept_waveform(frame.data)
-
-                # Also feed VAD if in half-duplex TTS pause (KWS stays active)
-                if self._half_duplex and self._kws_during_tts and self._state == PipelineState.TTS_PLAYING:
-                    pass  # KWS runs independently
-
-            result = self.kws.get_result()
-            if result:
-                await self._on_kws_triggered(result)
-
-            await asyncio.sleep(0.01)
-
-    async def _on_kws_triggered(self, result: KwsTriggered) -> None:
-        """KWS triggered - start SV + VAD."""
-        logger.info("kws_triggered", keyword=result.keyword, confidence=result.confidence)
-        self.kws.reset()
-
-        trace_id = uuid.uuid4().hex[:16]
-        set_trace_context(trace_id)
-        self._current_context = PipelineContext(trace_id=trace_id)
-
-        # Speaker Verification
-        if self.sv.enabled:
-            # Collect ~1s audio for SV (reuse recent frames)
-            sv_frames = list(self._audio_queue)[-100:]  # last 1s
-            if sv_frames:
-                sv_result = self.sv.verify(sv_frames, self._current_context.speaker_id)
-                if sv_result:
-                    self._current_context.sv_result = sv_result
-                    logger.info("sv_result", **sv_result.__dict__)
-                    if sv_result.tier == "rejected":
-                        self._set_state(PipelineState.IDLE)
-                        self._current_context = None
-                        clear_trace_context()
-                        return
-
-        self._set_state(PipelineState.VAD_ACTIVE)
-        self._current_context.vad_frames.clear()
-
-    async def _run_vad_asr(self) -> None:
-        """VAD segmentation + ASR."""
-        while self._running and self._state == PipelineState.VAD_ACTIVE:
-            while self._audio_queue:
-                frame = self._audio_queue.popleft()
-                self._current_context.vad_frames.append(frame)
-                segments = self.vad.accept_frame(frame)
-
-                for segment in segments:
-                    await self._on_vad_segment(segment)
-
-            await asyncio.sleep(0.01)
-
-    async def _on_vad_segment(self, segment: VadSegment) -> None:
-        """VAD segment complete - run ASR."""
-        logger.info("vad_segment", duration_ms=segment.duration_ms, frames=len(segment.frames))
-        self._set_state(PipelineState.ASR_RUNNING)
-
-        asr_result = await self.asr.transcribe(segment.frames)
-        logger.info("asr_result", text=asr_result.text, confidence=asr_result.confidence)
-
-        if asr_result.text.strip():
-            self._current_context.asr_text = asr_result.text
-            await self._route_intent(asr_result.text)
-        else:
-            self._set_state(PipelineState.KWS_LISTENING)
-
-    async def _route_intent(self, text: str) -> None:
-        """Route text through intent router (rules → local → cloud)."""
-        self._set_state(PipelineState.LLM_THINKING)
-
-        if self._intent_router:
-            intent = await self._intent_router.route(text, self._current_context.sv_result)
-            self._current_context.intent = intent
-            if self.on_intent:
-                self.on_intent(intent)
-
-    async def _run_llm_and_tools(self) -> None:
-        """Execute tool calls from intent."""
-        if not self._current_context.intent:
-            self._set_state(PipelineState.KWS_LISTENING)
+        result = self.kws.get_result()
+        if not result:
             return
 
-        intent = self._current_context.intent
+        logger.info("kws_triggered", keyword=result.keyword, barge_in=barge_in)
+        self.kws.reset()
 
-        # Convert intent to tool calls
-        tool_calls = self._intent_to_tool_calls(intent)
-        self._current_context.tool_calls = tool_calls
+        if barge_in:
+            self.tts.interrupt()
+            logger.info("tts_barge_in", keyword=result.keyword)
 
-        results = []
-        for call in tool_calls:
-            if self._tool_executor:
-                result = await self._tool_executor.execute(call)
-                results.append(result)
-                if not result.success:
-                    logger.warning("tool_failed", tool=call.tool, error=result.error)
-                    break
+        await self._begin_utterance(result)
 
-        # Generate response text
-        response = self._generate_response(intent, results)
-        self._current_context.tts_text = response
+    # ── utterance lifecycle ────────────────────────────────────
 
+    async def _begin_utterance(self, trigger: KwsResult) -> None:
+        """Start a new utterance: fresh trace, speaker check, then VAD."""
+        trace_id = uuid.uuid4().hex[:16]
+        set_trace_context(trace_id)
+        self._context = PipelineContext(trace_id=trace_id)
+        self.vad.reset()
+
+        # Speaker verification over the last ~1 s of audio.
+        # The engine returns None when nobody is enrolled yet, in which case
+        # the utterance proceeds without a speaker tier.
+        if getattr(self.sv, "enabled", True):
+            sv_result = self.sv.verify(list(self._recent))
+            if sv_result:
+                self._context.sv_result = sv_result
+                if sv_result.tier == "rejected":
+                    logger.info("speaker_rejected", score=round(sv_result.score, 4))
+                    await self._abort_utterance()
+                    return
+
+        self._set_state(PipelineState.VAD_ACTIVE)
+
+    async def _abort_utterance(self) -> None:
+        """Drop the current utterance and go back to listening."""
+        self._context = None
+        clear_trace_context()
+        self.vad.reset()
+        self._set_state(PipelineState.KWS_LISTENING)
+
+    # ── VAD -> ASR ─────────────────────────────────────────────
+
+    async def _tick_vad(self, chunk: bytes) -> None:
+        segments = self.vad.accept_waveform(chunk)
+        for segment in segments:
+            await self._on_segment(segment)
+
+    async def _on_segment(self, segment: VadSegment) -> None:
+        if self._context is None:
+            return
+
+        logger.info("vad_segment", duration_ms=segment.duration_ms)
+        self._set_state(PipelineState.ASR_RUNNING)
+
+        result = await self.asr.transcribe(segment.samples)
+        if not result.text.strip():
+            logger.info("asr_empty")
+            await self._abort_utterance()
+            return
+
+        self._context.asr_text = result.text
+        await self._route_intent(result)
+
+    # ── intent -> tools -> TTS ─────────────────────────────────
+
+    async def _route_intent(self, asr: AsrResult) -> None:
+        context = self._context
+        if context is None:
+            return
+
+        self._set_state(PipelineState.LLM_THINKING)
+
+        intent: Optional[IntentResult] = None
+        if self._intent_router is not None:
+            intent = await self._intent_router.route(asr.text, context.sv_result)
+            context.intent = intent
+            if self.on_intent:
+                await _maybe_await(self.on_intent(intent))
+
+        await self._run_tools(intent)
         self._set_state(PipelineState.TTS_PLAYING)
+        await self._play_tts()
+
+    async def _run_tools(self, intent: Optional[IntentResult]) -> None:
+        context = self._context
+        if context is None:
+            return
+
+        if intent is None:
+            context.tts_text = self._default_reply(None)
+            return
+
+        calls = self._intent_to_tool_calls(intent)
+        context.tool_calls = calls
+
+        results: List[ToolResult] = []
+        for call in calls:
+            if self.on_tool_call is not None:
+                out = await _maybe_await(self.on_tool_call(call))
+                if isinstance(out, ToolResult):
+                    results.append(out)
+            elif self._tool_executor is not None:
+                results.append(await self._tool_executor.execute(call))
+
+        context.tts_text = self._default_reply(intent, results)
 
     def _intent_to_tool_calls(self, intent: IntentResult) -> List[ToolCall]:
-        """Map intent to tool calls (simplified)."""
+        """Map an intent to tool invocations (tool choice lives in code, not the LLM)."""
         from winvoice.contracts import ToolName
+
         mapping = {
             "open_app": ToolName.OPEN_APP,
             "close_app": ToolName.CLOSE_APP,
@@ -275,55 +330,51 @@ class AudioPipeline:
             "run_script": ToolName.RUN_SCRIPT,
         }
         tool = mapping.get(intent.intent.value)
-        if not tool:
+        if tool is None:
             return []
-        return [ToolCall(
-            trace_id=self._current_context.trace_id,
-            tool=tool,
-            args=intent.args,
-            requires_confirmation=tool in (ToolName.WRITE_FILE, ToolName.RUN_SCRIPT),
-        )]
 
-    def _generate_response(self, intent: IntentResult, results: List[ToolResult]) -> str:
-        """Generate natural language response from tool results."""
-        if not results:
+        destructive = tool in (ToolName.WRITE_FILE, ToolName.RUN_SCRIPT)
+        return [
+            ToolCall(
+                trace_id=self._context.trace_id if self._context else "",
+                tool=tool,
+                args=intent.args,
+                requires_confirmation=destructive,
+            )
+        ]
+
+    def _default_reply(self, intent: Optional[IntentResult], results: Optional[List[ToolResult]] = None) -> str:
+        if intent is None:
             return "抱歉，我没有理解您的请求。"
-
-        success = all(r.success for r in results)
-        if success:
+        if not results:
+            return "好的。"
+        if all(r.success for r in results):
             return "好的，已为您完成。"
-        else:
-            errors = [r.error for r in results if r.error]
-            return f"执行遇到问题：{'; '.join(errors)}"
+        errors = "; ".join(r.error for r in results if r.error) or "未知错误"
+        return f"执行遇到问题：{errors}"
 
-    async def _run_tts(self) -> None:
-        """Play TTS with barge-in support."""
-        if not self._current_context.tts_text:
-            self._set_state(PipelineState.KWS_LISTENING)
-            return
+    # ── TTS ────────────────────────────────────────────────────
 
-        request = TtsRequest(
-            trace_id=self._current_context.trace_id,
-            text=self._current_context.tts_text,
-            voice="guest" if self._current_context.sv_result and self._current_context.sv_result.tier == "guest" else "default",
-        )
+    async def _play_tts(self) -> None:
+        context = self._context
+        text = (context.tts_text if context else "") or ""
 
-        async for chunk in self.tts.synthesize(request):
-            if self.on_tts_chunk:
-                self.on_tts_chunk(chunk)
+        if text.strip():
+            request = TtsRequest(
+                trace_id=context.trace_id if context else "",
+                text=text,
+                voice="guest" if (context and context.sv_result and context.sv_result.tier == "guest") else "default",
+            )
+            async for chunk in self.tts.synthesize(request):
+                if self.on_tts_chunk:
+                    await _maybe_await(self.on_tts_chunk(chunk))
+                if self.tts.is_interrupted():
+                    break
+                await asyncio.sleep(0)
 
-            # Check for barge-in (KWS during TTS)
-            if self._kws_during_tts and self.tts.is_interrupted():
-                logger.info("tts_barge_in")
-                break
+        await self._abort_utterance()
 
-            await asyncio.sleep(0)
-
-        # TTS complete or interrupted
-        self.tts.interrupt()  # reset
-        self._set_state(PipelineState.KWS_LISTENING)
-        self._current_context = None
-        clear_trace_context()
+    # ── shutdown ───────────────────────────────────────────────
 
     def stop(self) -> None:
         self._running = False

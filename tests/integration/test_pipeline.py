@@ -1,13 +1,23 @@
 """
-Integration tests for audio pipeline (with stubs).
+Integration tests for audio pipeline (with stub engines).
 """
 
-import pytest
 import asyncio
+import uuid
+from pathlib import Path
+
+import pytest
+
 from winvoice.audio.pipeline import AudioPipeline, PipelineState
+from winvoice.contracts import (
+    SystemState,
+    SystemStateName,
+    ToolCall,
+    ToolName,
+    ToolResult,
+)
 from winvoice.intent.router import create_intent_router
 from winvoice.tools.executor import create_tool_executor
-from winvoice.contracts import SystemState, SystemStateName, ToolCall, ToolResult, ToolName
 
 
 class TestAudioPipeline:
@@ -106,19 +116,39 @@ class TestToolExecutorIntegration:
 
     @pytest.mark.asyncio
     async def test_execute_write_file_requires_confirmation(self, executor):
+        # write_file is restricted to the user's home directory, and the test
+        # must not leave artefacts in the repo, so target a unique temp file
+        # inside the home directory and remove it afterwards.
+        target = Path.home() / f"winvoice_test_{uuid.uuid4().hex[:8]}.txt"
         call = ToolCall(
             trace_id="test1",
             tool=ToolName.WRITE_FILE,
-            args={"path": "test_output.txt", "content": "test"},
+            args={"path": str(target), "content": "test"},
         )
-        # First call without confirmation should fail
-        result = await executor.execute(call, confirmed=False)
-        assert result.success is False
-        assert "CONFIRMATION_REQUIRED" in result.error
+        try:
+            # First call without confirmation must be refused.
+            result = await executor.execute(call, confirmed=False)
+            assert result.success is False
+            assert "CONFIRMATION_REQUIRED" in result.error
+            assert not target.exists(), "file must not be written before confirmation"
 
-        # Second call with confirmation should succeed
+            # Second call with confirmation succeeds.
+            result = await executor.execute(call, confirmed=True)
+            assert result.success is True
+            assert target.read_text(encoding="utf-8") == "test"
+        finally:
+            target.unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
+    async def test_execute_write_file_rejects_outside_home(self, executor):
+        call = ToolCall(
+            trace_id="test1",
+            tool=ToolName.WRITE_FILE,
+            args={"path": "C:/Windows/winvoice_should_not_exist.txt", "content": "x"},
+        )
         result = await executor.execute(call, confirmed=True)
-        assert result.success is True
+        assert result.success is False
+        assert "user directory" in result.error
 
     @pytest.mark.asyncio
     async def test_execute_read_file(self, executor, tmp_path):

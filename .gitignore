@@ -216,3 +216,40 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project specific
+models/
+snapshots/
+logs/
+# locally extracted llama.cpp / sherpa-onnx toolchains (hundreds of MB)
+tools/
+*.onnx
+*.gguf
+*.bin
+*.tar.bz2
+.env
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.log
+tempCodeRunnerFile.py
+
+# Build / packaging artefacts
+*.egg-info/
+build/
+dist/
+
+# Local tooling scratch dirs (pip/pytest temp roots when the sandbox
+# redirects them into the workspace)
+.piptmp/
+.pytmp/
+.pylibs/
+pytest-cache-files-*/
+
+# Model helper files generated at runtime
+winvoice_keywords_*.txt
+winvoice_keywords.txt

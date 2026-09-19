@@ -1,38 +1,49 @@
 """
-Speaker Verification (SV) using sherpa-onnx CAM++ (3D-Speaker).
+Speaker Verification — sherpa-onnx SpeakerEmbeddingExtractor (3D-Speaker CAM++).
 
-Computes embeddings and cosine similarity for enrolled speakers.
+Enrollment collects N samples, computes embeddings, and derives two
+thresholds from the intra-speaker similarity distribution:
+
+    T_high = min_intra - offset_high
+    T_low  = max_inter + offset_low
+
+Runtime verification compares a fresh embedding against the enrolled set
+by max cosine similarity and maps it to a permission tier.
 """
 
 from __future__ import annotations
 
-import os
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
 from winvoice.config import get_config
-from winvoice.logging import get_logger, observe_latency, inc_request
+from winvoice.logging import get_logger, inc_request
+from ._common import ModelNotFoundError, frames_to_float32, resolve_path
 
 logger = get_logger(__name__)
+
+SAMPLE_RATE = 16000
+MIN_ENROLL_SAMPLES = 8
+MIN_INTRA_FLOOR = 0.40
 
 
 @dataclass
 class SvResult:
     speaker_id: str
     score: float
-    tier: str  # "full", "guest", "rejected"
+    tier: str  # "full" | "guest" | "rejected"
     threshold_high: float
     threshold_low: float
 
 
 @dataclass
 class SpeakerProfile:
-    """Enrolled speaker with embeddings and thresholds."""
     speaker_id: str
     embeddings: List[np.ndarray] = field(default_factory=list)
     threshold_high: float = 0.60
@@ -41,78 +52,261 @@ class SpeakerProfile:
     updated_at: float = field(default_factory=time.time)
 
 
-class SvEngine:
-    """
-    Speaker verification engine.
+def _load_sherpa():
+    try:
+        import sherpa_onnx
+    except ImportError as e:  # pragma: no cover
+        raise ModelNotFoundError(
+            "sherpa-onnx is not installed. Install it with:\n"
+            "  pip install sherpa-onnx==1.13.8"
+        ) from e
+    return sherpa_onnx
 
-    - Enroll: collect 8 samples, compute embeddings, derive thresholds
-    - Verify: compute embedding, cosine similarity vs enrolled, decide tier
-    - Adaptive update: on successful verify, update embedding with weight
-    """
+
+def cosine(a: np.ndarray, b: np.ndarray) -> float:
+    """Cosine similarity, safe against zero vectors."""
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+class SvEngine:
+    """CAM++ speaker embedding extractor with threshold calibration."""
 
     def __init__(
         self,
         model_path: Optional[str] = None,
-        enabled: bool = True,
+        enabled: Optional[bool] = None,
         threshold_high: Optional[float] = None,
         threshold_low: Optional[float] = None,
-        adaptive_update: bool = True,
-        update_weight: float = 0.05,
+        adaptive_update: Optional[bool] = None,
+        update_weight: Optional[float] = None,
         profiles_dir: Optional[str] = None,
+        offset_high: float = 0.05,
+        offset_low: float = 0.05,
     ):
         cfg = get_config()
-        self.model_path = model_path or cfg.get("sv.model", "models/sv/campplus")
-        self.enabled = enabled and cfg.get("sv.enabled", True)
-        self.threshold_high = threshold_high or cfg.get("sv.threshold_high", 0.60)
-        self.threshold_low = threshold_low or cfg.get("sv.threshold_low", 0.40)
-        self.adaptive_update = adaptive_update and cfg.get("sv.adaptive_update", True)
-        self.update_weight = update_weight or cfg.get("sv.update_weight", 0.05)
-        self.profiles_dir = Path(profiles_dir or cfg.get("snapshot.path", "snapshots")) / "sv_profiles"
+        self.model_path = resolve_path(
+            model_path
+            or cfg.get(
+                "sv.model",
+                "models/sv/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
+            ),
+            kind="file",
+        )
+        self.enabled = bool(enabled if enabled is not None else cfg.get("sv.enabled", True))
+        self.threshold_high = float(
+            threshold_high if threshold_high is not None else cfg.get("sv.threshold_high", 0.60)
+        )
+        self.threshold_low = float(
+            threshold_low if threshold_low is not None else cfg.get("sv.threshold_low", 0.40)
+        )
+        self.adaptive_update = bool(
+            adaptive_update if adaptive_update is not None else cfg.get("sv.adaptive_update", True)
+        )
+        self.update_weight = float(
+            update_weight if update_weight is not None else cfg.get("sv.update_weight", 0.05)
+        )
+        self.offset_high = offset_high
+        self.offset_low = offset_low
+
+        self.profiles_dir = Path(
+            profiles_dir or cfg.get("sv.profiles_dir", "models/sv/profiles")
+        )
         self.profiles_dir.mkdir(parents=True, exist_ok=True)
 
         self._extractor = None
+        self._ready = False
         self._profiles: Dict[str, SpeakerProfile] = {}
         self._load_profiles()
+
+    # ── lifecycle ──────────────────────────────────────────────
 
     async def initialize(self) -> None:
         if not self.enabled:
             logger.info("sv_disabled")
             return
 
-        try:
-            import sherpa_onnx
-        except ImportError:
-            logger.warning("sherpa_onnx not installed, using stub SV")
+        sherpa_onnx = _load_sherpa()
+        config = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+            model=str(self.model_path),
+            num_threads=1,
+            provider="cpu",
+            debug=False,
+        )
+        self._extractor = sherpa_onnx.SpeakerEmbeddingExtractor(config)
+        self._ready = True
+        logger.info(
+            "sv_initialized",
+            model=str(self.model_path),
+            dim=self.embedding_dim,
+            enrolled=list(self._profiles),
+        )
+
+    @property
+    def embedding_dim(self) -> int:
+        return self._extractor.dim if self._ready else 0
+
+    # ── embeddings ─────────────────────────────────────────────
+
+    def compute_embedding(self, frames) -> Optional[np.ndarray]:
+        """Compute a unit-normalised embedding from audio frames or an array."""
+        if not self._ready:
+            return None
+
+        samples = (
+            np.asarray(frames, dtype=np.float32)
+            if isinstance(frames, np.ndarray)
+            else frames_to_float32(frames)
+        )
+        if samples.size == 0:
+            return None
+
+        stream = self._extractor.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, samples)
+        stream.input_finished()
+
+        if not self._extractor.is_ready(stream):
+            logger.warning("sv_embedding_not_ready", samples=int(samples.size))
+            return None
+
+        emb = np.asarray(self._extractor.compute(stream), dtype=np.float32)
+        norm = np.linalg.norm(emb)
+        return emb / norm if norm > 0 else emb
+
+    # ── enrollment ─────────────────────────────────────────────
+
+    def enroll_start(self, speaker_id: str, force: bool = False) -> None:
+        if speaker_id in self._profiles and not force:
+            raise ValueError(f"Speaker '{speaker_id}' is already enrolled (use force=True to redo)")
+        self._profiles[speaker_id] = SpeakerProfile(speaker_id=speaker_id)
+        logger.info("sv_enroll_started", speaker_id=speaker_id)
+
+    def enroll_sample(self, speaker_id: str, frames) -> bool:
+        if speaker_id not in self._profiles:
+            raise ValueError(f"Enrollment not started for '{speaker_id}'")
+
+        emb = self.compute_embedding(frames)
+        if emb is None:
+            logger.warning("sv_enroll_sample_failed", speaker_id=speaker_id)
+            return False
+
+        self._profiles[speaker_id].embeddings.append(emb)
+        logger.info(
+            "sv_enroll_sample_added",
+            speaker_id=speaker_id,
+            count=len(self._profiles[speaker_id].embeddings),
+        )
+        return True
+
+    def enroll_finalize(self, speaker_id: str, max_inter: float = 0.45) -> SpeakerProfile:
+        """
+        Derive thresholds from the intra-speaker similarity distribution.
+
+        max_inter is the estimated similarity to the most similar non-target
+        speaker; it cannot be measured from a single enrollment, so it is a
+        parameter (default 0.45, per AISHELL-3 / CN-Celeb reference range).
+        """
+        profile = self._profiles[speaker_id]
+        embs = profile.embeddings
+
+        if len(embs) < MIN_ENROLL_SAMPLES:
+            raise ValueError(f"Need at least {MIN_ENROLL_SAMPLES} samples, got {len(embs)}")
+
+        sims = [cosine(embs[i], embs[j])
+                for i in range(len(embs)) for j in range(i + 1, len(embs))]
+        min_intra = float(min(sims)) if sims else 0.0
+
+        logger.info(
+            "sv_enroll_stats",
+            speaker_id=speaker_id,
+            samples=len(embs),
+            min_intra=round(min_intra, 4),
+            mean_intra=round(float(np.mean(sims)), 4) if sims else 0.0,
+            max_inter=max_inter,
+        )
+
+        if min_intra < MIN_INTRA_FLOOR:
+            raise ValueError(
+                f"Intra-speaker similarity too low (min_intra={min_intra:.3f} < {MIN_INTRA_FLOOR}). "
+                "Re-record in a quieter room, closer to the microphone, with varied wording."
+            )
+
+        profile.threshold_high = min_intra - self.offset_high
+        profile.threshold_low = max_inter + self.offset_low
+        self._save_profile(profile)
+
+        logger.info(
+            "sv_enroll_finalized",
+            speaker_id=speaker_id,
+            threshold_high=round(profile.threshold_high, 4),
+            threshold_low=round(profile.threshold_low, 4),
+        )
+        return profile
+
+    # ── verification ───────────────────────────────────────────
+
+    def verify(self, frames, speaker_id: str = "me") -> Optional[SvResult]:
+        """Verify audio against an enrolled speaker and return the tier."""
+        if not self._ready or speaker_id not in self._profiles:
+            return None
+
+        profile = self._profiles[speaker_id]
+        if not profile.embeddings:
+            return None
+
+        emb = self.compute_embedding(frames)
+        if emb is None:
+            return None
+
+        score = max(cosine(emb, e) for e in profile.embeddings)
+
+        if score >= profile.threshold_high:
+            tier = "full"
+        elif score >= profile.threshold_low:
+            tier = "guest"
+        else:
+            tier = "rejected"
+
+        inc_request("sv", tier)
+        if self.adaptive_update and tier in ("full", "guest"):
+            self._adaptive_update(profile, emb)
+
+        result = SvResult(
+            speaker_id=speaker_id,
+            score=float(score),
+            tier=tier,
+            threshold_high=profile.threshold_high,
+            threshold_low=profile.threshold_low,
+        )
+        logger.info(
+            "sv_result",
+            speaker_id=speaker_id,
+            score=round(result.score, 4),
+            tier=tier,
+        )
+        return result
+
+    def _adaptive_update(self, profile: SpeakerProfile, emb: np.ndarray) -> None:
+        """EMA-update the newest enrolled embedding with a fresh one."""
+        if not profile.embeddings:
             return
+        latest = profile.embeddings[-1]
+        updated = (1 - self.update_weight) * latest + self.update_weight * emb
+        norm = np.linalg.norm(updated)
+        if norm > 0:
+            profile.embeddings[-1] = updated / norm
+            self._save_profile(profile)
 
-        if not Path(self.model_path).exists():
-            raise FileNotFoundError(f"SV model not found: {self.model_path}")
+    # ── persistence ────────────────────────────────────────────
 
-        self._extractor = sherpa_onnx.SpeakerEmbeddingExtractor(self.model_path)
-        logger.info("sv_initialized", model=self.model_path)
-
-    def _load_profiles(self) -> None:
-        """Load enrolled speaker profiles from disk."""
-        for profile_file in self.profiles_dir.glob("*.json"):
-            try:
-                with open(profile_file, "r") as f:
-                    data = json.load(f)
-                profile = SpeakerProfile(
-                    speaker_id=data["speaker_id"],
-                    embeddings=[np.array(e, dtype=np.float32) for e in data["embeddings"]],
-                    threshold_high=data["threshold_high"],
-                    threshold_low=data["threshold_low"],
-                    created_at=data["created_at"],
-                    updated_at=data["updated_at"],
-                )
-                self._profiles[profile.speaker_id] = profile
-            except Exception as e:
-                logger.error("sv_profile_load_failed", file=str(profile_file), error=str(e))
+    def _profile_path(self, speaker_id: str) -> Path:
+        return self.profiles_dir / f"{speaker_id}.json"
 
     def _save_profile(self, profile: SpeakerProfile) -> None:
         profile.updated_at = time.time()
-        path = self.profiles_dir / f"{profile.speaker_id}.json"
-        data = {
+        payload = {
             "speaker_id": profile.speaker_id,
             "embeddings": [e.tolist() for e in profile.embeddings],
             "threshold_high": profile.threshold_high,
@@ -120,148 +314,65 @@ class SvEngine:
             "created_at": profile.created_at,
             "updated_at": profile.updated_at,
         }
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
+        self._profile_path(profile.speaker_id).write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
 
-    def enroll_start(self, speaker_id: str) -> None:
-        """Begin enrollment for a new speaker."""
-        if speaker_id in self._profiles:
-            raise ValueError(f"Speaker {speaker_id} already enrolled")
-        self._profiles[speaker_id] = SpeakerProfile(speaker_id=speaker_id)
-        logger.info("sv_enroll_started", speaker_id=speaker_id)
-
-    def enroll_sample(self, speaker_id: str, audio_frames: List[AudioFrame]) -> bool:
-        """Add one enrollment sample (3-5 seconds)."""
-        if speaker_id not in self._profiles:
-            raise ValueError(f"Enrollment not started for {speaker_id}")
-
-        embedding = self._compute_embedding(audio_frames)
-        if embedding is None:
-            return False
-
-        self._profiles[speaker_id].embeddings.append(embedding)
-        logger.info("sv_enroll_sample_added", speaker_id=speaker_id, count=len(self._profiles[speaker_id].embeddings))
-        return True
-
-    def enroll_finalize(self, speaker_id: str, max_inter: float = 0.45) -> SpeakerProfile:
-        """
-        Finalize enrollment: compute thresholds from intra-speaker similarities.
-        max_inter: estimated max similarity to other speakers (from AISHELL-3/CN-Celeb)
-        """
-        profile = self._profiles[speaker_id]
-        embeddings = profile.embeddings
-
-        if len(embeddings) < 8:
-            raise ValueError(f"Need at least 8 samples, got {len(embeddings)}")
-
-        # Compute pairwise cosine similarities
-        sims = []
-        for i in range(len(embeddings)):
-            for j in range(i + 1, len(embeddings)):
-                sim = np.dot(embeddings[i], embeddings[j]) / (
-                    np.linalg.norm(embeddings[i]) * np.linalg.norm(embeddings[j])
+    def _load_profiles(self) -> None:
+        for file in self.profiles_dir.glob("*.json"):
+            try:
+                data = json.loads(file.read_text(encoding="utf-8"))
+                profile = SpeakerProfile(
+                    speaker_id=data["speaker_id"],
+                    embeddings=[np.asarray(e, dtype=np.float32) for e in data["embeddings"]],
+                    threshold_high=float(data["threshold_high"]),
+                    threshold_low=float(data["threshold_low"]),
+                    created_at=float(data.get("created_at", time.time())),
+                    updated_at=float(data.get("updated_at", time.time())),
                 )
-                sims.append(sim)
+                self._profiles[profile.speaker_id] = profile
+                logger.info("sv_profile_loaded", speaker_id=profile.speaker_id,
+                            embeddings=len(profile.embeddings))
+            except Exception as e:
+                logger.error("sv_profile_load_failed", file=str(file), error=str(e))
 
-        min_intra = min(sims) if sims else 0.0
-        logger.info("sv_enroll_stats", speaker_id=speaker_id, min_intra=min_intra, max_inter=max_inter)
-
-        if min_intra < 0.4:
-            raise ValueError(f"Intra-speaker similarity too low (min_intra={min_intra:.3f}), please re-record")
-
-        # Configurable offsets (default 0.05)
-        profile.threshold_high = min_intra - 0.05
-        profile.threshold_low = max_inter + 0.05
-
-        self._save_profile(profile)
-        logger.info("sv_enroll_finalized", speaker_id=speaker_id,
-                   threshold_high=profile.threshold_high, threshold_low=profile.threshold_low)
-        return profile
-
-    def verify(self, audio_frames: List[AudioFrame], speaker_id: str = "me") -> Optional[SvResult]:
-        """Verify audio against enrolled speaker."""
-        if not self.enabled or speaker_id not in self._profiles:
-            return None
-
-        embedding = self._compute_embedding(audio_frames)
-        if embedding is None:
-            return None
-
-        profile = self._profiles[speaker_id]
-        if not profile.embeddings:
-            return None
-
-        # Compute max cosine similarity to enrolled embeddings
-        max_sim = max(
-            np.dot(embedding, e) / (np.linalg.norm(embedding) * np.linalg.norm(e))
-            for e in profile.embeddings
-        )
-
-        # Determine tier
-        if max_sim >= profile.threshold_high:
-            tier = "full"
-        elif max_sim >= profile.threshold_low:
-            tier = "guest"
-        else:
-            tier = "rejected"
-
-        # Adaptive update on successful verification (full or guest)
-        if self.adaptive_update and tier in ("full", "guest"):
-            self._adaptive_update(profile, embedding)
-
-        return SvResult(
-            speaker_id=speaker_id,
-            score=float(max_sim),
-            tier=tier,
-            threshold_high=profile.threshold_high,
-            threshold_low=profile.threshold_low,
-        )
-
-    def _compute_embedding(self, frames: List[AudioFrame]) -> Optional[np.ndarray]:
-        if self._extractor is None:
-            return self._stub_embedding(frames)
-
-        import sherpa_onnx
-        stream = self._extractor.create_stream()
-
-        for frame in frames:
-            audio = np.frombuffer(frame.data, dtype=np.int16).astype(np.float32) / 32768.0
-            stream.accept_waveform(frame.sample_rate, audio)
-
-        embedding = stream.compute()
-        return np.array(embedding, dtype=np.float32)
-
-    def _stub_embedding(self, frames: List[AudioFrame]) -> np.ndarray:
-        """Deterministic stub embedding based on audio hash."""
-        import hashlib
-        data = b"".join(f.data for f in frames)
-        hash_bytes = hashlib.md5(data).digest()
-        # Convert to pseudo-embedding on unit sphere
-        vec = np.frombuffer(hash_bytes, dtype=np.uint8).astype(np.float32) / 255.0
-        vec = vec[:192]  # CAM++ embedding dim
-        if len(vec) < 192:
-            vec = np.pad(vec, (0, 192 - len(vec)))
-        return vec / np.linalg.norm(vec)
-
-    def _adaptive_update(self, profile: SpeakerProfile, new_embedding: np.ndarray) -> None:
-        """Exponential moving average update of the latest embedding."""
-        if not profile.embeddings:
-            return
-        # Update the most recent embedding
-        latest = profile.embeddings[-1]
-        updated = (1 - self.update_weight) * latest + self.update_weight * new_embedding
-        updated = updated / np.linalg.norm(updated)
-        profile.embeddings[-1] = updated
-        self._save_profile(profile)
-        logger.debug("sv_adaptive_update", speaker_id=profile.speaker_id)
+    @property
+    def enrolled_speakers(self) -> List[str]:
+        return list(self._profiles)
 
 
 class StubSvEngine(SvEngine):
+    """Model-free stand-in for `--stub-audio` runs (always 'full' tier)."""
+
+    def __init__(self, *args, **kwargs):
+        self.model_path = Path(".")
+        self.enabled = True
+        self.threshold_high = 0.60
+        self.threshold_low = 0.40
+        self.adaptive_update = False
+        self.update_weight = 0.05
+        self.offset_high = 0.05
+        self.offset_low = 0.05
+        self.profiles_dir = Path(".")
+        self._extractor = None
+        self._ready = False
+        self._profiles = {}
+
     async def initialize(self) -> None:
         logger.info("stub_sv_initialized")
 
+    def verify(self, frames, speaker_id: str = "me") -> Optional[SvResult]:
+        return SvResult(
+            speaker_id=speaker_id,
+            score=0.95,
+            tier="full",
+            threshold_high=self.threshold_high,
+            threshold_low=self.threshold_low,
+        )
+
 
 def create_sv_engine(use_stub: bool = False) -> SvEngine:
+    """Factory honouring the WINVOICE_STUB_AUDIO env var."""
     if use_stub or os.getenv("WINVOICE_STUB_AUDIO") == "1":
         return StubSvEngine()
     return SvEngine()

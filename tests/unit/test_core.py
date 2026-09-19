@@ -2,7 +2,10 @@
 Unit tests for core modules.
 """
 
+import json
 import pytest
+from pathlib import Path
+
 from winvoice.contracts import (
     AudioFrame, KwsTriggered, SvResult, VadSegment, AsrResult,
     IntentResult, ToolCall, ToolResult, TtsRequest, TtsChunk,
@@ -84,8 +87,17 @@ llm:
     def test_missing_env_var_raises(self, tmp_path):
         config_file = tmp_path / "test.yaml"
         config_file.write_text("value: ${NONEXISTENT_VAR}")
-        with pytest.raises(ValueError, match="Unresolved environment variables"):
+        with pytest.raises(ValueError, match="Unresolved environment variable"):
             ConfigManager(config_file)
+
+    def test_missing_env_var_tolerated_when_section_disabled(self, tmp_path):
+        """An unresolved var inside a disabled feature must not block startup."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text(
+            "remote:\n  enabled: false\n  api_key: ${DEFINITELY_NOT_SET}\n"
+        )
+        cfg = ConfigManager(config_file)
+        assert cfg.get("remote.api_key") == ""
 
     def test_nested_get_set(self, tmp_path):
         config_file = tmp_path / "test.yaml"
@@ -102,22 +114,27 @@ class TestIrreversibleScan:
     def test_detects_reg_add(self):
         content = "reg add HKLM\\Software\\Test /v Value /t REG_SZ /d Data"
         matches = scan_for_irreversible(content)
-        assert any("reg add" in m for m in matches)
+        assert any("reg add" in m for m in matches), matches
 
     def test_detects_msiexec_uninstall(self):
         content = "msiexec /x {GUID} /quiet"
         matches = scan_for_irreversible(content)
-        assert any("msiexec.*uninstall" in m for m in matches)
+        assert matches and matches[0].startswith("msiexec"), matches
 
     def test_detects_rm_rf(self):
         content = "rm -rf /important/path"
         matches = scan_for_irreversible(content)
-        assert any("rm.*-rf" in m for m in matches)
+        assert any("rm -rf" in m for m in matches), matches
+
+    def test_returns_matched_text_not_patterns(self):
+        """Findings must be usable verbatim in an audit log."""
+        matches = scan_for_irreversible("reg add HKLM\\Software")
+        assert matches == ["reg add"]
 
     def test_clean_script_passes(self):
         content = "echo hello\nmkdir test\npython script.py"
         matches = scan_for_irreversible(content)
-        assert len(matches) == 0
+        assert len(matches) == 0, matches
 
 
 class TestToolRegistry:
@@ -145,10 +162,21 @@ class TestToolRegistry:
 
     def test_validate_write_file_path_restriction(self):
         registry = ToolRegistry()
-        # Outside user directory should fail
-        error = registry.validate_call(ToolName.WRITE_FILE, {"path": "C:/Windows/test.txt", "content": "x"})
+        # Outside the user directory must be rejected.
+        error = registry.validate_call(
+            ToolName.WRITE_FILE, {"path": "C:/Windows/test.txt", "content": "x"}
+        )
         assert error is not None
-        assert "not allowed" in error
+        assert "user directory" in error
+
+    def test_validate_write_file_allows_user_dir(self, tmp_path):
+        registry = ToolRegistry()
+        # A path inside the current user's home passes validation.
+        target = Path.home() / "winvoice_write_test.txt"
+        error = registry.validate_call(
+            ToolName.WRITE_FILE, {"path": str(target), "content": "x"}
+        )
+        assert error is None
 
     def test_validate_run_script_irreversible(self, tmp_path):
         registry = ToolRegistry()
@@ -172,14 +200,36 @@ class TestSnapshotManager:
 
         assert snapshot is not None
         assert len(snapshot.files) == 1
+        assert snapshot.files[0] == test_file.resolve()
 
         # Modify file
         test_file.write_text("modified content")
 
-        # Restore
+        # Restore must write back to the original absolute path.
         success = mgr.restore_snapshot(snapshot.snapshot_id)
         assert success
         assert test_file.read_text() == "original content"
+
+    def test_snapshot_records_absolute_originals(self, tmp_path):
+        """Restore must not depend on the process working directory."""
+        nested = tmp_path / "a" / "b"
+        nested.mkdir(parents=True)
+        target = nested / "deep.txt"
+        target.write_text("v1")
+
+        mgr = SnapshotManager(base_path=tmp_path / "snaps")
+        snap = mgr.create_snapshot([target])
+        assert snap is not None
+
+        target.write_text("v2")
+        assert mgr.restore_snapshot(snap.snapshot_id)
+        assert target.read_text() == "v1"
+
+        # And the manifest on disk carries the absolute original path.
+        manifest = json.loads(
+            (tmp_path / "snaps" / snap.snapshot_id / "manifest.json").read_text(encoding="utf-8")
+        )
+        assert manifest["files"][0]["original"] == str(target.resolve())
 
 
 class TestIntentRules:
@@ -202,6 +252,12 @@ class TestIntentRules:
         assert result.intent == IntentName.SET_VOLUME
         assert result.args["delta"] == 20
 
+    def test_match_set_volume_down_is_negative(self):
+        result = match_rules("音量调小 15")
+        assert result is not None
+        assert result.intent == IntentName.SET_VOLUME
+        assert result.args["delta"] == -15
+
     def test_match_media_control(self):
         for text, action in [("播放音乐", "play"), ("暂停", "pause"), ("下一首", "next"), ("上一首", "prev")]:
             result = match_rules(text)
@@ -215,8 +271,23 @@ class TestIntentRules:
         assert result.intent == IntentName.SEARCH_WEB
         assert result.args["query"] == "Python 教程"
 
+    def test_run_script_wins_over_open_app(self):
+        """`运行脚本` is more specific than the OPEN_APP verb list."""
+        result = match_rules("运行脚本 test.py")
+        assert result is not None
+        assert result.intent == IntentName.RUN_SCRIPT
+        assert result.args["path"] == "test.py"
+
+    def test_read_file_strips_leading_noun(self):
+        """`读取文件 X` must yield X, not `文件 X`."""
+        result = match_rules("读取文件 C:/notes.txt")
+        assert result is not None
+        assert result.intent == IntentName.READ_FILE
+        assert result.args["path"] == "C:/notes.txt"
+
     def test_no_match_returns_none(self):
-        result = match_rules("随便聊聊天气")
+        # Deliberately keyword-free text: any rule hit here would be a false positive.
+        result = match_rules("嗯嗯这个嘛让我想一想")
         assert result is None
 
 

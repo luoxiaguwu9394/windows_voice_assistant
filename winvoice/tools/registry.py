@@ -39,11 +39,18 @@ IRREVERSIBLE_PATTERNS: List[str] = [
 
 
 def scan_for_irreversible(script_content: str) -> List[str]:
-    """Scan script content for irreversible operation patterns."""
-    matches = []
+    """
+    Scan script content for irreversible operations.
+
+    Returns the *matched substrings* (not the regexes) so they can be shown
+    verbatim in the audit log and in the rejection message.
+    """
+    matches: List[str] = []
     for pattern in IRREVERSIBLE_PATTERNS:
-        if re.search(pattern, script_content, re.IGNORECASE):
-            matches.append(pattern)
+        for m in re.finditer(pattern, script_content, re.IGNORECASE):
+            snippet = m.group(0).strip()
+            if snippet and snippet not in matches:
+                matches.append(snippet)
     return matches
 
 

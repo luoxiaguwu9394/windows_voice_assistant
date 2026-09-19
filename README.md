@@ -159,24 +159,27 @@ Thresholds `T_high` and `T_low` are computed automatically. If `min_intra < 0.4`
 ### Run
 
 ```powershell
-# With real audio (requires models)
+# Verify every model loads, then exit (no microphone required)
+python -m winvoice --check
+
+# Run for real (needs models + a microphone)
 python -m winvoice
 
-# With stub audio (no sherpa-onnx/models needed - for development)
+# Run with model-free stubs (development / plumbing checks)
 python -m winvoice --stub-audio
-
-# Test pipeline initialization only
-python -m winvoice --test-pipeline
 ```
 
 ### Development commands
 
 ```powershell
-# Run unit tests
-pytest tests/unit -v
+# All tests (unit + integration + e2e)
+python -m pytest tests/ -q
 
-# Run integration tests (requires models)
-pytest tests/integration -v
+# Only the fast unit tests
+python -m pytest tests/unit -q
+
+# Exercise every audio engine against the real installed models
+python scripts/smoke_test_models.py
 
 # Type checking
 mypy winvoice

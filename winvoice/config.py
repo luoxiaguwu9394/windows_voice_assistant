@@ -9,7 +9,9 @@ Configuration management with hot-reload support.
 
 from __future__ import annotations
 
+import logging as _stdlib_logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -20,6 +22,10 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from .contracts import ConfigChanged
+
+# NOTE: using stdlib logging (not winvoice.logging) because winvoice.logging
+# imports this module — a structlog import here would be circular.
+_log = _stdlib_logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -145,23 +151,81 @@ class ConfigManager:
 
     # ─── Internal ──────────────────────────────────────────────
 
-    def _load(self) -> None:
+    def _load(self, strict: bool = False) -> None:
+        """
+        Read, expand and parse the YAML config.
+
+        `${VAR}` placeholders are expanded from the environment. An
+        unresolved placeholder is tolerated when it sits inside a section
+        that is explicitly disabled (e.g. `llm.remote.enabled: false`),
+        because an unused feature must not stop the assistant from booting.
+        Any other unresolved placeholder raises, naming the offending key
+        path so the fix is obvious.
+        """
         if not self.config_path.exists():
             raise FileNotFoundError(f"Config not found: {self.config_path}")
 
         with open(self.config_path, "r", encoding="utf-8") as f:
             raw = f.read()
 
-        # Expand ${VAR} -> os.environ["VAR"]
         expanded = os.path.expandvars(raw)
-
-        # Check for unresolved variables
-        import re
-        unresolved = re.findall(r"\$\{([^}]+)\}", expanded)
-        if unresolved:
-            raise ValueError(f"Unresolved environment variables: {unresolved}")
-
         self._config = yaml.safe_load(expanded) or {}
+
+        unresolved = self._find_unresolved(self._config)
+        tolerated: List[str] = []
+
+        for path in unresolved:
+            if strict or not self._is_in_disabled_section(path):
+                raise ValueError(
+                    f"Unresolved environment variable at '{path}'.\n"
+                    f"  Set it, e.g.:  setx {path.rsplit('.', 1)[-1].upper()} \"<value>\"\n"
+                    f"  …or disable the feature that needs it in {self.config_path.name}."
+                )
+            tolerated.append(path)
+
+        if tolerated:
+            for path in tolerated:
+                self._blank_out(path)
+            _log.warning(
+                "config: unresolved env var(s) %s ignored because the owning "
+                "section is disabled; substituted empty string",
+                ", ".join(tolerated),
+            )
+
+    @staticmethod
+    def _find_unresolved(config: Dict[str, Any], prefix: str = "") -> List[str]:
+        """Return dotted key paths whose (string) value still has a ${VAR} token."""
+        out: List[str] = []
+        for key, value in (config or {}).items():
+            path = f"{prefix}.{key}" if prefix else key
+            if isinstance(value, dict):
+                out.extend(ConfigManager._find_unresolved(value, path))
+            elif isinstance(value, str) and "${" in value:
+                out.append(path)
+        return out
+
+    def _is_in_disabled_section(self, path: str) -> bool:
+        """True when `path` belongs to a section carrying `enabled: false`."""
+        parts = path.split(".")
+        for depth in range(len(parts) - 1, 0, -1):
+            node: Any = self._config
+            for key in parts[:depth]:
+                if not isinstance(node, dict) or key not in node:
+                    node = None
+                    break
+                node = node[key]
+            if isinstance(node, dict) and node.get("enabled") is False:
+                return True
+        return False
+
+    def _blank_out(self, path: str) -> None:
+        """Replace a `${VAR}` placeholder with an empty string."""
+        parts = path.split(".")
+        node: Any = self._config
+        for key in parts[:-1]:
+            node = node[key]
+        value = node[parts[-1]]
+        node[parts[-1]] = re.sub(r"\$\{[^}]+\}", "", value)
 
     def _reload(self) -> None:
         old_config = self._config.copy()

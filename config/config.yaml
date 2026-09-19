@@ -8,23 +8,29 @@ audio:
   kws_during_tts: true         # Keep KWS active during TTS for barge-in
 
 kws:
-  model: "models/kws/zipformer-zh-en"
+  # Extracted from sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2
+  model: "models/kws/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
   keywords:
     - "assistant"
     - "hey assistant"
   threshold: 0.25              # Detection threshold (0.0-1.0)
 
 vad:
-  model: "models/vad/silero"
+  # Silero VAD v5 (single .onnx file)
+  model: "models/vad/silero_vad_v5.onnx"
   min_silence_ms: 500          # Minimum silence to end segment
   min_speech_ms: 250           # Minimum speech to start segment
 
 asr:
-  model: "models/asr/sense-voice"
+  # SenseVoice int8 (zh/en/ja/ko/yue, ITN supported)
+  model: "models/asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/model.int8.onnx"
+  tokens: "models/asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/tokens.txt"
   language: "auto"             # auto, zh, en, ja, ko, yue
+  use_itn: true                # inverse text normalization (punctuation)
 
 sv:
-  model: "models/sv/campplus"
+  # sherpa-onnx speaker embedding model (3D-Speaker CAM++)
+  model: "models/sv/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
   enabled: true
   threshold_high: 0.60         # Provisional; calibrated after enrollment
   threshold_low: 0.40          # Provisional; calibrated after enrollment
@@ -34,20 +40,29 @@ sv:
 
 llm:
   local:
-    base_url: "http://localhost:11434/v1"
+    base_url: "http://localhost:8080/v1"   # llama.cpp server with GBNF grammar
     api_key: "ollama"
-    model: "qwen2.5:7b-instruct"
-    confidence_threshold: 0.70  # Escalate to cloud if below this
+    model: "qwen2.5-3b-instruct"           # 小模型：3B 约 2.2GB (Q4_K_M)，灵耀14 Air 轻松跑满
+    # 备选小模型：
+    #   qwen2.5-1.5b-instruct  (~1.2GB, 极速，勉强够用)
+    #   qwen2.5-3b-instruct    (~2.2GB, 推荐，平衡速度/质量)
+    #   phi-3-mini-4k-instruct (~2.4GB, 指令遵循强)
+    #   gemma-2-2b-instruct    (~1.6GB, 多语言好)
+    #   llama-3.2-3b-instruct  (~2.0GB, 新架构)
+    confidence_threshold: 0.65             # 小模型阈值略低，依赖 GBNF 保证格式
 
   remote:
-    enabled: true
+    # Off by default: this is a placeholder endpoint. Enable it and fill in a
+    # real OpenAI-compatible base_url + API key before switching this to true.
+    enabled: false
     base_url: "https://your-api-endpoint/v1"
     api_key: "${REMOTE_API_KEY}"  # Expanded from environment variable
     model: "gpt-4o"
     guest_allowed: false        # Guests cannot trigger cloud calls
 
 tts:
-  model: "models/tts/piper-zh"
+  # Chinese VITS (icefall aishell3, 174 speakers)
+  model: "models/tts/vits-icefall-zh-aishell3"
   voice: "default"             # default or guest
   guest_voice: "guest"
 

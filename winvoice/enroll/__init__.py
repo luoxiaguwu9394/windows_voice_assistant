@@ -1,11 +1,13 @@
 """
-Speaker Enrollment Module Entry Point.
+Speaker enrollment module.
 
-Usage: python -m winvoice.enroll --speaker me --samples 8
+Usage:
+    python -m winvoice.enroll --speaker me --samples 8
+
+The implementation lives in ``session.py``; ``__main__.py`` is a thin
+entry point so the package stays importable without side effects.
 """
 
-from .enroll import main
+from .session import EnrollmentSession, main
 
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+__all__ = ["EnrollmentSession", "main"]

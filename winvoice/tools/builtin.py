@@ -34,16 +34,19 @@ ALLOWED_APPS = {
 
 
 def open_app(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Open an application."""
-    app = args.get("app", "").lower()
+    """Open an application from the allowlist."""
+    app = str(args.get("app", "")).lower()
     if app not in ALLOWED_APPS:
-        return {"success": False, "error": f"App not allowed: {app}. Allowed: {list(ALLOWED_APPS.keys())}"}
+        return {
+            "success": False,
+            "error": f"App not allowed: {app}. Allowed: {list(ALLOWED_APPS.keys())}",
+        }
 
+    cmd = ALLOWED_APPS[app]
     try:
-        cmd = ALLOWED_APPS[app]
         if cmd.startswith("ms-"):
-            import subprocess
-            subprocess.run(["start", "", cmd], shell=True, check=True)
+            # URI-style targets (e.g. ms-settings:) must go through `start`.
+            subprocess.run(["cmd", "/c", "start", "", cmd], check=True, capture_output=True)
         else:
             subprocess.Popen(cmd, shell=True)
         return {"success": True, "message": f"Opened {app}"}
@@ -52,15 +55,14 @@ def open_app(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def close_app(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Close an application."""
-    app = args.get("app", "").lower()
+    """Close an application from the allowlist."""
+    app = str(args.get("app", "")).lower()
     if app not in ALLOWED_APPS:
         return {"success": False, "error": f"App not allowed: {app}"}
 
+    exe = ALLOWED_APPS[app]
     try:
-        exe = ALLOWED_APPS[app]
         if exe.endswith(".exe"):
-            import subprocess
             subprocess.run(["taskkill", "/f", "/im", exe], capture_output=True)
         return {"success": True, "message": f"Closed {app}"}
     except Exception as e:
@@ -72,30 +74,90 @@ def close_app(args: Dict[str, Any]) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────
 
 def set_volume(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Adjust system volume."""
+    """
+    Adjust the system volume.
+
+    Implemented via the Windows Core Audio endpoint volume through
+    PowerShell, which needs no extra dependency beyond pywin32's runtime.
+    """
     try:
         delta = int(args.get("delta", 0))
-        # Use nircmd or PowerShell for volume control
-        # Simplified: use PowerShell
-        import subprocess
-        # Get current volume and adjust (simplified)
-        script = f"""
-        Add-Type -TypeDefinition @'
-        using System.Runtime.InteropServices;
-        public class Audio {{
-            [DllImport("winmm.dll")] public static extern int waveOutGetVolume(IntPtr hwo, out uint dwVolume);
-            [DllImport("winmm.dll")] public static extern int waveOutSetVolume(IntPtr hwo, uint dwVolume);
-        }}
+    except (TypeError, ValueError):
+        return {"success": False, "error": f"delta must be an integer, got {args.get('delta')!r}"}
+
+    # 1 unit of `delta` == 1 percentage point.
+    step = max(-100, min(100, delta))
+    script = f"""
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+[Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IAudioEndpointVolume {{
+  int NotImpl1();
+  int NotImpl2();
+  int GetChannelCount(out uint c);
+  int SetMasterVolumeLevel(float level, ref System.Guid ctx);
+  int SetMasterVolumeLevelScalar(float level, ref System.Guid ctx);
+  int GetMasterVolumeLevel(out float level);
+  int GetMasterVolumeLevelScalar(out float level);
+}}
+[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDevice {{
+  int Activate(ref System.Guid id, int clsCtx, System.IntPtr activationParams, [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.IUnknown)] out object iface);
+}}
+[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDeviceEnumerator {{
+  int NotImpl1();
+  int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice endpoint);
+}}
+[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumeratorComObject {{ }}
+public class Audio {{
+  public static void SetVolumeScalar(float level) {{
+    var enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+    IMMDevice dev; enumerator.GetDefaultAudioEndpoint(0, 1, out dev);
+    var guid = typeof(IAudioEndpointVolume).GUID;
+    object o; dev.Activate(ref guid, 23, System.IntPtr.Zero, out o);
+    var vol = (IAudioEndpointVolume)o;
+    var ctx = System.Guid.Empty;
+    vol.SetMasterVolumeLevelScalar(level, ref ctx);
+  }}
+  public static float GetVolumeScalar() {{
+    var enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+    IMMDevice dev; enumerator.GetDefaultAudioEndpoint(0, 1, out dev);
+    var guid = typeof(IAudioEndpointVolume).GUID;
+    object o; dev.Activate(ref guid, 23, System.IntPtr.Zero, out o);
+    var vol = (IAudioEndpointVolume)o;
+    float level; vol.GetMasterVolumeLevelScalar(out level);
+    return level;
+  }}
+}}
 '@
-        $vol = 0
-        [Audio]::waveOutGetVolume([IntPtr]::Zero, [ref]$vol)
-        $newVol = [Math]::Max(0, [Math]::Min(0xFFFF, $vol + {delta * 655}))  # rough scaling
-        [Audio]::waveOutSetVolume([IntPtr]::Zero, $newVol)
-        """
-        subprocess.run(["powershell", "-Command", script], capture_output=True)
-        return {"success": True, "message": f"Volume adjusted by {delta}"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+$current = [Audio]::GetVolumeScalar()
+$target = [Math]::Max(0.0, [Math]::Min(1.0, $current + ({step} / 100.0)))
+[Audio]::SetVolumeScalar($target)
+Write-Output ([int]($target * 100))
+"""
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "volume control timed out"}
+
+    if proc.returncode != 0:
+        return {
+            "success": False,
+            "error": (proc.stderr or "volume control failed").strip()[:400],
+        }
+
+    applied = (proc.stdout or "").strip().splitlines()[-1:] or [""]
+    return {
+        "success": True,
+        "message": f"Volume adjusted by {step} (now ~{applied[0]}%)",
+    }
 
 
 # ──────────────────────────────────────────────────────────────
@@ -104,36 +166,44 @@ def set_volume(args: Dict[str, Any]) -> Dict[str, Any]:
 
 def media_control(args: Dict[str, Any]) -> Dict[str, Any]:
     """Control media playback (global media keys)."""
-    action = args.get("action", "").lower()
+    action = str(args.get("action", "")).lower()
     key_map = {
-        "play": "0xB3",      # VK_MEDIA_PLAY_PAUSE
-        "pause": "0xB3",
-        "next": "0xB0",      # VK_MEDIA_NEXT_TRACK
-        "prev": "0xB1",      # VK_MEDIA_PREV_TRACK
+        "play": 0xB3,   # VK_MEDIA_PLAY_PAUSE
+        "pause": 0xB3,
+        "next": 0xB0,   # VK_MEDIA_NEXT_TRACK
+        "prev": 0xB1,   # VK_MEDIA_PREV_TRACK
     }
 
     if action not in key_map:
         return {"success": False, "error": f"Unknown action: {action}"}
 
-    try:
-        import subprocess
-        # Send media key via PowerShell
-        vk = key_map[action]
-        script = f"""
-        Add-Type -TypeDefinition @'
-        using System;
-        using System.Runtime.InteropServices;
-        public class Keys {{
-            [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
-        }}
+    vk = key_map[action]
+    script = f"""
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class Keys {{
+    [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+}}
 '@
-        [Keys]::keybd_event({vk}, 0, 0, [UIntPtr]::Zero)
-        [Keys]::keybd_event({vk}, 0, 2, [UIntPtr]::Zero)  # KEYEVENTF_KEYUP
-        """
-        subprocess.run(["powershell", "-Command", script], capture_output=True)
-        return {"success": True, "message": f"Media {action}"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+[Keys]::keybd_event({vk}, 0, 0, [UIntPtr]::Zero)
+[Keys]::keybd_event({vk}, 0, 2, [UIntPtr]::Zero)  # KEYEVENTF_KEYUP
+"""
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "media key timed out"}
+
+    if proc.returncode != 0:
+        return {"success": False, "error": (proc.stderr or "media key failed").strip()[:400]}
+
+    return {"success": True, "message": f"Media {action}"}
 
 
 # ──────────────────────────────────────────────────────────────

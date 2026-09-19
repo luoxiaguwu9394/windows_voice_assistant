@@ -60,28 +60,39 @@ _configured = False
 _config_lock = threading.Lock()
 
 
+def _normalise_process_name(process_name: "ProcessName | str") -> str:
+    """Accept either a ProcessName member or a plain string."""
+    if isinstance(process_name, ProcessName):
+        return process_name.value
+    return str(process_name)
+
+
 def configure_logging(
-    process_name: ProcessName = ProcessName.MAIN,
+    process_name: "ProcessName | str" = ProcessName.MAIN,
     log_dir: str | Path = "logs",
     level: str = "INFO",
     json_lines: bool = True,
 ) -> structlog.BoundLogger:
     """
     Configure structlog once per process.
-    Returns a bound logger with process_name and trace_id context.
+
+    `process_name` accepts either a ProcessName member or a plain string
+    (e.g. "main", "enroll"). Returns a logger bound with that name.
     """
     global _configured
 
+    proc = _normalise_process_name(process_name)
+
     with _config_lock:
         if _configured:
-            return structlog.get_logger().bind(process=process_name.value)
+            return structlog.get_logger().bind(process=proc)
 
         log_path = Path(log_dir)
         log_path.mkdir(parents=True, exist_ok=True)
 
         # File handler with daily rotation + gzip
         file_handler = logging.handlers.TimedRotatingFileHandler(
-            log_path / f"{process_name.value}.jsonl",
+            log_path / f"{proc}.jsonl",
             when="midnight",
             interval=1,
             backupCount=7,
@@ -134,7 +145,7 @@ def configure_logging(
 
         _configured = True
 
-    logger = structlog.get_logger().bind(process=process_name.value)
+    logger = structlog.get_logger().bind(process=proc)
     return logger
 
 

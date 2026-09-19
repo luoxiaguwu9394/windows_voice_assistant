@@ -75,11 +75,23 @@ class LocalLlmBackend:
         self.grammar = grammar
         self._client = httpx.AsyncClient(timeout=30.0)
 
-        # Allowed models whitelist
+        # Allowed models whitelist (包含小模型，适配轻量级设备)
         self.allowed_models = {
+            # 原有大模型
             "qwen2.5:7b-instruct",
             "qwen2.5:14b-instruct",
             "qwen2.5:32b-instruct",
+            # 新增小模型（推荐用于灵耀14 Air 等轻薄本）
+            "qwen2.5-1.5b-instruct",
+            "qwen2.5-3b-instruct",
+            "qwen2.5-0.5b-instruct",
+            "phi-3-mini-4k-instruct",
+            "phi-3.5-mini-instruct",
+            "gemma-2-2b-instruct",
+            "gemma-2-9b-instruct",
+            "llama-3.2-1b-instruct",
+            "llama-3.2-3b-instruct",
+            "llama-3.1-8b-instruct",
         }
 
     async def complete(self, prompt: str, grammar: Optional[str] = None) -> LlmResponse:

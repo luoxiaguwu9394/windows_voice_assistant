@@ -18,6 +18,19 @@ from pydantic import BaseModel, Field, model_validator
 
 
 # ──────────────────────────────────────────────────────────────
+# Trace-id helper
+#
+# Every message carries a `trace_id`. Pydantic v2 has no way to attach a
+# "before" validator after class creation, so each model declares trace_id
+# with this default_factory: an omitted trace_id is generated, an explicit
+# one is preserved.
+# ──────────────────────────────────────────────────────────────
+
+def new_trace_id() -> str:
+    return uuid.uuid4().hex[:16]
+
+
+# ──────────────────────────────────────────────────────────────
 # Base & Enums
 # ──────────────────────────────────────────────────────────────
 
@@ -83,7 +96,7 @@ class IntentName(str, Enum):
 class AudioFrame(BaseModel):
     """Raw PCM frame from microphone (16 kHz, mono, int16)."""
     schema_version: int = 1
-    trace_id: str
+    trace_id: str = Field(default_factory=new_trace_id)
     span_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     timestamp_ms: int
     data: bytes  # int16 little-endian
@@ -95,7 +108,7 @@ class AudioFrame(BaseModel):
 class KwsTriggered(BaseModel):
     """Wake-word detected."""
     schema_version: int = 1
-    trace_id: str
+    trace_id: str = Field(default_factory=new_trace_id)
     span_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     keyword: str
     confidence: float
@@ -105,7 +118,7 @@ class KwsTriggered(BaseModel):
 class SvResult(BaseModel):
     """Speaker verification result."""
     schema_version: int = 1
-    trace_id: str
+    trace_id: str = Field(default_factory=new_trace_id)
     span_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     speaker_id: str  # enrolled speaker label, e.g. "me"
     score: float
@@ -117,7 +130,7 @@ class SvResult(BaseModel):
 class VadSegment(BaseModel):
     """Voice activity segment ready for ASR."""
     schema_version: int = 1
-    trace_id: str
+    trace_id: str = Field(default_factory=new_trace_id)
     span_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     audio_frames: List[AudioFrame]
     start_ms: int
@@ -127,7 +140,7 @@ class VadSegment(BaseModel):
 class AsrResult(BaseModel):
     """ASR transcription result."""
     schema_version: int = 1
-    trace_id: str
+    trace_id: str = Field(default_factory=new_trace_id)
     span_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     text: str
     language: str
@@ -142,7 +155,7 @@ class AsrResult(BaseModel):
 class IntentResult(BaseModel):
     """Structured intent from rules / classifier / cloud."""
     schema_version: int = 1
-    trace_id: str
+    trace_id: str = Field(default_factory=new_trace_id)
     span_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     intent: IntentName
     args: Dict[str, Any]
@@ -159,7 +172,7 @@ class IntentResult(BaseModel):
 class ToolCall(BaseModel):
     """Tool invocation request."""
     schema_version: int = 1
-    trace_id: str
+    trace_id: str = Field(default_factory=new_trace_id)
     span_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     tool: ToolName
     args: Dict[str, Any]
@@ -170,7 +183,7 @@ class ToolCall(BaseModel):
 class ToolResult(BaseModel):
     """Tool execution result."""
     schema_version: int = 1
-    trace_id: str
+    trace_id: str = Field(default_factory=new_trace_id)
     span_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     tool: ToolName
     success: bool
@@ -186,7 +199,7 @@ class ToolResult(BaseModel):
 class TtsRequest(BaseModel):
     """Request to synthesize speech."""
     schema_version: int = 1
-    trace_id: str
+    trace_id: str = Field(default_factory=new_trace_id)
     span_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     text: str
     voice: str = "default"  # or "guest"
@@ -196,7 +209,7 @@ class TtsRequest(BaseModel):
 class TtsChunk(BaseModel):
     """Streaming audio chunk from TTS."""
     schema_version: int = 1
-    trace_id: str
+    trace_id: str = Field(default_factory=new_trace_id)
     span_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     data: bytes  # int16 PCM
     is_final: bool = False
@@ -205,7 +218,7 @@ class TtsChunk(BaseModel):
 class InterruptTTS(BaseModel):
     """Immediate TTS interruption (barge-in)."""
     schema_version: int = 1
-    trace_id: str
+    trace_id: str = Field(default_factory=new_trace_id)
     span_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     reason: str = "kws_barge_in"
 
@@ -217,7 +230,7 @@ class InterruptTTS(BaseModel):
 class ConfigChanged(BaseModel):
     """Hot-reloadable config change notification."""
     schema_version: int = 1
-    trace_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:16])
+    trace_id: str = Field(default_factory=new_trace_id)
     changed_keys: List[str]
     new_values: Dict[str, Any]
 
@@ -225,7 +238,7 @@ class ConfigChanged(BaseModel):
 class SystemState(BaseModel):
     """Current pipeline state for UI."""
     schema_version: int = 1
-    trace_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:16])
+    trace_id: str = Field(default_factory=new_trace_id)
     state: SystemStateName
     message: str = ""
 
@@ -233,7 +246,7 @@ class SystemState(BaseModel):
 class ErrorReport(BaseModel):
     """Structured error for logging/crash reporting."""
     schema_version: int = 1
-    trace_id: str
+    trace_id: str = Field(default_factory=new_trace_id)
     span_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     process: ProcessName
     error_type: str
@@ -242,21 +255,3 @@ class ErrorReport(BaseModel):
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 
-# ──────────────────────────────────────────────────────────────
-# Validation Helpers
-# ──────────────────────────────────────────────────────────────
-
-def ensure_trace_id(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Validator to ensure trace_id exists (backward compat)."""
-    if "trace_id" not in data:
-        data["trace_id"] = uuid.uuid4().hex[:16]
-    return data
-
-
-# Apply to all models
-for model in [
-    AudioFrame, KwsTriggered, SvResult, VadSegment, AsrResult,
-    IntentResult, ToolCall, ToolResult, TtsRequest, TtsChunk,
-    InterruptTTS, ConfigChanged, SystemState, ErrorReport
-]:
-    model.model_validator(mode="before")(ensure_trace_id)
