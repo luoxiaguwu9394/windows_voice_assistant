@@ -32,8 +32,27 @@ sv:
   # sherpa-onnx speaker embedding model (3D-Speaker CAM++)
   model: "models/sv/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
   enabled: true
-  threshold_high: 0.60         # Provisional; calibrated after enrollment
-  threshold_low: 0.40          # Provisional; calibrated after enrollment
+  profiles_dir: "models/sv/profiles"
+
+  # Thresholds are WRITTEN BY THE ENROLLMENT TOOL; do not hand-edit.
+  #   score >= threshold_high -> full
+  #   score >= threshold_low  -> guest
+  #   otherwise               -> rejected
+  # threshold_high MUST be greater than threshold_low, otherwise the guest band
+  # collapses and every score above the lower bar is promoted to "full".
+  threshold_high: 0.60
+  threshold_low: 0.40
+
+  # Estimated similarity to the most similar NON-target speaker. This cannot be
+  # measured from a single enrolled speaker, so it is an estimate (AISHELL-3 /
+  # CN-Celeb reference range). Lower it if enrollment reports that T_high would
+  # fall below T_low.
+  max_inter: 0.45
+
+  offset_high: 0.05            # margin subtracted from min_intra
+  offset_low: 0.05             # margin added to max_inter
+  min_gap: 0.05                # T_high must exceed T_low by at least this much
+
   adaptive_update: true        # Update embeddings on successful verification
   update_weight: 0.05          # EMA weight for adaptive update
   anchor_check_days: 30        # Days between anchor checks

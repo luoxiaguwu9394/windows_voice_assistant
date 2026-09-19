@@ -32,11 +32,20 @@ CHUNK = 1600  # 100 ms at 16 kHz
 class EnrollmentSession:
     """Drives the interactive enrollment flow."""
 
-    def __init__(self, speaker_id: str, num_samples: int = 8, sample_duration: float = 4.0):
+    def __init__(
+        self,
+        speaker_id: str,
+        num_samples: int = 8,
+        sample_duration: float = 4.0,
+        max_inter: Optional[float] = None,
+        min_gap: Optional[float] = None,
+    ):
         self.speaker_id = speaker_id
         self.num_samples = num_samples
         self.sample_duration = sample_duration
         self.sample_rate = SAMPLE_RATE
+        self.max_inter = max_inter
+        self.min_gap = min_gap
         self.sv_engine = create_sv_engine(use_stub=False)
         # KWS is initialized too so a broken wake-word model surfaces here
         # rather than at first run of the assistant.
@@ -87,8 +96,9 @@ class EnrollmentSession:
     def add_sample(self, audio: np.ndarray) -> bool:
         return self.sv_engine.enroll_sample(self.speaker_id, audio)
 
-    def finalize(self, max_inter: float):
-        return self.sv_engine.enroll_finalize(self.speaker_id, max_inter=max_inter)
+    def finalize(self):
+        """Derive thresholds; raises ValueError when the data is not separable."""
+        return self.sv_engine.enroll_finalize(self.speaker_id, max_inter=self.max_inter)
 
 
 async def main() -> int:
@@ -96,8 +106,11 @@ async def main() -> int:
     parser.add_argument("--speaker", default="me", help="speaker id (default: me)")
     parser.add_argument("--samples", type=int, default=8, help="number of samples (default: 8)")
     parser.add_argument("--duration", type=float, default=4.0, help="seconds per sample (default: 4.0)")
-    parser.add_argument("--max-inter", type=float, default=0.45,
-                        help="estimated max similarity to a non-target speaker (default: 0.45)")
+    parser.add_argument("--max-inter", type=float, default=None,
+                        help="estimated max similarity to a non-target speaker "
+                             "(default: sv.max_inter from config.yaml)")
+    parser.add_argument("--min-gap", type=float, default=None,
+                        help="minimum required T_high - T_low (default: sv.min_gap)")
     parser.add_argument("--config", default="config/config.yaml", help="config file path")
     parser.add_argument("--force", action="store_true", help="overwrite an existing enrollment")
     args = parser.parse_args()
@@ -106,14 +119,22 @@ async def main() -> int:
     cfg = get_config(args.config)
     configure_logging(process_name="enroll", level="INFO")
 
+    max_inter = args.max_inter if args.max_inter is not None else float(cfg.get("sv.max_inter", 0.45))
+    min_gap = args.min_gap if args.min_gap is not None else float(cfg.get("sv.min_gap", 0.05))
+
     print("=" * 64)
     print("Speaker enrollment")
     print(f"  speaker          : {args.speaker}")
     print(f"  samples          : {args.samples} x {args.duration:.0f}s")
-    print(f"  min speech floor : 0.40 (samples below this are rejected)")
+    print(f"  min speech floor : 0.40  (samples scoring below this are rejected)")
+    print(f"  max_inter        : {max_inter:.2f}  (estimated impostor similarity)")
+    print(f"  required gap     : {min_gap:.2f}  (T_high must exceed T_low by this)")
     print("=" * 64)
 
-    session = EnrollmentSession(args.speaker, args.samples, args.duration)
+    session = EnrollmentSession(
+        args.speaker, args.samples, args.duration,
+        max_inter=max_inter, min_gap=min_gap,
+    )
 
     try:
         await session.initialize(force=args.force)
@@ -138,16 +159,27 @@ async def main() -> int:
                 return 3
 
     try:
-        profile = session.finalize(args.max_inter)
+        profile = session.finalize()
     except ValueError as e:
-        print(f"\n[X] Enrollment failed: {e}")
+        print(f"\n[X] Enrollment failed:\n{e}")
         return 1
 
+    gap = profile.threshold_high - profile.threshold_low
     print("\n" + "=" * 64)
     print(f"[OK] Enrollment complete for '{args.speaker}'")
     print(f"     samples         : {len(profile.embeddings)}")
-    print(f"     threshold HIGH  : {profile.threshold_high:.3f}")
-    print(f"     threshold LOW   : {profile.threshold_low:.3f}")
+    print(f"     threshold HIGH  : {profile.threshold_high:.3f}   (>= this -> full)")
+    print(f"     threshold LOW   : {profile.threshold_low:.3f}   (>= this -> guest)")
+    print(f"     gap             : {gap:.3f}   (T_high - T_low, must be > 0)")
     print(f"     profile saved   : models/sv/profiles/{args.speaker}.json")
+
+    if gap < 2 * min_gap:
+        print()
+        print("     [!] CAUTION: this margin is thin.")
+        print("         Your genuine and impostor score ranges are close together,")
+        print("         so T_high is low and a similar-sounding voice could reach")
+        print("         the 'full' tier. The profile works, but re-recording in a")
+        print("         quieter room (closer mic, steady volume) would raise")
+        print("         min_intra and give a much larger margin.")
     print("=" * 64)
     return 0

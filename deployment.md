@@ -378,30 +378,108 @@ cd C:\Users\<you>\Desktop\windows_voice_assistant
 # 注册 8 个样本 (每个 3-5 秒，变化音量/距离/内容)
 python -m winvoice.enroll --speaker me --samples 8 --duration 4
 
-# 交互过程：
-# ================================================================
-# Speaker enrollment
-#   speaker          : me
-#   samples          : 8 x 4s
-#   min speech floor : 0.40 (samples below this are rejected)
-# ================================================================
-# [*] Sample 1/8 - speak for 4s
-#     (vary wording, volume and distance)
-#     starting in 3... recording...
-#     done.
-# ...
-# [OK] Enrollment complete for 'me'
-#      samples         : 8
-#      threshold HIGH  : 0.623
-#      threshold LOW   : 0.450
-#      profile saved   : models/sv/profiles/me.json
+# 可选参数：
+#   --max-inter 0.35   降低「冒充者相似度」估计（见下方故障说明）
+#   --min-gap   0.05   要求的最小间隔
+#   --force            覆盖已有注册
 ```
 
-> **提示**：
-> - 安静环境，贴近麦克风
+**阈值怎么来的：**
+
+```
+T_high = min_intra - offset_high      # score >= T_high -> full  (完整权限)
+T_low  = max_inter + offset_low       # score >= T_low  -> guest (访客权限)
+                                      # 否则            -> rejected
+```
+
+- `min_intra`：你自己 8 个样本两两余弦相似度的**最小值**（实测得出）
+- `max_inter`：与**最相似的非目标说话人**的相似度（**只能是估计值**，来自
+  AISHELL-3 / CN-Celeb 参考区间，无法从单个注册者身上测得）
+
+> ⚠️ **T_high 必须大于 T_low**。若反过来，分级阶梯会塌陷：
+> `score >= T_high` 先判定，于是**任何高于较低门槛的分数都被直接提升为
+> full**（可写文件、可执行脚本）。这是安全漏洞，不是显示问题。
+> 因此注册时会强制校验，不通过就**拒绝写入**并给出修复方法。
+
+**正常输出：**
+```
+================================================================
+Speaker enrollment
+  speaker          : me
+  samples          : 8 x 4s
+  min speech floor : 0.40  (samples scoring below this are rejected)
+  max_inter        : 0.45  (estimated impostor similarity)
+  required gap     : 0.05  (T_high must exceed T_low by this)
+================================================================
+[*] Sample 1/8 - speak for 4s
+    (vary wording, volume and distance)
+    starting in 3... recording...
+    done.
+...
+[OK] Enrollment complete for 'me'
+     samples         : 8
+     threshold HIGH  : 0.623   (>= this -> full)
+     threshold LOW   : 0.450   (>= this -> guest)
+     gap             : 0.173   (T_high - T_low, must be > 0)
+     profile saved   : models/sv/profiles/me.json
+================================================================
+```
+
+### 7.1 注册失败：「cannot separate」（T_high 会低于 T_low）
+
+实测样例：
+```
+[X] Enrollment failed:
+Enrolment cannot separate you from other speakers with these settings.
+  min_intra        = 0.524  (your worst self-similarity)
+  max_inter        = 0.450  (estimated impostor similarity)
+  T_high would be  = 0.474
+  T_low  would be  = 0.500
+  gap              = -0.026  (need >= 0.05)
+```
+
+含义：**你自己的最差自相似度（0.524）离「冒充者估计值」（0.450）太近了**，
+两个分数区间重叠，无法划分权限。两种修法：
+
+| 方案 | 命令 | 效果 |
+|------|------|------|
+| **A. 降低冒充者估计**（`max_inter` 本来只是猜测） | `python -m winvoice.enroll --speaker me --samples 8 --force --max-inter 0.37` | 立即可用，但余量很薄（gap≈0.05），`T_high` 仅 0.474 |
+| **B. 重新录制**（推荐） | 安静环境、贴近麦克风、音量稳定，再跑一次不带 `--max-inter` 的注册 | `min_intra` 可达 0.65+，得到健康余量（T_high≈0.60 / T_low≈0.50） |
+
+> `min_intra` 只有 0.524 本身就说明**录音一致性不够**（距离/音量/噪声变化大）。
+> CAM++ 在稳定录音上，同一人的自相似度通常在 0.7 以上。
+> 方案 A 能让你立刻用上，但保护强度有限 —— 相似嗓音在 0.48 左右就会被判为 full。
+
+### 7.2 注册成功但余量偏薄
+
+若 `gap` 小于 `2 × min_gap`（默认 0.10），会打印：
+
+```
+     [!] CAUTION: this margin is thin.
+         Your genuine and impostor score ranges are close together,
+         so T_high is low and a similar-sounding voice could reach
+         the 'full' tier. ...
+```
+
+此时功能正常，但建议按方案 B 重新录制以提高保护强度。
+
+### 7.3 坏 profile 会被自动拒绝
+
+若磁盘上已存在**阈值倒置**的 profile（例如早期版本生成的），启动时会：
+
+```
+[error] sv_profile_rejected_inverted_thresholds
+        action='re-enroll: python -m winvoice.enroll --speaker me --samples 8 --force'
+        detail="T_high must exceed T_low; this profile would promote low scores to the 'full' tier"
+```
+
+该 profile **不会被加载**（`enrolled=[]`），因此不会误放行；
+重新注册即可恢复。
+
+> **其他提示**
 > - 内容多样化：数字、指令、闲聊
-> - 若 `min_intra < 0.4` 会报错并提示重录
-> - 注册后再跑 `--check`，`enrolled` 应显示 `['me']`
+> - 若 `min_intra < 0.40` 会报错并提示重录
+> - 注册后再跑 `python -m winvoice --check`，`enrolled` 应显示 `['me']`
 
 ---
 
