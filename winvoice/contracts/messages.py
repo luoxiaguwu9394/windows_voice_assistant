@@ -66,6 +66,10 @@ class ToolName(str, Enum):
     READ_FILE = "read_file"
     WRITE_FILE = "write_file"
     RUN_SCRIPT = "run_script"
+    # Read-only queries: no arguments, no confirmation, guest-allowed. They
+    # answer with speech (`ToolResult.message`) instead of an action.
+    GET_TIME = "get_time"
+    GET_WEATHER = "get_weather"
 
 
 class MediaAction(str, Enum):

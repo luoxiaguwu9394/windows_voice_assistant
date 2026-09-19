@@ -2,18 +2,51 @@
 Builtin Tool Implementations.
 
 Each tool is a simple function that takes args dict and returns result.
+
+Two rules govern every string a handler returns (see `spec.md` §6.4):
+
+  * `error` is for logs and callers — it may name tools, argument keys and
+    paths, so English is fine there;
+  * `message` is *spoken*. The TTS model (`vits-icefall-zh-aishell3`) has no
+    Latin entries in its lexicon and drops every English word silently, so a
+    message is plain Chinese (digits are fine: `number.fst` expands them).
+    Anything else must be run through `_speakable()` (or dropped) first.
+
+Handlers may be sync or async: `ToolExecutor.execute` awaits whatever a
+handler returns, which is what lets a network tool do I/O without blocking the
+audio loop. `winvoice/tools/weather.py` is that one tool, and it lives apart
+because its reason to change is the provider, not the machine.
 """
 
 from __future__ import annotations
 
 import subprocess
 import webbrowser
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
+from winvoice.contracts import has_latin
 from winvoice.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────
+# Speech helpers
+# ──────────────────────────────────────────────────────────────
+
+def _speakable(value: Any, fallback: str = "") -> str:
+    """
+    `value` when it can be spoken, `fallback` when it cannot.
+
+    Used for anything that comes from outside — an ASR'd app name, a path —
+    because names are precisely where Latin text sneaks into a sentence and
+    leaves a hole in it. The predicate itself is shared with the pipeline
+    (`winvoice/contracts/speech.py`); this only chooses the fallback wording.
+    """
+    text = str(value or "").strip()
+    return text if text and not has_latin(text) else fallback
 
 
 # ──────────────────────────────────────────────────────────────
@@ -61,9 +94,7 @@ def _speakable_name(value: str) -> str:
     lexicon has no Latin entries and silently drops them, which would leave a
     hole where the name should be — so fall back to a generic phrase instead.
     """
-    if value and not any(ch.isascii() and ch.isalpha() for ch in value):
-        return value
-    return "这个程序"
+    return _speakable(value, "这个程序")
 
 
 # Spoken synonyms pinning the user's words onto an allowlisted id. The Chinese
@@ -139,7 +170,7 @@ def open_app(args: Dict[str, Any]) -> Dict[str, Any]:
             subprocess.run(["cmd", "/c", "start", "", cmd], check=True, capture_output=True)
         else:
             subprocess.Popen(cmd, shell=True)
-        return {"success": True, "message": f"Opened {app}"}
+        return {"success": True, "message": f"已经打开{APP_SPEECH[app]}了。"}
     except Exception as e:
         return {"success": False, "error": str(e), "message": f"打开{APP_SPEECH[app]}的时候出错了。"}
 
@@ -160,7 +191,7 @@ def close_app(args: Dict[str, Any]) -> Dict[str, Any]:
     try:
         if exe.endswith(".exe"):
             subprocess.run(["taskkill", "/f", "/im", exe], capture_output=True)
-        return {"success": True, "message": f"Closed {app}"}
+        return {"success": True, "message": f"已经关闭{APP_SPEECH[app]}了。"}
     except Exception as e:
         return {"success": False, "error": str(e), "message": f"关闭{APP_SPEECH[app]}的时候出错了。"}
 
@@ -200,7 +231,6 @@ def set_volume(args: Dict[str, Any]) -> Dict[str, Any]:
                 "message": "我没听清音量要调到多少，请说一个零到一百之间的数字。",
             }
         target_expr = f"{target_pct} / 100.0"
-        summary = f"Volume set to {target_pct}%"
     else:
         try:
             step = int(delta)
@@ -212,7 +242,6 @@ def set_volume(args: Dict[str, Any]) -> Dict[str, Any]:
             }
         step = max(-100, min(100, step))
         target_expr = f"$current + ({step} / 100.0)"
-        summary = f"Volume adjusted by {step}"
 
     # `$current` is read either way so the script body stays identical; it is
     # only part of the target expression in the relative case.
@@ -284,10 +313,12 @@ Write-Output ([int]($target * 100))
         }
 
     applied = (proc.stdout or "").strip().splitlines()[-1:] or [""]
-    return {
-        "success": True,
-        "message": f"{summary} (now ~{applied[0]}%)",
-    }
+    # The Windows script prints the level it actually applied, which is what
+    # the user asked about — not the requested one.
+    reached = applied[0].strip()
+    if not reached.isdigit():
+        return {"success": True, "message": "音量已经调好了。"}
+    return {"success": True, "message": f"音量已经调到百分之{reached}。"}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -297,17 +328,20 @@ Write-Output ([int]($target * 100))
 def media_control(args: Dict[str, Any]) -> Dict[str, Any]:
     """Control media playback (global media keys)."""
     action = str(args.get("action", "")).lower()
-    key_map = {
-        "play": 0xB3,   # VK_MEDIA_PLAY_PAUSE
-        "pause": 0xB3,
-        "next": 0xB0,   # VK_MEDIA_NEXT_TRACK
-        "prev": 0xB1,   # VK_MEDIA_PREV_TRACK
+    # One table per action: the virtual key *and* what to say about it. They
+    # were two maps once, and a fifth action would have had to be added to
+    # both (or the reply would be silent about a working keypress).
+    actions = {
+        "play": (0xB3, "正在播放。"),    # VK_MEDIA_PLAY_PAUSE
+        "pause": (0xB3, "已经暂停。"),
+        "next": (0xB0, "已经切到下一首。"),   # VK_MEDIA_NEXT_TRACK
+        "prev": (0xB1, "已经切到上一首。"),   # VK_MEDIA_PREV_TRACK
     }
 
-    if action not in key_map:
+    if action not in actions:
         return {"success": False, "error": f"Unknown action: {action}"}
 
-    vk = key_map[action]
+    vk, spoken = actions[action]
     script = f"""
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @'
@@ -333,7 +367,7 @@ public class Keys {{
     if proc.returncode != 0:
         return {"success": False, "error": (proc.stderr or "media key failed").strip()[:400]}
 
-    return {"success": True, "message": f"Media {action}"}
+    return {"success": True, "message": spoken}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -349,7 +383,13 @@ def search_web(args: Dict[str, Any]) -> Dict[str, Any]:
     try:
         url = f"https://www.bing.com/search?q={query}"
         webbrowser.open(url)
-        return {"success": True, "message": f"Searching for: {query}"}
+        # The query only reaches the sentence when it is already Chinese: an
+        # English one would be dropped word by word by the TTS lexicon.
+        spoken = _speakable(query, "")
+        return {
+            "success": True,
+            "message": f"已经在浏览器里搜索{spoken}了。" if spoken else "已经打开浏览器了。",
+        }
     except Exception as e:
         return {"success": False, "error": str(e), "message": "打开浏览器的时候出错了。"}
 
@@ -399,7 +439,9 @@ def write_file(args: Dict[str, Any]) -> Dict[str, Any]:
 
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-        return {"success": True, "message": f"Written to {path}", "path": str(path)}
+        # The path itself is never spoken: it is Latin, long, and the user
+        # already knows which file they asked for.
+        return {"success": True, "message": "已经写好了。", "path": str(path)}
     except ValueError:
         return {
             "success": False,
@@ -445,6 +487,9 @@ def run_script(args: Dict[str, Any]) -> Dict[str, Any]:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         return {
             "success": result.returncode == 0,
+            # stdout/stderr stay in the result for the caller; they are English
+            # and unpronounceable often enough that they must never be spoken.
+            "message": "脚本已经运行完了。" if result.returncode == 0 else "脚本运行出错了。",
             "stdout": result.stdout,
             "stderr": result.stderr,
             "returncode": result.returncode,
@@ -460,3 +505,38 @@ def run_script(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("run_script_failed", path=str(path), error=str(e))
         return {"success": False, "error": str(e), "message": "运行这个脚本的时候出错了。"}
+
+
+# ──────────────────────────────────────────────────────────────
+# Time Query
+# ──────────────────────────────────────────────────────────────
+
+# Spoken Chinese uses a 12-hour clock with a period word. 24-hour form is
+# unusable for speech: 00:30 would come out as 「0 点 30 分」 (or worse, 「24 点」
+# if the hour were printed raw), neither of which anyone says out loud.
+_TIME_PERIODS = ((5, "凌晨"), (11, "上午"), (12, "中午"), (17, "下午"), (23, "晚上"))
+
+
+def format_spoken_time(now: datetime) -> str:
+    """The current time as a short sentence the Chinese TTS can pronounce."""
+    period = next(label for last_hour, label in _TIME_PERIODS if now.hour <= last_hour)
+    hour = now.hour % 12 or 12
+    tail = "整" if now.minute == 0 else f" {now.minute} 分"
+    return f"现在是{period} {hour} 点{tail}。"
+
+
+def get_time(args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Report the current local time.
+
+    Zero arguments, zero dependencies, zero network — and it still needs a
+    `message`, because the pipeline speaks `message` and nothing else
+    (see §6.4 of spec.md).
+    """
+    now = datetime.now()
+    return {
+        "success": True,
+        "message": format_spoken_time(now),
+        "time": now.strftime("%H:%M"),
+        "date": now.strftime("%Y-%m-%d"),
+    }

@@ -148,18 +148,21 @@ class TestToolRegistry:
 
     def test_registry_has_all_tools(self):
         registry = ToolRegistry()
-        assert len(registry._tools) == 8  # 8 builtin tools
+        # Every ToolName member must be registered: a name the pipeline can map
+        # onto but the registry does not know is an intent that silently falls
+        # back to 「抱歉，这个请求我还没有实现。」
+        assert set(registry._tools) == set(ToolName)
 
     def test_get_allowed_tools_full_tier(self):
         registry = ToolRegistry()
-        allowed = registry.get_allowed("full")
-        assert len(allowed) == 8
+        allowed = {spec.name for spec in registry.get_allowed("full")}
+        assert allowed == set(ToolName)
 
     def test_get_allowed_tools_guest_tier(self):
         registry = ToolRegistry()
-        allowed = registry.get_allowed("guest")
+        allowed = {spec.name for spec in registry.get_allowed("guest")}
         # Guest denied: read_file, write_file, run_script
-        assert len(allowed) == 5
+        assert allowed == set(ToolName) - {ToolName.READ_FILE, ToolName.WRITE_FILE, ToolName.RUN_SCRIPT}
 
     def test_get_allowed_tools_rejected_tier(self):
         registry = ToolRegistry()

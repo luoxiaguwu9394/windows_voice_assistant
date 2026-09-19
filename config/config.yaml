@@ -100,6 +100,8 @@ tools:
     - "read_file"
     - "write_file"
     - "run_script"
+    - "get_time"
+    - "get_weather"
   guest_denied:
     - "read_file"
     - "write_file"
@@ -108,6 +110,14 @@ tools:
     - "write_file"
     - "run_script"
   confirm_required: true       # Require double confirmation for destructive tools
+
+weather:
+  enabled: true                # false → 「天气查询没有打开。」 (no request is made)
+  city: "北京"                  # used when the sentence does not name a city
+  # Hard limit for the wttr.in request (wttr.in needs no API key). Keep it
+  # small: the assistant says nothing at all until the answer arrives.
+  # Read fresh on every call, so editing this needs no restart.
+  timeout_s: 5
 
 snapshot:
   enabled: true

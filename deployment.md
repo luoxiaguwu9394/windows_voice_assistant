@@ -290,7 +290,15 @@ llm:
 audio:
   input_device: "default"                   # 或指定设备名
   sample_rate: 16000
+
+weather:
+  enabled: true                             # false → 说「天气查询没有打开。」
+  city: "北京"                               # 句子里没说城市时用这个
+  timeout_s: 5                              # wttr.in 无需 API key；别调大，等的时候是静音
 ```
+
+> `weather.*` 每次调用时重新读取，改完**不用重启**（引擎类配置只在启动时读一次，
+> 其余配置项基本都要重启才生效）。
 
 ### 5.2 设置环境变量 (仅云端启用时需要)
 
@@ -566,7 +574,7 @@ python scripts/check_llm.py
 
 ```powershell
 python -m pytest tests/ -q
-# 期望: 152 passed, 1 skipped
+# 期望: 235 passed, 1 skipped
 ```
 
 > 沙箱/受限权限环境下 `tmp_path` 与家目录写入会被拒，表现为若干
@@ -585,8 +593,18 @@ python -m winvoice
 
 # 说唤醒词："assistant" / "小助手" / "你好助手"（关键词集见 §5.3）
 # 然后发指令："打开记事本"、"音量调大 20"、"音量调到百分之十"、"搜索 Python 教程"
+# 查询类："现在几点了"（念出当前时间）、"今天天气怎么样"（念出今日天气）
 # 观察日志输出
 ```
+
+> **查询类的期望回应**
+> ```
+> 现在几点了        → 「现在是下午 3 点 25 分。」
+> 今天天气怎么样    → 「北京今天晴，气温 10 到 20 度，现在 15 度。」
+> （断网/超时）      → 「暂时查不到天气。」
+> ```
+> 天气走 `wttr.in`（无需 API key），城市取句子里说的那个，说不出来就用
+> `weather.city`。天气没打开时回「天气查询没有打开。」
 
 > **实测启动日志（2026-09-19）**
 > ```
@@ -647,6 +665,11 @@ python -m winvoice
 | 说「打开记事本」被拒绝 | 应用名按中文标签/英文 id/近似拼写解析（`记事本`、`notepad`、`Notpa` 都能命中）；不在白名单内的（微信/QQ）仍会拒绝。若要新增，改 `ALLOWED_APPS` + `APP_SPEECH` |
 | 音量「调高」「调低」方向不对 | 方向词已覆盖 `调高/调低/调大/调小/减小/降低/小声/小一点/down/lower…`；绝对量走 `level`（0–100），相对量走 `delta`，两者不可混用 |
 | 写文件/跑脚本永远提示需要确认 | 确认回路尚未实现（`CONFIRMATION_REQUIRED`），见 README「Known limitations」 |
+| 问「现在几点了」回「这个请求我还没有实现」 | 该意图没有映射到工具。检查 `AudioPipeline._intent_to_tool_calls` 里有 `get_time`，且 `ToolName.GET_TIME` 已注册（`pytest tests/unit/test_time_speech.py`） |
+| 天气一直回「暂时查不到天气」 | 1) 有没有网：`python -c "import httpx;print(httpx.get('https://wttr.in/Beijing?format=j1&timeout=5').status_code)"` 2) `weather.enabled` 是否为 `true` 3) `weather.timeout_s` 太小（默认 5 s）4) 说了一个 wttr.in 认不出的地名（会走 `weather.city` 之外的查询） |
+| 天气念成英文 / 缺一半字 | 天气描述必须走内置中文对照表：wttr.in 即使带 `lang=zh` 也只返回英文（`weatherDesc` 与 `lang_zh` 均为英文，已实测）。若出现新的 `weatherCode`，在 `winvoice/tools/weather.py` 的 `WEATHER_CODE_ZH` 补中文，并用 `pytest tests/unit/test_speech_is_pronounceable.py -k weather` 验证这些字在 TTS 词表里 |
+| 工具明明成功了，却只听到「好的，已为您完成。」 | 该工具没有写 `ToolResult.message`，或写的是英文（含拉丁字母会被拒绝并回退）。成功也念 `message`，见 README「Spoken output」 |
+| 答话被截断在半句 | `winvoice/contracts/speech.py` 的 `clip_for_speech` 会截到 80 字（优先在句号处）。工具该给短句，长内容请改成「一共有 N 项，前几项是…」 |
 
 ---
 
@@ -677,6 +700,8 @@ python -m winvoice
 │   ├── check_llm.py                         # LLM 层检查
 │   └── verify_install.py                    # 依赖检查
 └── winvoice/                                # 源码包
+    ├── contracts/speech.py                  # 可朗读规则（中文、≤80 字）
+    └── tools/weather.py                     # 天气工具 + WWO 码中文对照表
 ```
 
 ---
@@ -685,7 +710,7 @@ python -m winvoice
 
 - [ ] `python -m winvoice --check` → `Startup check PASSED`（5 个引擎全部加载）
 - [ ] `python scripts/smoke_test_models.py` → `18/18 passed`
-- [ ] `python -m pytest tests/ -q` → `152 passed, 1 skipped`
+- [ ] `python -m pytest tests/ -q` → `235 passed, 1 skipped`
 - [ ] `llama-server` 在 8080 端口监听，`main: server is listening on http://127.0.0.1:8080`
 - [ ] `python scripts/check_llm.py` → `9/9 intents matched`，`grammar-constrained decoding: ACTIVE`
 - [ ] `python -m winvoice` 启动 → `microphone_open` + `pipeline_started`

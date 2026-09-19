@@ -221,8 +221,11 @@ __marimo__/
 models/
 snapshots/
 logs/
-# locally extracted llama.cpp / sherpa-onnx toolchains (hundreds of MB)
-tools/
+# Locally extracted llama.cpp / sherpa-onnx toolchains (hundreds of MB).
+# Anchored to the repo root on purpose: a bare `tools/` also matches
+# `winvoice/tools/`, which silently ignored every new module added under it
+# (the package's existing files are tracked, so the trap only bites new ones).
+/tools/
 *.onnx
 *.gguf
 *.bin

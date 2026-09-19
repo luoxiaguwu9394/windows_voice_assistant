@@ -129,3 +129,86 @@ async def test_every_builtin_failure_is_speakable(pipeline, lexicon, tool, args,
     spoken = await spoken_reply(pipeline, tool, args, intent_name, str(args))
 
     assert_speakable(spoken, lexicon)
+
+
+# ── the success side of the same contract ─────────────────────────────────
+#
+# A successful `message` is spoken now, so it must clear the same bar as a
+# failure one: plain Chinese, no Latin, no markdown. `get_weather` is checked
+# in tests/unit/test_weather_speech.py because it needs a payload, not network.
+# `write_file` / `run_script` are absent on purpose: their confirmation round
+# trip does not exist yet, so their success path is unreachable.
+
+BUILTIN_SUCCESSES = [
+    (ToolName.OPEN_APP, {"app": "notepad"}, IntentName.OPEN_APP),
+    (ToolName.OPEN_APP, {"app": "记事本"}, IntentName.OPEN_APP),
+    (ToolName.CLOSE_APP, {"app": "notepad"}, IntentName.CLOSE_APP),
+    (ToolName.MEDIA_CONTROL, {"action": "play"}, IntentName.MEDIA_CONTROL),
+    (ToolName.MEDIA_CONTROL, {"action": "prev"}, IntentName.MEDIA_CONTROL),
+    (ToolName.SET_VOLUME, {"delta": 20}, IntentName.SET_VOLUME),
+    (ToolName.SET_VOLUME, {"level": 30}, IntentName.SET_VOLUME),
+    (ToolName.SEARCH_WEB, {"query": "今天新闻"}, IntentName.SEARCH_WEB),
+    (ToolName.GET_TIME, {}, IntentName.GET_TIME),
+]
+
+
+class _FakeProc:
+    returncode = 0
+    stdout = "45\n"
+    stderr = ""
+
+
+class _FakeSubprocess:
+    """Replaces the `subprocess` module: a test must not change the machine."""
+
+    @staticmethod
+    def run(*args, **kwargs):
+        return _FakeProc()
+
+    @staticmethod
+    def Popen(*args, **kwargs):
+        return _FakeProc()
+
+
+class _FakeWebbrowser:
+    @staticmethod
+    def open(*args, **kwargs):
+        return True
+
+
+@pytest.fixture
+def harmless(monkeypatch):
+    """Stop the handlers from opening windows, pressing keys or moving sliders."""
+    from winvoice.tools import builtin
+
+    monkeypatch.setattr(builtin, "subprocess", _FakeSubprocess)
+    monkeypatch.setattr(builtin, "webbrowser", _FakeWebbrowser)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool,args,intent_name", BUILTIN_SUCCESSES)
+async def test_every_builtin_success_is_speakable(pipeline, lexicon, harmless, tool, args, intent_name):
+    spoken = await spoken_reply(pipeline, tool, args, intent_name, str(args))
+
+    assert_speakable(spoken, lexicon)
+    # "好的，已为您完成。" is the fallback, and it means the tool said nothing
+    # the pipeline could use — for these tools that is a bug in the tool.
+    assert spoken != "好的，已为您完成。", f"{tool.value} had nothing speakable to report"
+
+
+def test_every_weather_condition_translation_is_pronounceable(lexicon):
+    """
+    The condition table is a fallback *for* the Chinese-only rule, so a typo in
+    it would reintroduce exactly the defect it exists to prevent.
+
+    `wttr.in` returns English descriptions no matter what `lang` is asked for
+    (verified live), so these strings are what the user actually hears.
+    """
+    from winvoice.tools.weather import WEATHER_CODE_ZH
+
+    assert len(WEATHER_CODE_ZH) >= 60, "the published WWO list has 60 codes"
+    for code, text in WEATHER_CODE_ZH.items():
+        assert_speakable(text, lexicon)
+        assert text.strip() == text and text, f"code {code} is not a clean phrase"
+
+

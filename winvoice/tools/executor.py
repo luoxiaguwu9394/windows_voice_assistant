@@ -11,6 +11,7 @@ Handles the full destructive action flow:
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, Dict, List, Optional
 
 from winvoice.config import get_config
@@ -20,6 +21,20 @@ from .registry import get_tool_registry, ToolSpec
 from .snapshot import get_snapshot_manager, Snapshot
 
 logger = get_logger(__name__)
+
+
+async def _maybe_await(value: Any) -> Any:
+    """
+    Await a handler's return value when it is awaitable.
+
+    Most builtins are synchronous, but `get_weather` does HTTP and must not
+    block the audio loop, so `execute` accepts both shapes. Returning the
+    coroutine unawaited would hand the pipeline a `<coroutine object>` and
+    produce a reply about nothing.
+    """
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 class ToolExecutor:
@@ -87,7 +102,7 @@ class ToolExecutor:
 
         # Execute
         try:
-            result = spec.handler(call.args)
+            result = await _maybe_await(spec.handler(call.args))
             success = result.get("success", False)
             error = result.get("error") if not success else None
             message = result.get("message") if isinstance(result, dict) else None

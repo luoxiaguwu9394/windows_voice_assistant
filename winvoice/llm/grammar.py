@@ -53,7 +53,7 @@ INTENT_ARG_SPEC: Dict[IntentName, str] = {
     IntentName.WRITE_FILE: '{"path": "<file path>", "content": "<text>"}',
     IntentName.RUN_SCRIPT: '{"path": "<script path>"}',
     IntentName.GET_TIME: "{}",
-    IntentName.GET_WEATHER: "{}",
+    IntentName.GET_WEATHER: '{"city": "<city name>"} or {}   (empty → the configured city)',
 }
 
 # Synonym -> canonical key. Models (especially small ones) invent names.
@@ -79,6 +79,8 @@ ARG_ALIASES: Dict[str, str] = {
     # paths
     "file": "path", "filename": "path", "file_path": "path", "filepath": "path",
     "script": "path", "script_path": "path", "scriptpath": "path",
+    # weather
+    "location": "city", "city_name": "city", "place": "city",
     # write content
     "body": "content", "data": "content", "text_content": "content",
 }
@@ -91,6 +93,7 @@ _STRING_ARG_KEY: Dict[IntentName, str] = {
     IntentName.READ_FILE: "path",
     IntentName.WRITE_FILE: "path",
     IntentName.RUN_SCRIPT: "path",
+    IntentName.GET_WEATHER: "city",
 }
 
 

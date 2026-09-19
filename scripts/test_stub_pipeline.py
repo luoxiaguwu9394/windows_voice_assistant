@@ -114,6 +114,8 @@ class TestVoiceAssistant:
                 IntentName.READ_FILE: ToolName.READ_FILE,
                 IntentName.WRITE_FILE: ToolName.WRITE_FILE,
                 IntentName.RUN_SCRIPT: ToolName.RUN_SCRIPT,
+                IntentName.GET_TIME: ToolName.GET_TIME,
+                IntentName.GET_WEATHER: ToolName.GET_WEATHER,
             }
             tool = tool_mapping.get(intent.intent)
             if tool:
@@ -147,7 +149,8 @@ async def main():
         ("播放音乐", "media_control", "rules"),
         ("搜索 Python 教程", "search_web", "rules"),
         ("关闭计算器", "close_app", "rules"),
-        ("今天天气怎么样", "get_weather", "local"),  # Will fallback to local/cloud
+        ("今天天气怎么样", "get_weather", "rules"),  # 天气 is a rule, answered by the tool
+        ("现在几点了", "get_time", "rules"),
         ("帮我写个Python脚本", "write_file", "local"),  # Will fallback
     ]
     

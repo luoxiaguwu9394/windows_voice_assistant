@@ -105,7 +105,11 @@ class ToolRegistry:
         from .builtin import (
             open_app, close_app, set_volume, media_control,
             search_web, read_file, write_file, run_script,
+            get_time,
         )
+        # The network tool lives in its own module: it is the only one whose
+        # reason to change is an external provider.
+        from .weather import get_weather
 
         self.register(ToolSpec(
             name=ToolName.OPEN_APP,
@@ -197,6 +201,32 @@ class ToolRegistry:
             guest_allowed=False,
             requires_confirmation=True,
             modified_paths=["{args.path}"],
+        ))
+
+        # ── read-only queries ──────────────────────────────────
+        # No arguments, nothing to confirm, nothing to snapshot: they answer
+        # with speech instead of acting on the machine, so a guest may ask.
+
+        self.register(ToolSpec(
+            name=ToolName.GET_TIME,
+            description="Report the current local time",
+            schema=ToolSchema(properties={}, required=[]),
+            handler=get_time,
+            destructive=False,
+            guest_allowed=True,
+            requires_confirmation=False,
+        ))
+
+        self.register(ToolSpec(
+            name=ToolName.GET_WEATHER,
+            description="Report today's weather for a city",
+            # `city` is optional: the rule layer fills it when the user named
+            # one, and `weather.city` in the config is the fallback.
+            schema=ToolSchema(properties={"city": {"type": "string"}}, required=[]),
+            handler=get_weather,
+            destructive=False,
+            guest_allowed=True,
+            requires_confirmation=False,
         ))
 
     def register(self, spec: ToolSpec) -> None:

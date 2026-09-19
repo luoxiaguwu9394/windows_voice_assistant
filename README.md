@@ -224,6 +224,14 @@ Say a wake word, wait for the acknowledgement, then speak one command.
 | **Apps** | **Web search** | **Files** |
 | `打开记事本` · `打开计算器` · `打开资源管理器` | `搜索今天新闻` · `查一下北京天气` | `读取文件 <path>` |
 | `关闭记事本` (see the allowlist below) | ⚠️ opens your browser immediately, no confirmation | `写入文件 <path> 内容 …` · `运行脚本 <path>` |
+| **Time** | **Weather** | |
+| `现在几点了` · `现在什么时间` | `今天天气怎么样` · `上海天气` · `北京明天天气` | |
+| answers e.g. 「现在是晚上 6 点整。」 | answers e.g. 「北京今天晴，气温 10 到 20 度，现在 15 度。」 (needs a network) | |
+
+A successful tool answers with what it found or did — 「已经打开记事本了。」,
+「音量已经调到百分之45。」, 「现在是上午 9 点 5 分。」 — and only falls back to
+「好的，已为您完成。」 when the tool has nothing to add.
+
 
 Allowlisted apps — say the Chinese or the English name, close spellings are
 matched too (ASR slips such as `Notpa` still land on `notepad`):
@@ -240,11 +248,18 @@ matched too (ASR slips such as `Notpa` still land on `notepad`):
 | 微软浏览器 | Edge |
 | 系统设置 · 设置 | Windows Settings |
 
-Anything outside these eight tools is **not** handled — see
-[Known limitations](#known-limitations). Questions ("what is X", "what's in
-this folder") are not answered: the assistant routes commands, it does not chat.
+The weather answer is a single sentence about today (the current condition plus
+the day's high and low). The city comes from the sentence when you name one;
+otherwise it is `weather.city` from the config. `查一下天气` and `今天天气怎么样`
+do **not** open a browser — they are routed to the weather tool.
+
+Anything outside these ten tools is **not** handled — see
+[Known limitations](#known-limitations). Questions that are not one of them
+("what is X", "what's in this folder") are not answered: the assistant routes
+commands and answers time and weather, it does not chat.
 `write_file` and `run_script` are listed above but currently refuse every
 request: the confirmation round trip they depend on does not exist yet.
+
 
 ### Development commands
 
@@ -341,6 +356,8 @@ tools:
     - read_file
     - write_file
     - run_script
+    - get_time
+    - get_weather
   guest_denied:
     - read_file
     - write_file
@@ -349,6 +366,11 @@ tools:
     - write_file
     - run_script
   confirm_required: true
+
+weather:
+  enabled: true               # false → 「天气查询没有打开。」
+  city: 北京                   # used when the sentence names no city
+  timeout_s: 5                # wttr.in needs no API key; keep this small
 
 snapshot:
   enabled: true
@@ -416,6 +438,8 @@ The LLM cannot generate shell commands. It can only invoke the tools below. All 
 | `read_file` | `path: str` (under `C:\Users\<you>\`) | ❌ | ❌ |
 | `write_file` | `path: str, content: str` | ✅ | ❌ |
 | `run_script` | `path: str` (`.py` / `.ps1` / `.bat` / `.cmd`) | ✅ | ❌ |
+| `get_time` | — | ❌ | ✅ |
+| `get_weather` | `city: str` (optional; defaults to `weather.city`) | ❌ | ✅ |
 
 **Destructive flow**: double confirmation → snapshot target files → execute.
 **Not yet wired**: the confirmation round trip does not exist, so `write_file`
@@ -423,6 +447,14 @@ and `run_script` currently refuse every request instead of executing — see
 [Known limitations](#known-limitations).
 
 **Snapshot**: only backs up target files declared by the tool as modified, stored under `snapshots/{timestamp}/`. Registry changes, software uninstalls, and system-level modifications are not covered.
+
+**Spoken output**: `ToolResult.message` is what the assistant says, and it must
+be plain Chinese — the TTS lexicon has no Latin entries and drops English words
+silently. A successful `message` is spoken too (that is how `get_time` and
+`get_weather` answer); a message containing Latin letters is refused and the
+generic 「好的，已为您完成。」 is used instead. Long messages are clipped to one
+short utterance at 80 characters, because the TTS synthesises a whole sentence
+before it plays anything.
 
 ---
 
@@ -460,7 +492,8 @@ The following are **not yet decided**. They are documented here so they aren't s
 
 | Limitation | Notes |
 |---|---|
-| No question answering | No chat/QA path: unknown requests, `get_time` and `get_weather` reply "抱歉，这个请求我还没有实现。"  Only the eight tools in the allowlist above are handled |
+| No question answering | There is no chat/QA path: anything that is not one of the ten tools replies "抱歉，这个请求我还没有实现。" Time and weather are answered; "什么是量子力学" is not |
+| Weather needs the internet | `get_weather` queries `wttr.in` (no API key) with a `weather.timeout_s` deadline covering the whole request (5 s by default, and the answer is silent until it arrives). Offline or timed out it says 「暂时查不到天气。」; `weather.enabled: false` disables it entirely. Conditions come from the tool's own Chinese table because `lang=zh` returns English descriptions |
 | No directory listing | There is no `list_dir` tool; "what is in this folder" cannot be answered |
 | Confirmation not wired | `write_file` and `run_script` are registered but the double-confirmation round trip is not implemented, so every call is refused |
 | `search_web` is immediate | It opens the browser the moment the intent is classified — no confirmation, and a misrouted question will pop a browser window |

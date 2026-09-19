@@ -40,6 +40,11 @@ HOT_RELOADABLE: Set[str] = {
     "llm.remote.base_url",
     "llm.remote.model",
     "audio.kws_during_tts",
+    # `get_weather` reads these on every call, so a change really does apply
+    # without a restart — unlike anything an engine loads in initialize().
+    "weather.enabled",
+    "weather.city",
+    "weather.timeout_s",
 }
 
 REQUIRES_RESTART: Set[str] = {

@@ -27,11 +27,14 @@ import numpy as np
 from winvoice.config import get_config
 from winvoice.contracts import (
     IntentResult,
+    MAX_SPEECH_CHARS,
     SystemState,
     SystemStateName,
     ToolCall,
     ToolResult,
     TtsRequest,
+    clip_for_speech,
+    has_latin,
 )
 from winvoice.logging import clear_trace_context, get_logger, set_trace_context
 from .asr import AsrEngine, AsrResult, create_asr_engine
@@ -329,6 +332,8 @@ class AudioPipeline:
             "read_file": ToolName.READ_FILE,
             "write_file": ToolName.WRITE_FILE,
             "run_script": ToolName.RUN_SCRIPT,
+            "get_time": ToolName.GET_TIME,
+            "get_weather": ToolName.GET_WEATHER,
         }
         tool = mapping.get(intent.intent.value)
         if tool is None:
@@ -370,6 +375,44 @@ class AudioPipeline:
         cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t:：,，.。-—")
         return cleaned
 
+    @staticmethod
+    def _spoken_success(results: List[ToolResult]) -> Optional[str]:
+        """
+        What to say when the tools succeeded, or None to fall back.
+
+        A tool that *did* something still has something to report — the time,
+        the temperature, the fact that the volume moved — and it reports it in
+        `ToolResult.message`, exactly like a failure does. Requiring an
+        explicit message keeps the old 「好的，已为您完成。」 for tools that have
+        nothing to add, instead of turning a confirmation into a guess.
+
+        A message with Latin letters in it is refused rather than spoken: it
+        was written for the speaker, so English there is a bug in the tool
+        (see `tools.builtin`), and the safe answer is the generic sentence.
+        """
+        spoken: List[str] = []
+        for result in results:
+            text = (result.message or "").strip()
+            if not text:
+                continue
+            if has_latin(text):
+                logger.warning(
+                    "unspeakable_tool_message", tool=result.tool.value, message=text
+                )
+                continue
+            spoken.append(text)
+
+        if not spoken:
+            return None
+        if len(spoken) == 1:
+            return clip_for_speech(spoken[0])
+
+        # One utterance maps to one tool call today, but clipping the *joined*
+        # text would let a long first message drop every later outcome. Give
+        # each result its own share of the budget instead.
+        share = max(1, MAX_SPEECH_CHARS // len(spoken))
+        return clip_for_speech("；".join(clip_for_speech(text, share) for text in spoken))
+
     def _default_reply(self, intent: Optional[IntentResult], results: Optional[List[ToolResult]] = None) -> str:
         if intent is None:
             return "抱歉，我没有理解您的请求。"
@@ -377,19 +420,19 @@ class AudioPipeline:
         results = results or []
         if not results:
             # Nothing ran: either this intent has no tool mapping yet
-            # (unknown / get_time / get_weather), or the tool callback returned
-            # nothing. "好的。" here would be a false success for a request the
-            # assistant never handled.
+            # (unknown), or the tool callback returned nothing. "好的。" here
+            # would be a false success for a request the assistant never
+            # handled.
             return "抱歉，这个请求我还没有实现。"
 
         if all(r.success for r in results):
-            return "好的，已为您完成。"
+            return self._spoken_success(results) or "好的，已为您完成。"
 
         reasons = [self._speakable(r) for r in results]
         reasons = [r for r in reasons if r]
         if not reasons:
             return "抱歉，这个操作没有成功。"
-        return f"执行遇到问题：{'；'.join(reasons)}"
+        return clip_for_speech(f"执行遇到问题：{'；'.join(reasons)}")
 
     # ── TTS ────────────────────────────────────────────────────
 

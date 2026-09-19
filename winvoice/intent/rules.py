@@ -129,14 +129,16 @@ RULE_PATTERNS: Dict[IntentName, List[str]] = {
     IntentName.MEDIA_CONTROL: [
         r"播放|暂停|停止播放|下一首|上一首|play|pause|resume|next|previous|prev",
     ],
-    IntentName.SEARCH_WEB: [
-        r"搜索|查一下|搜一下|search|google|百度",
-    ],
+    # Before SEARCH_WEB: 「查一下天气」 and 「搜一下天气」 contain a search verb but
+    # ask a question this assistant can answer — the browser must not open.
     IntentName.GET_WEATHER: [
         r"天气|weather",
     ],
     IntentName.GET_TIME: [
         r"几点|什么时间|现在时间|time|clock",
+    ],
+    IntentName.SEARCH_WEB: [
+        r"搜索|查一下|搜一下|search|google|百度",
     ],
     IntentName.OPEN_APP: [
         # `运行` alone is deliberately excluded to avoid stealing RUN_SCRIPT.
@@ -146,6 +148,50 @@ RULE_PATTERNS: Dict[IntentName, List[str]] = {
         r"关闭|退出|close|quit|exit",
     ],
 }
+
+
+# ──────────────────────────────────────────────────────────────
+# Weather city extraction
+# ──────────────────────────────────────────────────────────────
+
+# Time and filler words that sit next to 「天气」 but are not places. Stripped
+# from both ends of a captured candidate, so 「上海的今天天气」 still yields 上海.
+_WEATHER_NOISE = (
+    "今天|明天|后天|昨天|现在|目前|最近|早上|上午|中午|下午|晚上|这边|当地"
+)
+# A candidate *containing* any of these is a verb phrase, not a city name:
+# 「查一下天气」 and 「帮我看看天气」 must fall back to the configured city.
+# Rejecting is safe — the configured city is the default answer — whereas a
+# wrong city silently gives the user a forecast for the wrong place.
+_WEATHER_NOT_A_CITY = set("看查问帮我知道想要了解说讲下吗呢么呀的了")
+
+
+# A city named in a weather question is the run of characters immediately
+# before 「天气」 — Chinese (2-4 characters, which covers 北京/牡丹江/乌鲁木齐)
+# or Latin for a name ASR left in Latin script (`New York天气`). Latin names
+# are matched too because falling back to the configured city there would
+# answer about the wrong place without saying so.
+_WEATHER_CITY_PATTERN = r"([\u4e00-\u9fa5]{2,4}|[A-Za-z][A-Za-z.'\- ]{0,23}?)\s*天气"
+
+
+def _weather_city(text: str) -> Optional[str]:
+    """
+    The city named in a weather question, or None.
+
+    Only the characters immediately before 「天气」 are considered, and only
+    when they survive the noise-word and verb-word filters. Everything else
+    (「今天天气怎么样」, 「查一下天气」) names no place at all, so `get_weather`
+    falls back to `weather.city` from the config.
+    """
+    match = re.search(_WEATHER_CITY_PATTERN, text)
+    if not match:
+        return None
+
+    candidate = re.sub(rf"^(?:{_WEATHER_NOISE})+", "", match.group(1))
+    candidate = re.sub(rf"(?:{_WEATHER_NOISE})+$", "", candidate).strip(" 的.")
+    if not candidate or any(ch in _WEATHER_NOT_A_CITY for ch in candidate):
+        return None
+    return candidate
 
 
 # ──────────────────────────────────────────────────────────────
@@ -226,6 +272,12 @@ def _extract_args(intent: IntentName, text: str) -> dict:
         value = after_verb(r"搜索|搜一下|查一下|查询|search|google|百度")
         if value:
             args["query"] = value
+
+    elif intent == IntentName.GET_WEATHER:
+        # No city named → `get_weather` uses `weather.city` from the config.
+        city = _weather_city(text)
+        if city:
+            args["city"] = city
 
     elif intent == IntentName.READ_FILE:
         # Longest alternative first, so "读取文件 X" yields X, not "文件 X".

@@ -186,7 +186,12 @@ filling happen in code (`AudioPipeline._intent_to_tool_calls`).
 🔶 Lines ①-③ can all miss. The router then returns `intent=unknown`, and since
 `unknown` has no tool mapping, the spoken reply is
 「抱歉，这个请求我还没有实现。」 There is no chat/QA fallback: the assistant routes
-commands, it does not answer questions.
+commands and answers time and weather, it does not answer questions.
+
+The rule layer is consulted first and in declaration order, so the more specific
+intents are declared above the general ones. `get_weather`/`get_time` therefore sit
+**above** `search_web`: 「查一下天气」 contains a search verb but asks something the
+assistant can answer, and it must not open a browser.
 
 🔶 **Failure handling**: the local call makes at most two attempts (grammar, then
 `json_object`); a transport error, a timeout, or a low-confidence parse is caught by
@@ -210,10 +215,24 @@ and no 2 s deadline beyond the client's 60 s HTTP timeout.
 | `read_file` 🔶 | `path: str` (must resolve under `C:\Users\<you>\`, ≤10 MB, UTF-8) | ❌ | ❌ |
 | `write_file` | `path: str, content: str` | ✅ | ❌ |
 | `run_script` 🔶 | `path: str` with suffix `.py` / `.ps1` / `.bat` / `.cmd` (under `C:\Users\<you>\`) | ✅ | ❌ |
+| `get_time` | — (no arguments) | ❌ | ✅ |
+| `get_weather` | `city: str` optional — the rule layer fills it when the sentence names a city (`北京的天气` → `北京`), otherwise `weather.city` from the config | ❌ | ✅ |
 
 The 9 allowlisted apps and their spoken Chinese names live in
 `winvoice/tools/builtin.py` (`ALLOWED_APPS` / `APP_SPEECH`). Adding an app means adding
 to both, plus optionally an alias.
+
+`get_time` and `get_weather` are the only read-only *query* tools: they answer with a
+sentence rather than acting on the machine, so they need no confirmation and no
+snapshot, and a guest may ask them (that flag is inert until §15's guest-tier gap is
+closed). `get_weather` lives in `winvoice/tools/weather.py` — it is the only tool whose
+reason to change is an external provider — and is the only **async** handler
+(`httpx.AsyncClient` inside an `asyncio.wait_for` deadline; httpx's own `timeout` bounds
+connect and read separately, so it is not a bound on the whole exchange).
+`ToolExecutor.execute` awaits either handler shape. Its answers are built by
+`WeatherSummary.speech()`, which maps the numeric WWO code to Chinese itself — `wttr.in`
+returns English descriptions even with `lang=zh` (verified against Beijing/Lhasa/Sanya/
+Mohe, 2026-09-19).
 
 ### 6.2 Destructive Action Flow ⛔
 1. Double confirmation (voice + UI toast)
@@ -246,9 +265,28 @@ The contract that fixes this: `ToolResult` carries two strings.
 | `error` | logs and callers — may name tools, argument keys, paths | free (often English) |
 | `message` | **spoken to the user** | plain Chinese, digits allowed (expanded by `number.fst`) |
 
-`AudioPipeline._default_reply` speaks `message` when present, otherwise strips the
-unpronounceable parts of `error` and falls back to
-「抱歉，这个操作没有成功。」 Anything new that reaches the speaker must respect this.
+`message` carries both outcomes. On failure `AudioPipeline._default_reply` speaks
+`message` when present, otherwise strips the unpronounceable parts of `error` and falls
+back to 「抱歉，这个操作没有成功。」. On success it speaks `_spoken_success(results)` — the
+successful `message`s — and falls back to 「好的，已为您完成。」 when a tool has nothing
+to report. That is how the query tools answer at all: `get_time` and `get_weather` write
+their whole answer into `message`.
+
+Two guards apply to anything on its way to the speaker, both from
+`winvoice/contracts/speech.py` so the tool layer and the speech layer cannot drift apart:
+
+- a `message` containing ASCII letters is **refused** (with an `unspeakable_tool_message`
+  warning) and the generic sentence is used instead. English in `message` is a bug in the
+  tool, and cleaning it would leave a sentence full of holes;
+- the joined text is clipped to `MAX_SPEECH_CHARS = 80` — at the last sentence boundary
+  past the midpoint when there is one, otherwise at the limit — because
+  `TtsEngine.synthesize` synthesises the whole utterance before it yields its first
+  chunk: length is dead air. With several results each gets an equal share of the
+  budget, so one long message cannot clip the others away.
+
+`tests/unit/test_speech_is_pronounceable.py` checks every handler's success *and* failure
+message against the model's real `lexicon.txt` (and the whole 60-entry weather condition
+table with it). Anything new that reaches the speaker must respect this contract.
 
 ---
 
@@ -312,6 +350,11 @@ Full schema in README. Key points:
   - `tools.whitelist`
   - `tts.voice`
   - `kws.threshold` (requires Audio restart → logged warning)
+  - `weather.enabled` / `weather.city` / `weather.timeout_s` — `get_weather` reads them
+    per call, so these are the only settings that genuinely take effect without a restart
+- `weather:` (new section): `enabled` (default `true`), `city` (default `北京`, used when
+  the sentence names no city), `timeout_s` (default 5 s, the ceiling for the `wttr.in`
+  request). `wttr.in` needs no API key, so there is no key to configure.
 - Non-hot-reload changes → warning + "needs restart" toast
 - 🔶 **Reality check**: `ConfigManager.start_watching()` does start a `watchdog`
   observer and re-reads the file into the config object on modification. But nothing
@@ -372,7 +415,7 @@ Full schema in README. Key points:
 🔶 **Markers are declared but barely used.** `pytest.ini` registers `unit`,
 `integration` and `manual`, but only `tests/e2e/test_e2e.py` carries a marker
 (`manual`). `pytest -m unit` therefore selects **nothing** — select by directory or
-file instead. The suite today is **152 passed, 1 skipped**; the skip is
+file instead. The suite today is **235 passed, 1 skipped**; the skip is
 `test_core.py`'s LLM probe, which skips itself when `llama-server` is not reachable.
 Tests that load a real engine `skipif` when the model is absent.
 
@@ -425,10 +468,13 @@ windows_voice_assistant/
 ├── tools/                     # locally extracted llama.cpp (gitignored)
 ├── winvoice/
 │   ├── contracts/             # Pydantic message models (schema_version=1)
+│   │                          # speech.py: what the Chinese TTS can pronounce (§6.4)
 │   ├── audio/                 # kws, vad, asr, sv, tts, stream, pipeline, _common
 │   ├── llm/                   # local + remote clients, GBNF grammar, router
 │   ├── intent/                # rules, classifier, router
 │   ├── tools/                 # registry, builtin handlers, executor, snapshot
+│   │                          # weather.py: the one network-backed tool, with its
+│   │                          # own WWO → Chinese condition table
 │   ├── enroll/                # speaker enrollment CLI (+ guided prompts)
 │   ├── config.py              # ConfigManager + watchdog file watcher
 │   ├── logging.py             # structlog setup (see the §10 defects)
@@ -462,9 +508,12 @@ The entry point is `winvoice/__main__.py`, not `main.py`.
 ### Implemented
 Voice pipeline (KWS → SV → VAD → ASR → intent → tools → TTS), half-duplex with
 barge-in, bilingual wake words, speaker enrollment with guided prompts and threshold
-derivation, three-tier intent routing (rules → local LLM → cloud), 8-tool allowlist with
+derivation, three-tier intent routing (rules → local LLM → cloud), 10-tool allowlist with
 schema validation, destructive-tool snapshotting, JSON-Lines logging with trace IDs,
-stub-engine mode for development.
+stub-engine mode for development. Spoken replies carry successful results too
+(`ToolResult.message`), and the two query tools — `get_time` (spoken 12-hour clock with a
+period word) and `get_weather` (one Chinese sentence about today, from `wttr.in`, offline
+in Chinese) — answer questions rather than acting on the machine.
 
 ### Not implemented
 > `UNIMPLEMENTED.md` is the working backlog for these: it carries the per-item constraints,
@@ -475,7 +524,7 @@ stub-engine mode for development.
 | Confirmation round trip (blocks `write_file` / `run_script`) | `ToolExecutor` + pipeline |
 | Guest-tier permission enforcement | `ToolExecutor.execute` tier argument |
 | Question answering / chat, directory listing | new intent + tools |
-| `get_time` / `get_weather` are routed but have no tool | `winvoice/tools/builtin.py` |
+| A weather provider with an API key (wttr.in is keyless but rate-limited, and untranslated) | `winvoice/tools/weather.py` |
 | Hot-reload fan-out to running engines | config watcher → engines |
 | Prometheus metrics, disk quota, model integrity check, anchor check | §10, §9.2 |
 | Password/phrase fallback, threshold-tuning UI, PySide6 UI | §4.3, §4.4, §14 |
@@ -493,11 +542,13 @@ stub-engine mode for development.
 ### Verified numbers (2026-09-19, this machine)
 | Metric | Value |
 |---|---|
-| Test suite | 152 passed, 1 skipped |
+| Test suite | 235 passed, 1 skipped |
 | Local LLM latency | 0.8–1.1 s per intent classification |
 | ASR latency | 40–50 ms per VAD segment |
 | TTS synthesis | 100–300 ms, 8 kHz |
 | KWS on the model's own reference wavs | English 2/2, Chinese 5/7 at threshold 0.25 |
+| `get_time` | < 1 ms (no I/O) |
+| `get_weather` (wttr.in) | ~1–2 s (measured 1.8 s for Beijing); the whole exchange is capped by `weather.timeout_s` (5 s), and a timeout says 「暂时查不到天气。」 |
 
 ---
 
