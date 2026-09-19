@@ -302,6 +302,35 @@ setx REMOTE_API_KEY "sk-xxx-your-api-key"
 $env:REMOTE_API_KEY = "sk-xxx-your-api-key"
 ```
 
+### 5.3 唤醒词与灵敏度（实测调优）
+
+```yaml
+kws:
+  keywords:
+    - "assistant"            # 英文关键词按英语音素匹配
+    - "小助手"                # 中文关键词走模型的拼音 token，对中文口音宽容得多
+    - "你好助手"
+  threshold: 0.25            # 越低越灵敏，代价是误唤醒变多
+  use_int8: true             # false = fp32 编码器，更准，CPU 约 2.5 倍
+```
+
+- **英文关键词要求按英语音素发音**。若「assistant」念成中文腔（“阿西斯坦特”），
+  音素序列和模型里的 `AH0 S IH1 S T AH0 N T` 对不上，就会不灵敏 ——
+  换成中文关键词可绕开这个问题。
+- **阈值**：先用模型自带参考音频验证过引擎本身正常（英文 2/2、中文 5/7 触发，
+  阈值 0.25、100 ms 分块）。若你的唤醒率仍偏低，先 `threshold: 0.20`，
+  仍不行再 `use_int8: false`。
+- **中文关键词已实测可分词**：
+  ```
+  AH0 S IH1 S T AH0 N T @ASSISTANT
+  x iǎo zh ù sh ǒu @小助手
+  n ǐ h ǎo zh ù sh ǒu @你好助手
+  ```
+- 关键词会编译成 `models/kws/<模型>/winvoice_keywords_<sha1>.txt` 并缓存，
+  **模型目录需要可写**。
+- sherpa-onnx **不暴露每次命中分数**，所以无法从日志判断「差多少」；
+  要量化只能录一段你自己的 wav 离线跑（做法同 §8.2 的冒烟测试思路）。
+
 ---
 
 ## 6️⃣ 启动服务 (按顺序，每个开一个终端)
@@ -410,11 +439,19 @@ Speaker enrollment
   min speech floor : 0.40  (samples scoring below this are rejected)
   max_inter        : 0.45  (estimated impostor similarity)
   required gap     : 0.05  (T_high must exceed T_low by this)
+----------------------------------------------------------------
+  Each sample shows one line to read. Say it at a normal pace.
+  Vary wording, volume and distance between takes.
+  Running past the timer mid-sentence is fine - say what you can.
 ================================================================
 [*] Sample 1/8 - speak for 4s
-    (vary wording, volume and distance)
-    starting in 3... recording...
+    【数字】一三五七九，二四六八十，今天二十三度。
+    starting in 3...
+    recording...
     done.
+    next up: 【指令】打开记事本，再帮我查一下天气。
+[*] Sample 2/8 - speak for 4s
+    【指令】打开记事本，再帮我查一下天气。
 ...
 [OK] Enrollment complete for 'me'
      samples         : 8
@@ -424,6 +461,24 @@ Speaker enrollment
      profile saved   : models/sv/profiles/me.json
 ================================================================
 ```
+
+**内置引导词（8 条，数字/指令/闲聊 交替）：**
+
+| # | 类别 | 念这句 |
+|---|------|--------|
+| 1 | 数字 | 一三五七九，二四六八十，今天二十三度。 |
+| 2 | 指令 | 打开记事本，再帮我查一下天气。 |
+| 3 | 闲聊 | 你好，今天过得怎么样？ |
+| 4 | 数字 | 播放第八首歌，音量调到三十。 |
+| 5 | 指令 | 把屏幕亮度调低，然后打开浏览器。 |
+| 6 | 闲聊 | 我最近在学语音识别，挺有意思的。 |
+| 7 | 数字 | 二零二六年九月十九日，晚上八点四十五。 |
+| 8 | 指令 | 设个十分钟闹钟，提醒我喝水。 |
+
+> 类别交替是刻意的：只用命令句录音，建出来的声纹对别的说话风格泛化更差。
+> `--samples 12` 这类超出 8 条的情况会**循环复用**引导词，不会出现某条没有提示。
+> 每条录完会预告下一句，利用写入 embedding 的空档给你留出阅读时间
+> （3 秒倒计时不够读完一句 20 字的中文）。
 
 ### 7.1 注册失败：「cannot separate」（T_high 会低于 T_low）
 
@@ -477,7 +532,7 @@ Enrolment cannot separate you from other speakers with these settings.
 重新注册即可恢复。
 
 > **其他提示**
-> - 内容多样化：数字、指令、闲聊
+> - 内容多样化：引导词已按数字/指令/闲聊交替（见上表），照着念即可
 > - 若 `min_intra < 0.40` 会报错并提示重录
 > - 注册后再跑 `python -m winvoice --check`，`enrolled` 应显示 `['me']`
 
@@ -511,8 +566,11 @@ python scripts/check_llm.py
 
 ```powershell
 python -m pytest tests/ -q
-# 期望: 55 passed, 1 skipped
+# 期望: 152 passed, 1 skipped
 ```
+
+> 沙箱/受限权限环境下 `tmp_path` 与家目录写入会被拒，表现为若干
+> `PermissionError` 报错（本机正常终端里不会出现）。
 
 ### 8.5 端到端手动测试
 
@@ -525,8 +583,8 @@ python -m winvoice
 #   Assistant is listening. Say the wake word (default: 'assistant'). Ctrl+C to stop.
 #   pipeline_started
 
-# 说唤醒词："assistant" 或 "hey assistant"
-# 然后发指令："打开记事本"、"音量调大 20"、"搜索 Python 教程"
+# 说唤醒词："assistant" / "小助手" / "你好助手"（关键词集见 §5.3）
+# 然后发指令："打开记事本"、"音量调大 20"、"音量调到百分之十"、"搜索 Python 教程"
 # 观察日志输出
 ```
 
@@ -546,6 +604,9 @@ python -m winvoice
 > `enrolled=[]` 表示**还没注册声纹**：此时 `verify()` 返回 `None`，
 > 说话人分级不生效（不做拦截），功能可用但**没有声纹保护**。
 > 要启用请执行第 7 节的注册命令
+>
+> 该快照记录的是当时的配置；关键词集此后已更新为
+> `assistant / 小助手 / 你好助手`（见 §5.3）。
 
 ---
 
@@ -581,6 +642,11 @@ python -m winvoice
 | `numpy` 版本冲突 | `pip install "numpy<2"` 或确认所有依赖支持 numpy 2.x |
 | 意图分类总是 UNKNOWN | 1) `python scripts/check_llm.py` 确认 LLM 层 2) 检查 `llm.local.model` 是否与 llama-server 加载的一致 |
 | TTS 只有 8 kHz 音质 | icefall aishell3 原生即为 8 kHz，属正常现象 |
+| 唤醒词不灵敏 | 见 §5.3：优先换成中文关键词，其次降 `kws.threshold` 到 0.20，再不行 `kws.use_int8: false` |
+| 控制台刷 `OOV ... Ignore it!`（如 `OOV 90.`、`OOV app.`） | sherpa 中文 VITS 的**词表里没有任何拉丁词条**，数字靠 `number.fst` 展开。① 原文含英文 → 说明有工具把英文错误直接送进了 TTS（应走 `ToolResult.message`，中文面向用户，`error` 只进日志）② 数字被丢 → 检查 TTS 模型目录里 `number.fst` / `date.fst` / `phone.fst` 是否存在（引擎会把它们作为 `rule_fsts` 传入） |
+| 说「打开记事本」被拒绝 | 应用名按中文标签/英文 id/近似拼写解析（`记事本`、`notepad`、`Notpa` 都能命中）；不在白名单内的（微信/QQ）仍会拒绝。若要新增，改 `ALLOWED_APPS` + `APP_SPEECH` |
+| 音量「调高」「调低」方向不对 | 方向词已覆盖 `调高/调低/调大/调小/减小/降低/小声/小一点/down/lower…`；绝对量走 `level`（0–100），相对量走 `delta`，两者不可混用 |
+| 写文件/跑脚本永远提示需要确认 | 确认回路尚未实现（`CONFIRMATION_REQUIRED`），见 README「Known limitations」 |
 
 ---
 
@@ -593,9 +659,12 @@ python -m winvoice
 ├── run.ps1                                  # 从任意目录启动
 ├── models/
 │   ├── kws/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/
+│   │   └── winvoice_keywords_<sha1>.txt     # 运行时生成的唤醒词 token（需目录可写）
 │   ├── vad/silero_vad_v5.onnx
 │   ├── asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/
 │   ├── tts/vits-icefall-zh-aishell3/
+│   │   ├── model.onnx · lexicon.txt
+│   │   └── number.fst / date.fst / phone.fst   # 数字、日期、电话的文本规范化规则
 │   ├── sv/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx
 │   ├── sv/profiles/me.json                  # 声纹档案（注册后生成）
 │   └── llm/qwen2.5-3b-instruct-q4_k_m.gguf
@@ -616,12 +685,12 @@ python -m winvoice
 
 - [ ] `python -m winvoice --check` → `Startup check PASSED`（5 个引擎全部加载）
 - [ ] `python scripts/smoke_test_models.py` → `18/18 passed`
-- [ ] `python -m pytest tests/ -q` → `55 passed, 1 skipped`
+- [ ] `python -m pytest tests/ -q` → `152 passed, 1 skipped`
 - [ ] `llama-server` 在 8080 端口监听，`main: server is listening on http://127.0.0.1:8080`
 - [ ] `python scripts/check_llm.py` → `9/9 intents matched`，`grammar-constrained decoding: ACTIVE`
 - [ ] `python -m winvoice` 启动 → `microphone_open` + `pipeline_started`
-- [ ] `python -m winvoice.enroll --speaker me --samples 8` → 生成 `models/sv/profiles/me.json`，`--check` 显示 `enrolled=['me']`
-- [ ] 说 "assistant" → 唤醒 → 指令执行 → TTS 回复
+- [ ] `python -m winvoice.enroll --speaker me --samples 8` → 按 8 条引导词念完，生成 `models/sv/profiles/me.json`，`--check` 显示 `enrolled=['me']`
+- [ ] 说 `assistant` / `小助手` → 唤醒 → 指令执行 → TTS 中文回复
 
 ---
 

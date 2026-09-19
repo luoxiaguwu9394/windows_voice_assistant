@@ -28,6 +28,36 @@ logger = get_logger(__name__)
 SAMPLE_RATE = 16000
 CHUNK = 1600  # 100 ms at 16 kHz
 
+# ──────────────────────────────────────────────────────────────
+# Guided enrolment phrases
+# ──────────────────────────────────────────────────────────────
+
+# One prompt per sample, in this order. Read at a normal pace each runs about
+# 4 s. The categories rotate on purpose: digits, commands and conversational
+# speech stress the embedding differently, and a profile built only from
+# command-shaped speech generalises worse.
+ENROLLMENT_PROMPTS: list[tuple[str, str]] = [
+    ("数字", "一三五七九，二四六八十，今天二十三度。"),
+    ("指令", "打开记事本，再帮我查一下天气。"),
+    ("闲聊", "你好，今天过得怎么样？"),
+    ("数字", "播放第八首歌，音量调到三十。"),
+    ("指令", "把屏幕亮度调低，然后打开浏览器。"),
+    ("闲聊", "我最近在学语音识别，挺有意思的。"),
+    ("数字", "二零二六年九月十九日，晚上八点四十五。"),
+    ("指令", "设个十分钟闹钟，提醒我喝水。"),
+]
+
+
+def prompt_for(sample_num: int) -> tuple[str, str]:
+    """
+    `(category, phrase)` for a 1-based sample number.
+
+    Prompts are reused in order when the session records more samples than
+    there are prompts, so `--samples 12` still guides every take.
+    """
+    return ENROLLMENT_PROMPTS[(max(1, sample_num) - 1) % len(ENROLLMENT_PROMPTS)]
+
+
 
 class EnrollmentSession:
     """Drives the interactive enrollment flow."""
@@ -59,8 +89,9 @@ class EnrollmentSession:
 
     def record_sample(self, sample_num: int) -> np.ndarray:
         """Record one sample and return float32 mono audio."""
+        category, phrase = prompt_for(sample_num)
         print(f"\n[*] Sample {sample_num}/{self.num_samples} - speak for {self.sample_duration:.0f}s")
-        print("    (vary wording, volume and distance)")
+        print(f"    【{category}】{phrase}")
 
         for i in range(3, 0, -1):
             print(f"    starting in {i}...", end="\r", flush=True)
@@ -86,6 +117,13 @@ class EnrollmentSession:
                 sd.sleep(100)
 
         print("    done.")
+
+        # The next prompt is shown while the recording is being embedded:
+        # a 3-second countdown is not enough time to read a 20-character line,
+        # so the speaker gets the idle gap to read ahead.
+        if sample_num < self.num_samples:
+            next_category, next_phrase = prompt_for(sample_num + 1)
+            print(f"    next up: 【{next_category}】{next_phrase}")
 
         if not blocks:
             return np.zeros(0, dtype=np.float32)
@@ -129,6 +167,10 @@ async def main() -> int:
     print(f"  min speech floor : 0.40  (samples scoring below this are rejected)")
     print(f"  max_inter        : {max_inter:.2f}  (estimated impostor similarity)")
     print(f"  required gap     : {min_gap:.2f}  (T_high must exceed T_low by this)")
+    print("-" * 64)
+    print("  Each sample shows one line to read. Say it at a normal pace.")
+    print("  Vary wording, volume and distance between takes.")
+    print("  Running past the timer mid-sentence is fine - say what you can.")
     print("=" * 64)
 
     session = EnrollmentSession(

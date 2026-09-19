@@ -1,16 +1,29 @@
 # Windows Voice Assistant — Technical Specification
 
-**Version**: 0.1.0-draft
-**Status**: Design consensus from grilling session
-**Last Updated**: 2025-01-16
+**Version**: 0.1.0-dev
+**Status**: As-built — synced with the implementation (`winvoice/`) on 2026-09-19
+**Last Updated**: 2026-09-19
+
+> **Status legend used throughout**
+> ✅ implemented as written · 🔶 implemented, but differs from the original design (the
+> difference is stated inline) · ⛔ designed but **not implemented** yet.
+>
+> Sections 1–14 describe the system as it is. Section 15 lists what is still missing
+> and the known defects, so a divergence is never silent.
 
 ---
 
 ## 1. Overview
 
-A local-first Windows voice assistant built on **sherpa-onnx** with pluggable LLM backends (Ollama local, OpenAI-compatible remote). Features wake-word detection, speaker verification, streaming ASR/TTS, three-tier intent routing, tool allowlist, and destructive-action protection with snapshots.
+A local-first Windows voice assistant built on **sherpa-onnx**. Wake-word detection,
+speaker verification, ASR/TTS, three-tier intent routing, a tool allowlist, and
+snapshot-protected destructive actions all run in **one asyncio process**
+(🔶 the 4-process split stays a future option — see §2). The intent classifier talks to
+a local **llama.cpp `llama-server`**; any OpenAI-compatible endpoint can serve as the
+cloud tier.
 
-**Target**: Single-user Windows 10/11 desktop. No installer, no auto-update, no telemetry in MVP.
+**Target**: Single-user Windows 10/11 desktop. No installer, no auto-update, no
+telemetry in MVP.
 
 ---
 
@@ -20,8 +33,14 @@ A local-first Windows voice assistant built on **sherpa-onnx** with pluggable LL
 
 | Phase | Approach |
 |-------|----------|
-| **Prototype** | Single process, `asyncio` + `ThreadPoolExecutor` for blocking calls (KWS/VAD/ASR/TTS/LLM). Measure end-to-end latency & jitter. |
-| **Split trigger** | If audio thread jitter > 20 ms or GIL contention measurable → split into 4 processes: Main (UI), Audio, LLM, Execution. |
+| **Prototype** ✅ | Single process, `asyncio` + `ThreadPoolExecutor` for blocking calls (KWS/VAD/ASR/TTS/LLM). Measure end-to-end latency & jitter. |
+| **Split trigger** ⛔ | If audio thread jitter > 20 ms or GIL contention measurable → split into 4 processes: Main (UI), Audio, LLM, Execution. |
+
+🔶 Current implementation: one `asyncio` loop (`winvoice/audio/pipeline.py`). The
+microphone callback pushes 100 ms int16 blocks into a bounded deque; `run()` drives
+KWS → SV → VAD → ASR → intent → tools → TTS. No thread pool is used yet — the
+sherpa-onnx calls are fast enough on CPU (ASR ≈ 40-50 ms, LLM ≈ 0.8-1.1 s, TTS
+synthesis ≈ 100-300 ms) for a single user.
 
 ### 2.2 Future Multi-Process IPC (Post-Prototype)
 
@@ -37,91 +56,143 @@ A local-first Windows voice assistant built on **sherpa-onnx** with pluggable LL
 ## 3. Audio Pipeline
 
 ```
-Microphone (16 kHz, mono)
+Microphone (16 kHz, mono, int16)  — callback, 100 ms blocks
    │
    ▼
-┌─────────────────────────────────────┐
-│ KWS (Zipformer, always-on)          │
-│   keywords: "assistant", "hey assistant"            │
-│   threshold: 0.25 (config)          │
-└─────────────┬───────────────────────┘
+┌─────────────────────────────────────────────┐
+│ KWS (Zipformer, always-on)  🔶            │
+│   keywords: "assistant" / "小助手" / "你好助手" │
+│   threshold: 0.25, use_int8: true (config)  │
+└─────────────┬───────────────────────────────┘
               │ trigger
               ▼
-┌─────────────────────────────────────┐
-│ Speaker Verification (CAM++)        │
-│   embeddings → cosine similarity    │
-│   thresholds: T_high, T_low         │
-└─────────────┬───────────────────────┘
+┌─────────────────────────────────────────────┐
+│ Speaker Verification (CAM++, 192-d)         │
+│   last ~100 blocks → embedding → cosine     │
+│   thresholds: T_high, T_low                 │
+└─────────────┬───────────────────────────────┘
               ▼
-┌─────────────────────────────────────┐
-│ VAD (Silero)                        │
-│   min_silence_ms: 500               │
-│   min_speech_ms: 250                │
-└─────────────┬───────────────────────┘
+┌─────────────────────────────────────────────┐
+│ VAD (Silero v5)                             │
+│   min_silence_ms: 500                       │
+│   min_speech_ms: 250                        │
+└─────────────┬───────────────────────────────┘
               ▼
-┌─────────────────────────────────────┐
-│ ASR (SenseVoice streaming)          │
-│   language: auto                    │
-└─────────────┬───────────────────────┘
+┌─────────────────────────────────────────────┐
+│ ASR (SenseVoice int8, offline)  🔶          │
+│   language: auto, use_itn: true             │
+└─────────────┬───────────────────────────────┘
               │ text
               ▼
 ```
 
-**Half-duplex**: ASR/VAD paused during TTS playback. **KWS stays active** and can interrupt TTS immediately (barge-in).
+🔶 **Wake words are bilingual.** English keywords are matched against English
+phonemes (`AH0 S IH1 S T AH0 N T`), Chinese ones against the model's pinyin tokens
+(`x iǎo zh ù sh ǒu`), which tolerates a Chinese accent far better. Keywords are
+compiled into `models/kws/<model>/winvoice_keywords_<sha1>.txt` and cached.
 
-**Barge-in implementation**: Audio process holds `tts_stream`; on `InterruptTTS` → `tts_stream.stop()` + write silence frames to drain DMA.
+🔶 **ASR is SenseVoice (offline), not streaming.** `AsrEngine` supports a streaming
+Zipformer path, but the configured model is the offline SenseVoice one; it recognises
+a VAD-delimited segment in one pass. `use_itn: true` is what turns
+「百分之十」 into `10%` before intent routing sees it.
+
+**Half-duplex**: ASR/VAD paused during TTS playback. **KWS stays active** and can
+interrupt TTS immediately (barge-in).
+
+🔶 **Barge-in implementation** is cooperative, not DMA-level: `TtsEngine.interrupt()`
+sets a flag that the synthesis generator checks at each ~100 ms chunk boundary, so
+playback stops within one chunk (≈100 ms) rather than draining the audio device.
+Speech that *overlapped* the TTS output is not captured — the wake word must be
+detected for the user to break in.
 
 ---
 
 ## 4. Speaker Verification
 
-### 4.1 Enrollment
-- 8 samples, 3–5 s each, varied content/volume/distance
+### 4.1 Enrollment ✅
+- 8 samples, ~4 s each. 🔶 The CLI now **shows one line to read per sample**
+  (8 built-in prompts rotating through 数字 / 指令 / 闲聊) and previews the next line
+  while the previous take is embedded, instead of asking the user to invent content.
 - Compute pairwise cosine similarities → `min_intra`
 - Estimate `max_inter` from AISHELL-3 / CN-Celeb (offline script)
 - `T_high = min_intra - 0.05` (configurable offset)
 - `T_low  = max_inter + 0.05` (configurable offset)
 - If `min_intra < 0.4` → prompt re-record
+- 🔶 If `T_high - T_low < min_gap` (0.05) the profile is **refused, not written** —
+  inverted thresholds would promote any score above the lower bar to `full`.
 
-### 4.2 Runtime Verification
+### 4.2 Runtime Verification ✅
 | Score | Tier | Capabilities |
 |-------|------|--------------|
 | `≥ T_high` | Full | Cloud API, all tools, destructive actions (with confirm) |
 | `T_low ≤ s < T_high` | Guest | Local queries, media control, non-sensitive apps, **no cloud, no file/write/script** |
 | `< T_low` | Rejected | None |
 
-### 4.3 Adaptive Update
-- Enabled by default: `update_weight: 0.05` on successful verification
-- Anchor check every 30 days; if similarity < 0.6 → reset + re-enroll
-- 3 consecutive failures → password/phrase fallback (not implemented yet)
+⛔ **The Guest column is aspirational.** `tools.guest_denied` is declared in config but
+nothing reads it: `ToolExecutor.execute()` validates every call as `full` (there is a
+`# For now, assume full tier` placeholder where the tier should be passed in), and
+`AudioPipeline._intent_to_tool_calls()` does not filter by tier either. Tiers today
+only (a) abort the utterance on `rejected`, (b) gate the cloud tier, (c) pick the TTS
+voice. A `guest` speaker can therefore still call `read_file` / `write_file` /
+`run_script`.
 
-### 4.4 UI for Threshold Tuning
-Enrollment wizard final step: histogram of intra/inter scores + suggested `[T_low, T_high]` band + manual sliders → writes final `threshold_high` / `threshold_low` to `config.yaml`.
+### 4.3 Adaptive Update ✅
+- Enabled by default: `update_weight: 0.05` on successful verification
+- Anchor check every 30 days; if similarity < 0.6 → reset + re-enroll ⛔ (the config
+  key `sv.anchor_check_days` exists, nothing schedules the check)
+- 3 consecutive failures → password/phrase fallback ⛔ not implemented
+
+### 4.4 UI for Threshold Tuning ⛔
+Enrollment wizard final step: histogram of intra/inter scores + suggested
+`[T_low, T_high]` band + manual sliders → writes final `threshold_high` / `threshold_low`
+to `config.yaml`.
+
+🔶 **Not implemented.** Thresholds are derived automatically during enrollment and the
+CLI prints the resulting band and gap; tuning means re-running `python -m winvoice.enroll`
+with `--max-inter` / `--min-gap`. There is no histogram and no slider UI (there is no
+GUI at all yet).
 
 ---
 
 ## 5. Intent Routing (Three-Tier Waterfall)
 
 ```
-① Rules (regex + keyword tables)
+① Rules (regex + keyword tables) ✅
     └─> 0 latency, high-frequency commands (open/close app, volume, media, time, weather)
+        Volume understands both relative ("音量调大 20" → delta) and absolute
+        ("音量调到百分之十" → level 0-100) requests; app names accept Chinese
+        labels, English ids, and near-miss spellings from ASR.
 
-② Intent Classifier (local small model)
-    ├─ Model: Qwen2.5 7B Instruct (Ollama)
-    ├─ Constrained decoding: GBNF grammar via llama.cpp server
+② Intent Classifier (local small model) 🔶
+    ├─ Model: qwen2.5-3b-instruct on llama.cpp llama-server (config: llm.local.*)
+    ├─ Constrained decoding: GBNF sent per request in the `grammar` field
+    │  (no server-side -mgf needed); a build that rejects it falls back once to
+    │  `response_format: json_object` and logs local_llm_grammar_rejected
     ├─ Output: {"intent": "...", "args": {...}} — **no tool selection**
-    ├─ Confidence threshold: 0.70 (to be calibrated with ≥200 real queries)
-    └─ < 0.70 or allowlist miss → escalate to ③
+    ├─ Confidence threshold: 0.65 (config: llm.local.confidence_threshold)
+    └─ < 0.65 or allowlist miss → escalate to ③
 
-③ Cloud LLM (OpenAI-compatible)
+③ Cloud LLM (OpenAI-compatible) 🔶
     ├─ Only for ② failures or allowlist misses
     ├─ Guest tier: cloud disabled
-    └─ Same structured output contract
+    ├─ Same structured output contract
+    └─ **Disabled by default** (`llm.remote.enabled: false`), and it needs a real
+       endpoint + `${REMOTE_API_KEY}` before it can run
 ```
 
-**Hard constraint**: small model **never selects tools**. Tool selection & argument filling happen in code.
+**Hard constraint** ✅: small model **never selects tools**. Tool selection & argument
+filling happen in code (`AudioPipeline._intent_to_tool_calls`).
 
-**Failure handling**: constrained decode retry ≤ 2 times or > 2 s → mark `needs_cloud: true`.
+🔶 Lines ①-③ can all miss. The router then returns `intent=unknown`, and since
+`unknown` has no tool mapping, the spoken reply is
+「抱歉，这个请求我还没有实现。」 There is no chat/QA fallback: the assistant routes
+commands, it does not answer questions.
+
+🔶 **Failure handling**: the local call makes at most two attempts (grammar, then
+`json_object`); a transport error, a timeout, or a low-confidence parse is caught by
+the router and either escalated to ③ or returned as `IntentResult(unknown,
+needs_cloud=True)`. There is no dedicated decode-retry loop beyond those two attempts,
+and no 2 s deadline beyond the client's 60 s HTTP timeout.
 
 ---
 
@@ -131,86 +202,134 @@ Enrollment wizard final step: histogram of intra/inter scores + suggested `[T_lo
 
 | Tool | Arguments | Destructive | Guest |
 |------|-----------|-------------|-------|
-| `open_app` | `app: Enum[...]` | ❌ | Non-sensitive only |
-| `close_app` | `app: Enum[...]` | ❌ | Non-sensitive only |
-| `set_volume` | `delta: int` | ❌ | ✅ |
+| `open_app` 🔶 | `app: str` — allowlisted id or Chinese name, fuzzy-matched (`记事本`, `notepad`, `Notpa` all resolve) | ❌ | Non-sensitive only ⛔ |
+| `close_app` 🔶 | `app: str` — as above | ❌ | Non-sensitive only ⛔ |
+| `set_volume` 🔶 | `delta: int` (relative) **or** `level: int` 0–100 (absolute); at least one required | ❌ | ✅ |
 | `media_control` | `action: Enum[play,pause,next,prev]` | ❌ | ✅ |
-| `search_web` | `query: str` | ❌ | ✅ |
-| `read_file` | `path: str` | ❌ | ❌ |
+| `search_web` 🔶 | `query: str` — opens the default browser immediately, no confirmation, no URL encoding | ❌ | ✅ |
+| `read_file` 🔶 | `path: str` (must resolve under `C:\Users\<you>\`, ≤10 MB, UTF-8) | ❌ | ❌ |
 | `write_file` | `path: str, content: str` | ✅ | ❌ |
-| `run_script` | `path: str` | ✅ | ❌ |
+| `run_script` 🔶 | `path: str` with suffix `.py` / `.ps1` / `.bat` / `.cmd` (under `C:\Users\<you>\`) | ✅ | ❌ |
 
-### 6.2 Destructive Action Flow
+The 9 allowlisted apps and their spoken Chinese names live in
+`winvoice/tools/builtin.py` (`ALLOWED_APPS` / `APP_SPEECH`). Adding an app means adding
+to both, plus optionally an alias.
+
+### 6.2 Destructive Action Flow ⛔
 1. Double confirmation (voice + UI toast)
 2. Snapshot target files (declared in `modified_paths: string[]`)
 3. Execute
 4. On failure → auto-restore from snapshot
 
-### 6.3 Irreversible Operation Blocklist
+⛔ **Steps 1 and 2 are only half-built.** The snapshot half works
+(`ToolExecutor.execute` snapshots `modified_paths` for destructive tools and restores on
+failure), but the confirmation round trip does not exist: `execute()` is always called
+with `confirmed=False`, so `write_file` and `run_script` return
+`CONFIRMATION_REQUIRED: ...` and **never run**. `ToolExecutor.get_pending_confirmation()`
+and `clear_pending_confirmation()` exist with no caller in the voice path.
+
+### 6.3 Irreversible Operation Blocklist ✅
 - `run_script` content scanned for `IRREVERSIBLE_PATTERNS` (reg add/delete, msiexec /uninstall, etc.) → reject + audit log
 - `write_file` restricted to `C:\Users\<user>\` subtree
 - Registry, software uninstall, system config changes **never allowed**
+
+### 6.4 Speech contract for tool output 🔶
+The TTS model is Chinese-only: `vits-icefall-zh-aishell3`'s lexicon contains **zero
+Latin entries**, so sherpa-onnx drops every English word it is asked to say
+(`lexicon.cc: OOV ... Ignore it!`). A tool error containing English therefore produced
+an audible sentence with holes in it.
+
+The contract that fixes this: `ToolResult` carries two strings.
+
+| Field | Audience | Language |
+|---|---|---|
+| `error` | logs and callers — may name tools, argument keys, paths | free (often English) |
+| `message` | **spoken to the user** | plain Chinese, digits allowed (expanded by `number.fst`) |
+
+`AudioPipeline._default_reply` speaks `message` when present, otherwise strips the
+unpronounceable parts of `error` and falls back to
+「抱歉，这个操作没有成功。」 Anything new that reaches the speaker must respect this.
 
 ---
 
 ## 7. LLM Backends
 
-### 7.1 Local (Ollama)
-- **Allowed models**: `qwen2.5:7b-instruct`, `qwen2.5:14b-instruct`, ... (configurable whitelist)
-- **Base URL**: `http://localhost:11434/v1`
-- **API Key**: `ollama`
-- **Constrained decoding**: `llama.cpp` server with GBNF grammar (`llama-server -mgf grammar.gbnf`)
+### 7.1 Local (llama.cpp `llama-server`) 🔶
+- **Transport**: OpenAI-compatible `/v1/chat/completions` on `http://localhost:8080/v1`
+- **Model**: `qwen2.5-3b-instruct` (`config: llm.local.model`); `ALLOWED_MODELS` in
+  `winvoice/llm/local.py` lists the known-good names and logs a warning for anything
+  else. The documented floor is ~1.5B — below that the argument keys drift badly.
+- **API Key**: any placeholder (`ollama` in config) — llama-server ignores it
+- **Constrained decoding**: GBNF is sent **per request** in the `grammar` field, so the
+  server needs no `-mgf`/`--grammar-file`; a build that rejects it triggers one fallback
+  to `response_format: json_object` and a `local_llm_grammar_rejected` warning
+- 🔶 Ollama is *not* required: it works only as an alternative OpenAI-compatible
+  endpoint, but the project's docs, models and scripts all assume llama.cpp.
 
-### 7.2 Remote (OpenAI-compatible)
-- Enabled via `llm.remote.enabled: true`
+### 7.2 Remote (OpenAI-compatible) ✅
+- Enabled via `llm.remote.enabled: true` (default **false**)
 - `base_url`, `api_key` (from `${REMOTE_API_KEY}` env var), `model`
 - **Guest tier**: `guest_allowed: false` (default)
 
-### 7.3 Routing Logic
+### 7.3 Routing Logic ✅
 ```
 if local_unavailable or local_confidence < threshold:
     if remote_enabled and (tier == Full or remote.guest_allowed):
         route_to_cloud()
     else:
-        reply("暂时无法处理")
+        return IntentResult(unknown, needs_cloud=True)   # spoken: 抱歉，这个请求我还没有实现。
 ```
 
 ---
 
-## 8. TTS
+## 8. TTS 🔶
 
-| Engine | Model | Voice |
-|--------|-------|-------|
-| Piper | `piper-zh` | `default` (Full), `guest` (Guest) |
-| Kokoro | (future) | — |
+| Engine | Model | Voice | Sample rate |
+|--------|-------|-------|-------------|
+| sherpa-onnx VITS | `vits-icefall-zh-aishell3` (174 speakers) | `default` (Full), `guest` (Guest) | **8 kHz** |
 
-**Interruptible**: see §3 barge-in.
+- 🔶 Not Piper, and not Kokoro. The Chinese icefall aishell3 VITS model is natively
+  8 kHz — the telephone-grade output is expected, not a misconfiguration.
+- **Lexicon**: Chinese-only (`lexicon.txt`, 66 377 entries, **no Latin entries**).
+  English words are dropped at synthesis time; see §6.4 for the speech contract.
+- **Text normalisation**: `number.fst`, `date.fst`, `phone.fst` are passed as
+  `rule_fsts`, which is what makes digits and dates speakable at all. Without them
+  「调到90」 is synthesised as 「调到」 — the number silently disappears.
+- **Interruptible**: see §3 barge-in.
 
 ---
 
 ## 9. Configuration
 
-### 9.1 File: `config/config.yaml`
+### 9.1 File: `config/config.yaml` ✅
 Full schema in README. Key points:
-- `${VAR}` syntax → `os.path.expandvars` at load; missing var → explicit error with field path
-- Hot-reloadable fields (via `watchdog` → ZeroMQ PUB/SUB):
+- `${VAR}` syntax → `os.path.expandvars` at load; missing var → explicit error with field path.
+  🔶 An unresolved placeholder inside a section that is explicitly disabled (e.g.
+  `llm.remote.enabled: false`) is tolerated and substituted with an empty string, so an
+  unused feature cannot stop the assistant from booting.
+- Hot-reloadable fields (`HOT_RELOADABLE` in `winvoice/config.py`):
   - `llm.local.confidence_threshold`
   - `tools.whitelist`
   - `tts.voice`
   - `kws.threshold` (requires Audio restart → logged warning)
 - Non-hot-reload changes → warning + "needs restart" toast
+- 🔶 **Reality check**: `ConfigManager.start_watching()` does start a `watchdog`
+  observer and re-reads the file into the config object on modification. But nothing
+  *consumes* the reload — engines read their settings once during `initialize()`, and
+  there is no PUB/SUB fan-out. So a hot reload changes what `get_config().get(...)`
+  returns and nothing else; in practice **restart the assistant to apply a config
+  change**.
 
-### 9.2 Model Manifest
-`scripts/download_models.py` embeds:
-```python
-MANIFEST = {
-    "kws/zipformer-zh-en": {"url": "...", "sha256": "...", "size": 123456},
-    ...
-}
-```
-- Download to `models/.tmp/<name>.part` → verify SHA256 → atomic `os.replace`
-- Resume via HTTP Range requests
-- Startup integrity: quick `size+mtime` check; mismatch → full SHA256 → corrupt backup to `models/.corrupt/` + modal "Auto-repair" dialog
+### 9.2 Model Manifest 🔶
+`scripts/download_models.py` embeds a `MANIFEST` of `{url, sha256, size}` per model:
+- Download to `<dest>.part` → verify SHA256 → `Path.replace()` into place (atomic on
+  the same volume)
+- Resume via HTTP Range requests; a non-satisfiable range restarts the transfer clean
+- 🔶 **Only the KWS entry pins a real SHA256** (`68447f4f…`); every other entry has
+  `sha256: None`, and the script prints `(no pinned SHA256 - skipping verification)`.
+  The `--list` output marks each model `sha256` or `no-hash`.
+- ⛔ Startup integrity check (`size+mtime` quick check → full SHA256 → `models/.corrupt/`
+  + "Auto-repair" dialog) is **not implemented**; only the download path verifies.
 
 ---
 
@@ -223,6 +342,23 @@ MANIFEST = {
 - **Rotation**: `TimedRotatingFileHandler` daily, retain 7 `.jsonl.gz`
 - **Disk quota**: `storage.max_total_gb: 10` (models + logs + snapshots); cleanup order: snapshots → logs → audio cache → models (never)
 
+🔶 **Known defects in this area (verified 2026-09-19):**
+
+1. **Structured events do not reach the log file.** Every module builds its logger at
+   import time, before `configure_logging()` runs, and `cache_logger_on_first_use=True`
+   freezes structlog's *default* configuration into those loggers. The events are
+   therefore rendered to **stdout** (pretty console format), while `logs/main.jsonl`
+   only ever receives stdlib records from third-party libraries (httpx request lines).
+   Diagnosing anything from the file log alone is currently impossible.
+2. **The `process` field is wrong.** `add_process_name` and `add_timestamp` take
+   `(logger, name, event_dict)`, but structlog passes the *method name* as the second
+   argument, so `process` is always the log level — e.g.
+   `{"event": "hello_event", "process": "info", "level": "info"}`.
+3. ⛔ **Prometheus metrics are dead code.** `winvoice/logging.py:init_metrics()` is
+   never called, so `observe_latency` / `inc_request` are no-ops and nothing is pushed.
+4. ⛔ **The disk quota is not enforced.** `storage.max_total_gb` is read into the
+   config but no code computes or prunes usage; rotation is the only bound on log growth.
+
 ---
 
 ## 11. Testing Strategy
@@ -233,7 +369,20 @@ MANIFEST = {
 | Integration | Audio pipeline with synthetic WAV → KWS/VAD/ASR output text | `pytest -m integration` (requires `models/`) | ⚠️ Optional |
 | E2E | Real mic, real models, real network | `pytest -m manual` | ❌ Manual only |
 
-**Synthetic audio**: `pytest-audio` fixtures inject WAV into Audio process stdin.
+🔶 **Markers are declared but barely used.** `pytest.ini` registers `unit`,
+`integration` and `manual`, but only `tests/e2e/test_e2e.py` carries a marker
+(`manual`). `pytest -m unit` therefore selects **nothing** — select by directory or
+file instead. The suite today is **152 passed, 1 skipped**; the skip is
+`test_core.py`'s LLM probe, which skips itself when `llama-server` is not reachable.
+Tests that load a real engine `skipif` when the model is absent.
+
+🔶 **Synthetic audio**: `pytest-audio` is not used. Integration-level coverage instead
+drives the real `AudioPipeline` with **stub engines** plus real models where the test
+needs them (e.g. the SV frame-conversion regression loads the real CAM++ model and
+skips if it is missing).
+
+> Repository-relative commands are the reliable interface: `pytest tests/unit -q`,
+> `pytest tests/integration -q`, `pytest tests -q`.
 
 ---
 
@@ -249,51 +398,110 @@ MANIFEST = {
 
 ---
 
-## 13. File Structure (Planned)
+## 13. File Structure (as built)
 
 ```
 windows_voice_assistant/
 ├── AGENTS.md
+├── README.md / deployment.md / spec.md
 ├── config/
 │   └── config.yaml
 ├── docs/
-│   ├── agents/
-│   │   ├── issue-tracker.md
-│   │   └── domain.md
-│   └── adr/
-├── prototype/                 # single-process asyncio prototype
+│   └── agents/                # issue-tracker.md, domain.md
+│                              # (docs/adr/ is referenced by AGENTS.md but not created yet)
+├── grammar.gbnf               # reference copy; the live grammar is in winvoice/llm/grammar.py
+├── run.ps1
 ├── scripts/
-│   ├── download_models.py
-│   └── analyze_sv_scores.py
+│   ├── download_models.py     # MANIFEST + Range resume + SHA256 (partially pinned)
+│   ├── smoke_test_models.py   # every engine against the real models
+│   ├── check_llm.py           # local LLM tier check
+│   ├── analyze_sv_scores.py   # offline intra/inter score analysis
+│   ├── verify_install.py      # dependency check
+│   └── test_stub_pipeline.py
 ├── tests/
-│   ├── unit/
-│   ├── integration/
-│   └── e2e/
+│   ├── unit/                  # pure logic + model-backed regressions (skipif)
+│   ├── integration/           # real pipeline with stub engines
+│   └── e2e/                   # marked `manual`
+├── tools/                     # locally extracted llama.cpp (gitignored)
 ├── winvoice/
 │   ├── contracts/             # Pydantic message models (schema_version=1)
-│   ├── audio/                 # KWS, VAD, ASR, SV, TTS
-│   ├── llm/                   # local + remote clients, constrained decoding
+│   ├── audio/                 # kws, vad, asr, sv, tts, stream, pipeline, _common
+│   ├── llm/                   # local + remote clients, GBNF grammar, router
 │   ├── intent/                # rules, classifier, router
-│   ├── tools/                 # allowlist, registry, execution, snapshots
-│   ├── config.py              # ConfigManager + watchdog + hot-reload
-│   ├── logging.py             # structlog setup
-│   └── main.py                # entry point
+│   ├── tools/                 # registry, builtin handlers, executor, snapshot
+│   ├── enroll/                # speaker enrollment CLI (+ guided prompts)
+│   ├── config.py              # ConfigManager + watchdog file watcher
+│   ├── logging.py             # structlog setup (see the §10 defects)
+│   ├── context.py
+│   └── __main__.py            # entry point (`python -m winvoice`)
 └── models/                    # gitignored, downloaded at runtime
 ```
 
----
-
-## 14. Roadmap (Unchanged from README)
-
-1. **Validate intent classifier accuracy** (keyboard input) ← highest risk
-2. Audio pipeline: KWS → VAD → ASR → print text
-3. Ollama integration: text → reply → TTS
-4. Execution layer: three non-destructive tools first
-5. Cloud routing
-6. Speaker verification + confirmation + snapshot
-7. Guest mode + voice switching
-8. PySide6 UI
+🔶 No `prototype/` directory: the single-process prototype **is** the implementation.
+The entry point is `winvoice/__main__.py`, not `main.py`.
 
 ---
 
-*This spec reflects the consensus reached in the grilling session. Items marked "deferred" are explicitly not part of MVP.*
+## 14. Roadmap (as executed)
+
+1. ✅ **Validate intent classifier accuracy** — the local tier runs against
+   llama-server with GBNF; `scripts/check_llm.py` is the check
+2. ✅ Audio pipeline: KWS → SV → VAD → ASR → intent
+3. ✅ LLM integration: text → reply → TTS
+4. ✅ Execution layer: the non-destructive tools
+5. 🔶 Cloud routing — implemented but disabled by default, never exercised end to end
+6. 🔶 Speaker verification: enrollment, tiers, adaptive update — **confirmation and
+   snapshot are only half-built** (§6.2)
+7. ⛔ Guest mode + voice switching — the guest *voice* works, the guest *permissions* do not
+8. ⛔ PySide6 UI — not started; everything is a CLI
+
+---
+
+## 15. As-built status
+
+### Implemented
+Voice pipeline (KWS → SV → VAD → ASR → intent → tools → TTS), half-duplex with
+barge-in, bilingual wake words, speaker enrollment with guided prompts and threshold
+derivation, three-tier intent routing (rules → local LLM → cloud), 8-tool allowlist with
+schema validation, destructive-tool snapshotting, JSON-Lines logging with trace IDs,
+stub-engine mode for development.
+
+### Not implemented
+> `UNIMPLEMENTED.md` is the working backlog for these: it carries the per-item constraints,
+> code anchors and acceptance criteria. Keep the two lists in step.
+
+| Item | Where it would live |
+|---|---|
+| Confirmation round trip (blocks `write_file` / `run_script`) | `ToolExecutor` + pipeline |
+| Guest-tier permission enforcement | `ToolExecutor.execute` tier argument |
+| Question answering / chat, directory listing | new intent + tools |
+| `get_time` / `get_weather` are routed but have no tool | `winvoice/tools/builtin.py` |
+| Hot-reload fan-out to running engines | config watcher → engines |
+| Prometheus metrics, disk quota, model integrity check, anchor check | §10, §9.2 |
+| Password/phrase fallback, threshold-tuning UI, PySide6 UI | §4.3, §4.4, §14 |
+| `docs/adr/` | AGENTS.md references it |
+
+### Known defects
+| Defect | Impact |
+|---|---|
+| Structured log events go to stdout, not `logs/main.jsonl` (§10.1) | file log is useless for diagnosis |
+| `process` field always contains the log level (§10.2) | any tooling keyed on it is wrong |
+| `search_web` opens the browser immediately, unconfirmed (§6.1) | a misrouted question pops a browser window |
+| Failures anywhere in the tick loop are swallowed by `except Exception` + `error=str(e)` (no traceback) | silent breakage — two bugs in this spec's history were only found by reading code |
+| TTS is 8 kHz and Chinese-only (§8) | English in any spoken string is dropped |
+
+### Verified numbers (2026-09-19, this machine)
+| Metric | Value |
+|---|---|
+| Test suite | 152 passed, 1 skipped |
+| Local LLM latency | 0.8–1.1 s per intent classification |
+| ASR latency | 40–50 ms per VAD segment |
+| TTS synthesis | 100–300 ms, 8 kHz |
+| KWS on the model's own reference wavs | English 2/2, Chinese 5/7 at threshold 0.25 |
+
+---
+
+*This spec started as the consensus from the grilling session and is now maintained as
+the as-built description of `winvoice/`. Where the implementation diverges, the
+divergence is marked inline (🔶 / ⛔) rather than quietly rewritten, and §15 collects
+what is still missing.*

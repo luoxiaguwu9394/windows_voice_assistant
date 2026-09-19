@@ -10,10 +10,10 @@ Repository: https://github.com/luoxiaguwu9394/windows_voice_assistant
 
 ## Features
 
-- **Wake word detection**: sherpa-onnx Zipformer KWS, always-on, custom keywords without retraining
+- **Wake word detection**: sherpa-onnx Zipformer KWS, always-on, custom keywords without retraining; English or Chinese wake words (`assistant` / `小助手` / `你好助手`), tunable sensitivity
 - **Speaker verification**: CAM++ embeddings, three-tier permission model (full / guest / reject), adaptive updates at runtime
 - **Local ASR**: SenseVoice / Zipformer streaming, multilingual
-- **Local TTS**: Piper / Kokoro, with a separate guest voice
+- **Local TTS**: sherpa-onnx VITS (Chinese, icefall aishell3, 174 speakers) with a separate guest voice
 - **Dual LLM backends**: local Ollama and any OpenAI-compatible remote API, routed by a fixed escalation chain
 - **Three-tier intent routing**: rules → local small model → cloud, balancing latency and accuracy
 - **Tool allowlist**: the LLM can only invoke registered tools; it cannot generate shell commands
@@ -164,11 +164,24 @@ python scripts/check_llm.py
 
 ### Speaker enrollment
 
-First run requires recording **8 samples**, 3–5 seconds each. Vary content, volume, and distance to cover real usage conditions.
+First run requires recording **8 samples**, ~4 seconds each. The tool shows one
+line to read before every sample, rotating through digits, commands and small
+talk, and previews the next line while the previous take is being embedded:
 
 ```powershell
 python -m winvoice.enroll --speaker me --samples 8
 ```
+
+```
+[*] Sample 1/8 - speak for 4s
+    【数字】一三五七九，二四六八十，今天二十三度。
+    starting in 3...
+    done.
+    next up: 【指令】打开记事本，再帮我查一下天气。
+```
+
+Read at a normal pace and vary volume and distance between takes — the prompts
+are a guide, not a script. Running past the timer mid-sentence is fine.
 
 Thresholds `T_high` and `T_low` are computed automatically. If `min_intra < 0.4`, the tool prompts for re-recording.
 
@@ -199,6 +212,39 @@ From any other directory, use the helper — it switches to the repo root first:
 & C:\Users\<you>\Desktop\windows_voice_assistant\run.ps1 --check
 & C:\Users\<you>\Desktop\windows_voice_assistant\run.ps1
 ```
+
+### What you can say
+
+Say a wake word, wait for the acknowledgement, then speak one command.
+
+| Wake words | Volume | Media |
+|---|---|---|
+| `assistant` · `小助手` · `你好助手` | `音量调大 20` / `音量调低` (relative) | `播放` · `暂停` · `下一首` · `上一首` |
+| | `音量调到百分之十` / `音量调到 50%` (absolute) | |
+| **Apps** | **Web search** | **Files** |
+| `打开记事本` · `打开计算器` · `打开资源管理器` | `搜索今天新闻` · `查一下北京天气` | `读取文件 <path>` |
+| `关闭记事本` (see the allowlist below) | ⚠️ opens your browser immediately, no confirmation | `写入文件 <path> 内容 …` · `运行脚本 <path>` |
+
+Allowlisted apps — say the Chinese or the English name, close spellings are
+matched too (ASR slips such as `Notpa` still land on `notepad`):
+
+| Spoken | App |
+|---|---|
+| 记事本 · 笔记本 | Notepad |
+| 计算器 | Calculator |
+| 资源管理器 · 文件管理器 · 我的电脑 | Explorer |
+| 命令提示符 · 终端 | `cmd` |
+| 命令行窗口 | PowerShell |
+| 代码编辑器 | VS Code |
+| 谷歌浏览器 · 浏览器 | Chrome |
+| 微软浏览器 | Edge |
+| 系统设置 · 设置 | Windows Settings |
+
+Anything outside these eight tools is **not** handled — see
+[Known limitations](#known-limitations). Questions ("what is X", "what's in
+this folder") are not answered: the assistant routes commands, it does not chat.
+`write_file` and `run_script` are listed above but currently refuse every
+request: the confirmation round trip they depend on does not exist yet.
 
 ### Development commands
 
@@ -233,36 +279,45 @@ audio:
   kws_during_tts: true       # wake word can interrupt playback
 
 kws:
-  model: models/kws/zipformer-zh-en
+  model: models/kws/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20
   keywords:
-    - "assistant"
-    - "hey assistant"
-  threshold: 0.25
+    - "assistant"            # English words are matched by English phonemes
+    - "小助手"                # Chinese keywords use the model's pinyin tokens:
+    - "你好助手"              # far more forgiving for a Chinese accent
+  threshold: 0.25            # lower = more sensitive, more false wakes
+  use_int8: true             # false = fp32 encoder: more accurate, ~2.5x CPU
 
 vad:
-  model: models/vad/silero
+  model: models/vad/silero_vad_v5.onnx
   min_silence_ms: 500
   min_speech_ms: 250
 
 asr:
-  model: models/asr/sense-voice
+  model: models/asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/model.int8.onnx
+  tokens: models/asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/tokens.txt
   language: auto
+  use_itn: true              # spoken numbers become digits, e.g. 百分之十 -> 10%
 
 sv:
-  model: models/sv/campplus
+  model: models/sv/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx
   enabled: true
+  profiles_dir: models/sv/profiles
   threshold_high: 0.60       # provisional; calibrate after enrollment
   threshold_low: 0.40        # provisional; calibrate after enrollment
+  max_inter: 0.45            # estimated impostor similarity (see Permission model)
+  offset_high: 0.05          # T_high = min_intra - offset_high
+  offset_low: 0.05           # T_low  = max_inter + offset_low
+  min_gap: 0.05              # T_high must exceed T_low by at least this
   adaptive_update: true
   update_weight: 0.05
   anchor_check_days: 30
 
 llm:
   local:
-    base_url: http://localhost:11434/v1
+    base_url: http://localhost:8080/v1   # llama-server (see Quick start)
     api_key: ollama
-    model: qwen2.5:7b-instruct
-    confidence_threshold: 0.70
+    model: qwen2.5-3b-instruct
+    confidence_threshold: 0.65
 
   remote:
     enabled: true
@@ -272,7 +327,7 @@ llm:
     guest_allowed: false     # guests cannot trigger cloud calls
 
 tts:
-  model: models/tts/piper-zh
+  model: models/tts/vits-icefall-zh-aishell3
   voice: default
   guest_voice: guest
 
@@ -353,16 +408,19 @@ The LLM cannot generate shell commands. It can only invoke the tools below. All 
 
 | Tool | Arguments | Destructive | Guest |
 |---|---|---|---|
-| `open_app` | `app: Enum[...]` | ❌ | Non-sensitive only |
-| `close_app` | `app: Enum[...]` | ❌ | Non-sensitive only |
-| `set_volume` | `delta: int` | ❌ | ✅ |
+| `open_app` | `app: str` — id or Chinese name, fuzzy-matched | ❌ | Non-sensitive only |
+| `close_app` | `app: str` — as above | ❌ | Non-sensitive only |
+| `set_volume` | `delta: int` (relative) **or** `level: int` 0–100 (absolute) | ❌ | ✅ |
 | `media_control` | `action: Enum[play, pause, next, prev]` | ❌ | ✅ |
 | `search_web` | `query: str` | ❌ | ✅ |
-| `read_file` | `path: str` | ❌ | ❌ |
+| `read_file` | `path: str` (under `C:\Users\<you>\`) | ❌ | ❌ |
 | `write_file` | `path: str, content: str` | ✅ | ❌ |
-| `run_script` | `path: str` | ✅ | ❌ |
+| `run_script` | `path: str` (`.py` / `.ps1` / `.bat` / `.cmd`) | ✅ | ❌ |
 
 **Destructive flow**: double confirmation → snapshot target files → execute.
+**Not yet wired**: the confirmation round trip does not exist, so `write_file`
+and `run_script` currently refuse every request instead of executing — see
+[Known limitations](#known-limitations).
 
 **Snapshot**: only backs up target files declared by the tool as modified, stored under `snapshots/{timestamp}/`. Registry changes, software uninstalls, and system-level modifications are not covered.
 
@@ -402,6 +460,12 @@ The following are **not yet decided**. They are documented here so they aren't s
 
 | Limitation | Notes |
 |---|---|
+| No question answering | No chat/QA path: unknown requests, `get_time` and `get_weather` reply "抱歉，这个请求我还没有实现。"  Only the eight tools in the allowlist above are handled |
+| No directory listing | There is no `list_dir` tool; "what is in this folder" cannot be answered |
+| Confirmation not wired | `write_file` and `run_script` are registered but the double-confirmation round trip is not implemented, so every call is refused |
+| `search_web` is immediate | It opens the browser the moment the intent is classified — no confirmation, and a misrouted question will pop a browser window |
+| Speech is Chinese-only | The TTS lexicon contains no Latin entries and digits are expanded by `number.fst`/`date.fst`/`phone.fst`. Text handed to TTS must be spoken Chinese; English words are dropped silently (`OOV ... Ignore it!`) |
+| Guest tier not enforced | The `guest_denied` config is declared but no caller applies it; tool calls are validated as `full` |
 | Half-duplex | ASR input is paused during TTS; only the wake word can interrupt |
 | Snapshot scope | File-level only; registry, uninstall, and system changes are not covered |
 | Context | Session-scoped, cleared on sleep; no cross-session memory |
@@ -409,9 +473,29 @@ The following are **not yet decided**. They are documented here so they aren't s
 | Local LLM | Below 7B, tool-calling accuracy is insufficient; do not downgrade |
 | Windows only | Execution layer depends on pywin32 / pyautogui |
 
+The tracked backlog of unimplemented interaction features — with the constraints and
+technical detail needed to add each one — lives in [`UNIMPLEMENTED.md`](UNIMPLEMENTED.md).
+Read it before building anything user-visible.
+
 ---
 
 ## Design Decisions (from Grilling Session)
+
+> **This section is a historical record of the design session, kept verbatim.** Several
+> items were later changed during implementation. **What actually shipped:**
+>
+> | Decision as recorded below | As built |
+> |---|---|
+> | Local LLM: Ollama + Qwen2.5 **7B** | llama.cpp **`llama-server`** + `qwen2.5-3b-instruct` (Ollama works only as an alternative endpoint) |
+> | Confidence threshold **0.70** | **0.65** (`llm.local.confidence_threshold`) |
+> | GBNF via `llama-server -mgf grammar.gbnf` | GBNF sent **per request** in the `grammar` field, with a `json_object` fallback |
+> | Hot-reload via `watchdog` → ZeroMQ PUB/SUB | `watchdog` re-reads the config object; **no PUB/SUB, engines do not pick it up — restart to apply** |
+> | TTS: Piper / Kokoro | sherpa-onnx VITS `vits-icefall-zh-aishell3` (Chinese, 8 kHz) |
+> | Enrollment UI: histogram + sliders | CLI derives thresholds and prints the band; **no UI** |
+> | 4 processes + PySide6 UI | Single asyncio process, no GUI |
+> | Metrics: Prometheus pushgateway | `init_metrics()` exists but is **never called** |
+>
+> `spec.md` describes the system as built, section by section.
 
 ### Architecture
 - **MVP: Single-process asyncio** — Prototype with `asyncio` + `ThreadPoolExecutor` first; split to 4 processes (Main/Audio/LLM/Execution) only if audio jitter > 20ms or GIL contention measured
@@ -464,7 +548,7 @@ The following are **not yet decided**. They are documented here so they aren't s
 | VAD | sherpa-onnx Silero-VAD |
 | ASR | SenseVoice / Zipformer streaming |
 | Speaker verification | 3D-Speaker CAM++ (ONNX) |
-| TTS | Piper / Kokoro |
+| TTS | sherpa-onnx VITS (zh, icefall aishell3, 8 kHz) |
 | Local LLM | Ollama + Qwen2.5 7B Instruct |
 | Cloud LLM | Any OpenAI-compatible API |
 | Validation | Pydantic |
