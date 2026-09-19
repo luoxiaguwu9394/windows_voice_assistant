@@ -11,7 +11,6 @@ Handles the full destructive action flow:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from winvoice.config import get_config
@@ -21,16 +20,6 @@ from .registry import get_tool_registry, ToolSpec
 from .snapshot import get_snapshot_manager, Snapshot
 
 logger = get_logger(__name__)
-
-
-@dataclass
-class ToolResult:
-    """Tool execution result."""
-    tool: ToolName
-    success: bool
-    result: Any = None
-    error: Optional[str] = None
-    snapshot_id: Optional[str] = None
 
 
 class ToolExecutor:
@@ -54,7 +43,12 @@ class ToolExecutor:
         # Validate
         spec = self.registry.get(call.tool)
         if not spec:
-            return ToolResult(tool=call.tool, success=False, error=f"Unknown tool: {call.tool}")
+            return ToolResult(
+                tool=call.tool,
+                success=False,
+                error=f"Unknown tool: {call.tool}",
+                message="这个功能我还不认识。",
+            )
 
         # Check speaker tier (would be passed via context)
         # For now, assume full tier
@@ -62,7 +56,12 @@ class ToolExecutor:
         # Validate args
         error = self.registry.validate_call(call.tool, call.args)
         if error:
-            return ToolResult(tool=call.tool, success=False, error=error)
+            return ToolResult(
+                tool=call.tool,
+                success=False,
+                error=error,
+                message="这个请求缺少必要的信息，我没有执行。",
+            )
 
         # Confirmation check
         if spec.requires_confirmation and self.confirm_required and not confirmed:
@@ -71,6 +70,10 @@ class ToolExecutor:
                 tool=call.tool,
                 success=False,
                 error=f"CONFIRMATION_REQUIRED: {spec.description}. Call again with confirmed=true.",
+                # The confirmation round trip does not exist yet, so this is
+                # what the user hears every time they ask for a write or a
+                # script: say so plainly instead of reading the English spec.
+                message="这个操作需要你先确认，我还没有实现确认的流程。",
             )
 
         # Create snapshot for destructive tools
@@ -87,6 +90,7 @@ class ToolExecutor:
             result = spec.handler(call.args)
             success = result.get("success", False)
             error = result.get("error") if not success else None
+            message = result.get("message") if isinstance(result, dict) else None
 
             # On failure, restore snapshot
             if not success and snapshot_id:
@@ -98,6 +102,7 @@ class ToolExecutor:
                 success=success,
                 result=result,
                 error=error,
+                message=message,
                 snapshot_id=snapshot_id,
             )
         except Exception as e:
@@ -108,6 +113,7 @@ class ToolExecutor:
                 tool=call.tool,
                 success=False,
                 error=f"Execution error: {e}",
+                message="执行这个操作的时候出错了。",
                 snapshot_id=snapshot_id,
             )
 

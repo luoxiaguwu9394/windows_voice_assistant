@@ -247,6 +247,8 @@ dist/
 # redirects them into the workspace)
 .piptmp/
 .pytmp/
+.pytmp_sv_frames/
+.pytest_tmp/
 .pylibs/
 pytest-cache-files-*/
 

@@ -66,6 +66,20 @@ class TtsEngine:
         lexicon = self.model_dir / "lexicon.txt"
         self.lexicon_file = lexicon if lexicon.exists() else None
 
+        # Text-normalisation FSTs shipped with the model. Without them sherpa
+        # feeds digits straight to the Chinese lexicon, which has no entry for
+        # them, and drops them ("OOV 90. Ignore it!") — so "调到90" came out as
+        # "调到" with the number silently missing.
+        self.rule_fsts = [
+            path
+            for path in (
+                self.model_dir / "number.fst",
+                self.model_dir / "date.fst",
+                self.model_dir / "phone.fst",
+            )
+            if path.exists()
+        ]
+
         self.voice = voice or cfg.get("tts.voice", "default")
         self.speaker_id = speaker_id
         self.speed = speed
@@ -90,6 +104,7 @@ class TtsEngine:
                 debug=False,
             ),
             max_num_sentences=1,
+            rule_fsts=",".join(str(p) for p in self.rule_fsts),
         )
         self._tts = sherpa_onnx.OfflineTts(config)
         self._ready = True

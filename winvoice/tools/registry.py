@@ -63,6 +63,10 @@ class ToolSchema(BaseModel):
     type: str = "object"
     properties: Dict[str, Any] = Field(default_factory=dict)
     required: List[str] = Field(default_factory=list)
+    # Cross-field rule `required` cannot express: at least one of these keys
+    # must be present. Used by tools offering two alternative argument forms
+    # (set_volume: absolute `level` or relative `delta`).
+    at_least_one: List[str] = Field(default_factory=list)
     additionalProperties: bool = False
 
 
@@ -125,8 +129,18 @@ class ToolRegistry:
 
         self.register(ToolSpec(
             name=ToolName.SET_VOLUME,
-            description="Adjust system volume",
-            schema=ToolSchema(properties={"delta": {"type": "integer"}}, required=["delta"]),
+            description="Set the volume to an absolute level, or change it by a delta",
+            # Either form is valid, so neither can be required: `delta` moves the
+            # volume by percentage points, `level` is an absolute 0-100 target.
+            # Requiring `delta` made every "调到 10%" call fail validation.
+            schema=ToolSchema(
+                properties={
+                    "delta": {"type": "integer", "description": "percentage points to change by, negative to lower"},
+                    "level": {"type": "integer", "minimum": 0, "maximum": 100, "description": "absolute target 0-100"},
+                },
+                required=[],
+                at_least_one=["level", "delta"],
+            ),
             handler=set_volume,
             destructive=False,
             guest_allowed=True,
@@ -218,6 +232,9 @@ class ToolRegistry:
         for required in spec.schema.required:
             if required not in args:
                 return f"Missing required argument: {required}"
+
+        if spec.schema.at_least_one and not any(k in args for k in spec.schema.at_least_one):
+            return f"Missing argument: one of {spec.schema.at_least_one} is required"
 
         # Check irreversible patterns for run_script
         if tool == ToolName.RUN_SCRIPT and "path" in args:

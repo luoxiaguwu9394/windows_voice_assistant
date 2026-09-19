@@ -31,11 +31,34 @@ def to_float32(pcm: bytes) -> np.ndarray:
 
 
 def frames_to_float32(frames: Sequence) -> np.ndarray:
-    """Concatenate AudioFrame.data (int16 bytes) into one float32 array."""
-    if not frames:
+    """
+    Concatenate int16 little-endian PCM into one float32 array.
+
+    Callers hand this function either a sequence of raw `bytes` blocks (the
+    pipeline's microphone buffer, `AudioPipeline._recent`) or a sequence of
+    objects exposing `.data` (`AudioFrame`, used by the offline paths), so
+    both are accepted. Passing a float32 `np.ndarray` is deliberately NOT
+    supported: it would be reinterpreted as int16 and silently corrupted.
+    """
+    if frames is None:
         return np.zeros(0, dtype=np.float32)
-    raw = b"".join(f.data for f in frames)
-    return to_float32(raw)
+    if isinstance(frames, (bytes, bytearray, memoryview)):
+        return to_float32(bytes(frames))
+
+    blocks: List[bytes] = []
+    for frame in frames:
+        if isinstance(frame, (bytes, bytearray, memoryview)):
+            blocks.append(bytes(frame))
+        elif hasattr(frame, "data"):
+            blocks.append(bytes(frame.data))
+        else:
+            raise TypeError(
+                f"frame must be bytes or expose .data, got {type(frame).__name__}"
+            )
+
+    if not blocks:
+        return np.zeros(0, dtype=np.float32)
+    return to_float32(b"".join(blocks))
 
 
 def float32_to_pcm(samples: np.ndarray) -> bytes:

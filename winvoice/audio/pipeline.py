@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 import time
 import uuid
 from collections import deque
@@ -343,15 +344,52 @@ class AudioPipeline:
             )
         ]
 
+    # ── speech ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _speakable(result: ToolResult) -> str:
+        """
+        The part of a failed tool result that the TTS model can pronounce.
+
+        `ToolResult.message` is authored for speech and is used as-is. `error`
+        is for logs and callers, so it may contain English words, argument keys
+        and bracketed path lists — none of which the Chinese VITS lexicon
+        contains. sherpa-onnx drops such tokens one by one ("OOV ... Ignore
+        it!"), so pasting an error straight into TTS produced a sentence with
+        holes in it. Anything unpronounceable is stripped here, and if nothing
+        readable survives the caller falls back to a generic sentence.
+        """
+        if result.message:
+            return result.message
+
+        text = result.error or ""
+        logger.warning("unspeakable_tool_error", tool=result.tool.value, error=text)
+        # Latin words, bracketed reprs and stray ASCII punctuation.
+        cleaned = re.sub(r"[A-Za-z]+", "", text)
+        cleaned = re.sub(r"[\[\]{}()<>\"'`|\\^~*_=+/]+", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t:：,，.。-—")
+        return cleaned
+
     def _default_reply(self, intent: Optional[IntentResult], results: Optional[List[ToolResult]] = None) -> str:
         if intent is None:
             return "抱歉，我没有理解您的请求。"
+
+        results = results or []
         if not results:
-            return "好的。"
+            # Nothing ran: either this intent has no tool mapping yet
+            # (unknown / get_time / get_weather), or the tool callback returned
+            # nothing. "好的。" here would be a false success for a request the
+            # assistant never handled.
+            return "抱歉，这个请求我还没有实现。"
+
         if all(r.success for r in results):
             return "好的，已为您完成。"
-        errors = "; ".join(r.error for r in results if r.error) or "未知错误"
-        return f"执行遇到问题：{errors}"
+
+        reasons = [self._speakable(r) for r in results]
+        reasons = [r for r in reasons if r]
+        if not reasons:
+            return "抱歉，这个操作没有成功。"
+        return f"执行遇到问题：{'；'.join(reasons)}"
 
     # ── TTS ────────────────────────────────────────────────────
 

@@ -13,6 +13,98 @@ from typing import Dict, List, Optional
 from winvoice.contracts import IntentName, IntentResult
 
 # ──────────────────────────────────────────────────────────────
+# Volume direction vocabulary
+# ──────────────────────────────────────────────────────────────
+
+# The rule pattern and the sign derivation are built from these same two
+# lists, so a word that means "volume" and a word that means "which way"
+# cannot drift apart: adding a phrase here teaches both the matcher and the
+# sign logic. English alternatives are word-bounded so "support"/"shutdown"
+# cannot be read as "up"/"down".
+_VOLUME_DOWN = (
+    r"调低|调小|降低|压低|减小|变小|弄小|关小|小声|小一点|小一些|小点|轻一点|低一点"
+    r"|\b(?:down|lower|decrease|quieter|softer|reduce)\b"
+)
+_VOLUME_UP = (
+    r"调高|调大|提高|增大|变大|大声|大一点|大一些|大点|高一点"
+    r"|\b(?:up|raise|increase|louder|higher|boost)\b"
+)
+
+DEFAULT_VOLUME_STEP = 10
+
+# "调到/设为 X" asks for an absolute target, never a change *by* X. Scraping
+# the digits into a delta is what made 「调到百分之十」 raise the volume: it
+# became "+10 points" instead of "go to 10%".
+_VOLUME_SET_VERB = r"调到|调至|调成|调整到|调整成|设为|设成|设置到|设置成|变成"
+
+_CN_DIGITS = {
+    "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+
+
+def _chinese_number(token: str) -> Optional[int]:
+    """
+    Parse 0-100 written in Chinese numerals ("十", "十五", "九十", "一百").
+
+    ASR runs with ITN on, so 「百分之十」 normally arrives as `10%`; this keeps
+    the volume command working when ITN is switched off or misses a case.
+    """
+    if not token or any(ch not in _CN_DIGITS and ch not in "十百" for ch in token):
+        return None
+    if token in ("百", "一百"):
+        return 100
+    if "百" in token:
+        return None  # "一百二十" is not a volume anyone sets
+
+    if "十" in token:
+        head, _, tail = token.partition("十")
+        tens = _CN_DIGITS.get(head, 1) if head else 1
+        ones = _CN_DIGITS.get(tail, 0) if tail else 0
+        return tens * 10 + ones
+    return _CN_DIGITS[token] if len(token) == 1 else None
+
+
+def _volume_target(text: str) -> Optional[int]:
+    """Absolute percentage if the utterance says "set the volume to X", else None."""
+    patterns = [
+        rf"(?:{_VOLUME_SET_VERB})\s*(?:百分之|[%％])?\s*(\d{{1,3}})",
+        rf"(?:{_VOLUME_SET_VERB})\s*(?:百分之)?\s*([零一二两三四五六七八九十百]+)",
+        r"(\d{1,3})\s*[%％]",  # bare "音量 90%"
+        r"百分之\s*([零一二两三四五六七八九十百]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        token = match.group(1)
+        value = int(token) if token.isdigit() else _chinese_number(token)
+        if value is not None:
+            return max(0, min(100, value))
+    return None
+
+
+def _volume_delta(text: str) -> int:
+    """
+    Signed volume delta for an utterance.
+
+    The number may sit anywhere ("音量调大 20", "把音量加 20"); when it is
+    absent the step is `DEFAULT_VOLUME_STEP`. An explicit sign written as
+    "+20"/"-20" always wins. Otherwise the direction words decide, and they
+    must be consulted *whether or not* a number was given — an earlier version
+    only applied them when a digit was present, so every "lower" phrasing
+    without a number silently fell through to +10 and raised the volume.
+    """
+    num = re.search(r"[+-]?\d+", text)
+    magnitude = abs(int(num.group(0))) if num else DEFAULT_VOLUME_STEP
+
+    if num and num.group(0).startswith("-"):
+        return -magnitude
+    if re.search(_VOLUME_DOWN, text, re.IGNORECASE):
+        return -magnitude
+    return magnitude
+
+# ──────────────────────────────────────────────────────────────
 # Rule Patterns
 # ──────────────────────────────────────────────────────────────
 
@@ -32,7 +124,7 @@ RULE_PATTERNS: Dict[IntentName, List[str]] = {
     ],
     # --- then the general command families ---
     IntentName.SET_VOLUME: [
-        r"音量|volume|调大|调小|大声|小声",
+        rf"音量|volume|{_VOLUME_DOWN}|{_VOLUME_UP}|{_VOLUME_SET_VERB}|[%％]|百分之",
     ],
     IntentName.MEDIA_CONTROL: [
         r"播放|暂停|停止播放|下一首|上一首|play|pause|resume|next|previous|prev",
@@ -112,13 +204,11 @@ def _extract_args(intent: IntentName, text: str) -> dict:
             args["app"] = value
 
     elif intent == IntentName.SET_VOLUME:
-        # The number may sit anywhere: "音量调大 20", "把音量加 20", "volume up 20".
-        num = re.search(r"[+-]?\d+", text)
-        args["delta"] = int(num.group(0)) if num else 10
-        # "调小/降低/down" implies a negative delta when no sign was given.
-        if num and not num.group(0).startswith(("+", "-")):
-            if re.search(r"调小|减小|降低|小声|down|lower|decrease", text, re.IGNORECASE):
-                args["delta"] = -abs(args["delta"])
+        target = _volume_target(text)
+        if target is None:
+            args["delta"] = _volume_delta(text)
+        else:
+            args["level"] = target
 
     elif intent == IntentName.MEDIA_CONTROL:
         # Order matters: check the more specific phrases before the generic ones.

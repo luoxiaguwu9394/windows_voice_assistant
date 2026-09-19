@@ -11,6 +11,7 @@ keywords file. That conversion needs `sentencepiece` and `pypinyin`.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +39,17 @@ class KwsResult:
     timestamp_ms: int
 
 
+def _keywords_digest(keywords: "Sequence[str]") -> str:
+    """
+    Stable content digest for the keyword list.
+
+    Deliberately not `hash()`: Python salts string hashing per interpreter run,
+    so the cache filename changed on every launch and the model directory
+    accumulated 48 identical copies of the same keywords file.
+    """
+    return hashlib.sha1("\n".join(keywords).encode("utf-8")).hexdigest()[:8]
+
+
 def _load_sherpa():
     try:
         import sherpa_onnx
@@ -58,7 +70,7 @@ class KwsEngine:
         keywords: Optional[List[str]] = None,
         threshold: Optional[float] = None,
         keywords_file: Optional[str] = None,
-        use_int8: bool = True,
+        use_int8: Optional[bool] = None,
     ):
         cfg = get_config()
         self.model_dir = resolve_path(
@@ -70,7 +82,9 @@ class KwsEngine:
             threshold if threshold is not None else cfg.get("kws.threshold", 0.25)
         )
         self.keywords_file = Path(keywords_file) if keywords_file else None
-        self.use_int8 = use_int8
+        # int8 halves CPU but is measurably less accurate; `kws.use_int8: false`
+        # switches to the fp32 encoder when wake-word detection is unreliable.
+        self.use_int8 = bool(use_int8 if use_int8 is not None else cfg.get("kws.use_int8", True))
         self.sample_rate = 16000
         self._spotter = None
         self._stream = None
@@ -101,7 +115,7 @@ class KwsEngine:
         lexicon = self._lexicon()
 
         if out_path is None:
-            digest = abs(hash(tuple(self.keywords))) % (10**8)
+            digest = _keywords_digest(self.keywords)
             out_path = self.model_dir / f"winvoice_keywords_{digest}.txt"
 
         if out_path.exists():

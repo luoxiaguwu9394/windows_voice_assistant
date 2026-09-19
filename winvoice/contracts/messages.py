@@ -181,7 +181,13 @@ class ToolCall(BaseModel):
 
 
 class ToolResult(BaseModel):
-    """Tool execution result."""
+    """Tool execution result.
+
+    `error` is for logs and callers: it may name tools, argument keys and file
+    paths, so it can contain English. `message` is what the assistant is
+    allowed to *say* — plain Chinese, because the TTS model is Chinese-only and
+    silently drops anything its lexicon does not contain.
+    """
     schema_version: int = 1
     trace_id: str = Field(default_factory=new_trace_id)
     span_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -189,6 +195,7 @@ class ToolResult(BaseModel):
     success: bool
     result: Any = None
     error: Optional[str] = None
+    message: Optional[str] = None
     snapshot_id: Optional[str] = None
 
 

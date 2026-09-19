@@ -46,7 +46,7 @@ INTENT_GRAMMAR: str = (
 INTENT_ARG_SPEC: Dict[IntentName, str] = {
     IntentName.OPEN_APP: '{"app": "<application name>"}',
     IntentName.CLOSE_APP: '{"app": "<application name>"}',
-    IntentName.SET_VOLUME: '{"delta": <integer, negative to lower>}',
+    IntentName.SET_VOLUME: '{"level": <absolute 0-100, e.g. "调到10%">} or {"delta": <integer, negative to lower>}',
     IntentName.MEDIA_CONTROL: '{"action": "play|pause|next|prev"}',
     IntentName.SEARCH_WEB: '{"query": "<search terms>"}',
     IntentName.READ_FILE: '{"path": "<file path>"}',
@@ -62,8 +62,15 @@ ARG_ALIASES: Dict[str, str] = {
     "app_name": "app", "appname": "app", "application": "app",
     "application_name": "app", "name": "app", "target": "app", "program": "app",
     # volume
-    "value": "delta", "amount": "delta", "level": "delta",
+    "value": "delta", "amount": "delta",
     "change": "delta", "volume": "delta", "volume_delta": "delta",
+    # An absolute target must NOT be aliased onto `delta`: it used to map
+    # here, so {"level": 10} became "change by +10 points" and raised the
+    # volume instead of setting it to 10%.
+    "percent": "level", "percentage": "level", "volume_level": "level",
+    "target_level": "level", "target": "level",
+    # `level` stays `level` — remove the old delta mapping explicitly.
+    "level": "level",
     # media
     "command": "action", "media_action": "action", "operation": "action",
     # search
@@ -135,8 +142,10 @@ def normalize_args(intent: IntentName, raw_args: Any) -> Dict[str, Any]:
         canonical = ARG_ALIASES.get(str(key).lower().strip(), str(key).strip())
         out[canonical] = value
 
-    if intent == IntentName.SET_VOLUME and "delta" in out:
-        out["delta"] = _coerce_int(out["delta"])
+    if intent == IntentName.SET_VOLUME:
+        for key in ("delta", "level"):
+            if key in out:
+                out[key] = _coerce_int(out[key])
 
     if intent == IntentName.MEDIA_CONTROL and "action" in out:
         action = str(out["action"]).lower().strip()
