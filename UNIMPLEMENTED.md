@@ -34,7 +34,8 @@
 | **不要相信 `process` 日志字段**，它恒等于日志级别 | `winvoice/logging.py:33` | 基于它做统计/告警是错的 |
 | **tick 循环吞掉所有异常且不带 traceback** | `pipeline.py:180-182` | 出问题只看到一行 `error="..."`，得靠读代码复现 |
 | **新的工具 handler 可以是 async**：`ToolExecutor.execute` 会 await 返回值（`get_weather` 就是这么做的） | `winvoice/tools/executor.py` 的 `_maybe_await` | 直接 `return` 协程 → 结果是 `<coroutine object>`，回复变成空话 |
-| **测试**：`pytest tests -q`（当前 235 passed, 1 skipped）。加载真实模型的测试要 `skipif` 缺模型；`pytest.ini` 里的 `unit`/`integration` 标记没人用，**按目录选** | `pytest.ini` | `pytest -m unit` 会选中 0 个测试 |
+| **工具说「成功了」必须真的成功**：`open_app` 原来拿裸名字 `Popen(..., shell=True)` 启动，cmd.exe 报「不是内部或外部命令」而工具照样 `success=True` | `winvoice/tools/builtin.py`（`resolve_app_command` / `_launch`）、`tests/unit/test_app_launch.py` | 用户听到「已经打开谷歌浏览器了」，屏幕上却什么都没有 |
+| **测试**：`pytest tests -q`（当前 274 passed, 1 skipped）。加载真实模型的测试要 `skipif` 缺模型；`pytest.ini` 里的 `unit`/`integration` 标记没人用，**按目录选** | `pytest.ini` | `pytest -m unit` 会选中 0 个测试 |
 
 ---
 
@@ -147,19 +148,21 @@
 
 ### 2.4 打开浏览器的确认制（`search_web`）
 
-- **现象**：任何被误判成搜索的句子都会**立刻弹浏览器**（实测：「帮我看看这个项目里有什么」）。
-- **现状**：`winvoice/tools/builtin.py` 的 `search_web` 直接
-  `webbrowser.open(f"https://www.bing.com/search?q={query}")` —— 无确认、无编码
-  （中文直接拼进 URL）。
-  **已修一半**：规则层的 `get_weather` / `get_time` 现在排在 `search_web` **之前**，
-  所以「查一下天气」这类句子不会再弹浏览器；但其余问句（「帮我看看这个项目里有什么」）
-  仍会被判成 `search_web` 并开浏览器。
+- **现象**：被误判成搜索的句子会**立刻弹浏览器**（实测：「帮我看看这个项目里有什么」）。
+- **现状**：`winvoice/tools/builtin.py` 的 `search_web` 现在会检查 `webbrowser.open()`
+  的返回值（打不开就回「我没能打开浏览器。」），query 也已 `quote()` 编码。
+  **只差确认这一步**：任何显式「搜索 X」都会不打招呼地开窗口。
+- **已修的部分**（2026-09-19）：规则层把 `用浏览器/搜索/搜一下/百度/google/search`
+  这类**显式搜索词**排在话题规则之前（拉丁词带「后面不是 `.` `/` `\`」的保护，
+  免得「运行脚本 search.py」被判成搜索；带路径参数的意图排在它更前面），
+  「查一下/查询」仍是弱触发词、由话题决定，「用浏览器搜索天气」现在正确开浏览器。
 - **技术细节与建议**：
-  - (a) 先用 `urllib.parse.quote` 编码 query；
-  - (b) 要么复用 2.3 的确认回路（把 `search_web` 标成 `requires_confirmation=True`），
-    要么只在明确说了「搜索/查一下/百度/google」时才允许开浏览器，其余路由到 2.1 的问答。
-  - 配置里加个开关会比二选一更实际（例如 `tools.search_web_confirm: true`）。
-- **验收**：问句不再弹浏览器；明确说「搜索 X」才开，且 URL 里 query 已正确编码。
+  - 要么复用 2.3 的确认回路（把 `search_web` 标成 `requires_confirmation=True`），
+    要么先在界面上给一句「这就帮你搜 X」再开（浏览器起来有延迟，用户至少知道发生了什么）。
+  - 配置里加个开关更实际（例如 `tools.search_web_confirm: true`）。
+- **验收**：显式说「搜索 X」时，用户要么被问过一次、要么先听到确认；
+  规则层能进 `search_web` 的只剩「显式搜索」这一类（问句仍可能被 3B 模型判成
+  `search_web`，见 2.1）。
 
 ### 2.5 唤醒词灵敏度标定（需要用户本人录音，agent 无法独立完成）
 
@@ -187,6 +190,8 @@
 | 阈值可视化 UI / PySide6 | 全部是 CLI，无 GUI | 阈值目前靠 `--max-inter`/`--min-gap` 调；直方图+滑块属长期项 |
 | 全双工 / AEC | 半双工规避回声；打断只到 chunk 边界（≈100 ms），且**只有唤醒词能打断** | 真全双工需要 AEC（WebRTC APM 或 speexdsp），属大改 |
 | 天气数据源单一 | `get_weather` 只用 `https://wttr.in`：**无 key**，但会限流，而且**不返回中文**（`weatherDesc`/`lang_zh` 恒为英文，2026-09-19 实测），所以中文靠 `winvoice/tools/weather.py` 里的 WWO 码对照表 | 换和风天气等需 key 的源可拿到官方中文与更稳的 SLA；要动的前提是把 key 放进 config（`${VAR}` 展开已支持）并保留中文兜底。缺 code 时当前**静默丢描述**，加日志/上报会更好排查 |
+| 应用启动只证明「系统接受了启动请求」 | `open_app` 现在按真实路径启动（`App Paths` → `PATH`），进程创建失败会如实报错；但 Chrome 已有实例时主进程会立刻退出，所以只能报「已发出启动请求」 | 想真正确认「窗口起来了」需要 UI Automation / `EnumWindows` 之类的手段，属大改；当前至少不再出现「cmd 报错但工具说成功」 |
+| 免安装 / 绿色版程序打不开 | 解析只查 `PATH` 与 `App Paths` 注册表，没有第二套「安装目录猜测表」（那样的表一定会腐烂） | 用户把目录加进 `PATH` 即可；若将来常见，可考虑读取 `HKCU\...\App Paths` 之外的注册来源或允许 `config.yaml` 里手工登记路径 |
 
 ---
 
@@ -196,6 +201,7 @@
 |---|---|
 | 2026-09-19 | 建档。条目来源：`spec.md` §15「未实现清单」、`README.md` Known limitations，以及本次调试中实测确认的缺口（路由误判、浏览器弹窗、tier 未传、日志缺陷）。 |
 | 2026-09-19 | 下线 原 §1.1「成功结果永远不会被念出来」、原 §2.3「查时间」、原 §2.4「查天气」。实现：`_spoken_success`（成功也念中文 `message`，可朗读 + ≤80 字规则统一放在 `winvoice/contracts/speech.py`）+ `ToolName.GET_TIME`/`GET_WEATHER` + `winvoice/tools/weather.py`（wttr.in，async + 整体 deadline，中文兜底，内置 WWO 码中文表）。同批同步 README / deployment / spec。原 1.2–1.4 与 2.5–2.7 已重编号为 1.1–1.3 与 2.3–2.5；新缺口写入第 0 节（成功也必须给 `message`、handler 可为 async）、1.1（新工具已声明 guest 但暂不生效）、2.4（`search_web` 只解决了一半）与第 3 节（天气数据源单一）。顺带修掉一个仓库陷阱：`.gitignore` 里未锚定的 `tools/` 连 `winvoice/tools/` 一起忽略，新增模块会静默进不了提交（已改为 `/tools/`）。 |
+| 2026-09-19 | 实测报障修复（用户现场日志）：①「用浏览器搜索天气」被天气工具抢走，并把「览器搜索」当地名发给 wttr.in（500）→ 规则层改为三段优先级：**带路径参数的意图** > **显式搜索词**（`用浏览器/搜索/搜一下/百度/google/search`，拉丁词不得紧跟 `.`/`/`/`\`）> 表内顺序（`查一下/查询` 仍是弱触发词）；查询取「最后一个动词之后」的文本（`google 搜索天气` → 天气）；句子里的地名查不到时改用 `weather.city` 重查一次，网络类失败不换城市。②「打开谷歌浏览器」失败却报成功：`chrome.exe`/`msedge.exe`/`Code.exe` 都不在 `PATH`，改为 `resolve_app_command`（`App Paths` 注册表 →（`code` 用别名 `Code.exe`）→ `PATH`）按真实路径启动、去掉 shell、找不到就如实说；`close_app` 同样不再谎报（128/「找不到」→「好像没有在运行」，其余非 0（如 Access denied）→「我没能关掉…」，URI 目标→「我关不掉…」）；`search_web` 也不再把 `webbrowser.open()` 的 `False` 当成成功。③ query 改为 `quote()` 编码。新增 `tests/unit/test_app_launch.py`、`tests/unit/test_web_search.py`，并更新两个把旧缺陷当契约的旧测试。第 0 节、第 3 节、2.4、spec §5/§6.1、README、deployment 排障表已同步。 |
 
 > 删除条目时请**只删条目**，并把同一次提交里同步过的文档（README / deployment / spec）
 > 写进提交信息，方便回溯「哪次提交让它从这份文件里消失」。

@@ -108,6 +108,27 @@ def _volume_delta(text: str) -> int:
 # Rule Patterns
 # ──────────────────────────────────────────────────────────────
 
+# Verbs that explicitly ask for a web search. A sentence containing one of
+# these wants the browser whatever else it mentions: 「用浏览器搜索天气」 was
+# answered by the weather tool instead, and the city extractor then read the
+# four characters in front of 「天气」 — the fragment 「览器搜索」 — as a place
+# name. 「用浏览器…」 counts on its own; 「浏览器」 alone does not, because
+# 「打开浏览器」 is an app to open, not a search.
+#
+# The Latin verbs must not be part of a path: a bare match on `search` turned
+# 「运行脚本 search.py」 into a browser search for 「py」, and 「读取文件
+# C:/google/notes.txt」 into one for 「/notes.txt」.
+_LATIN_SEARCH = r"(?:google|bing|search)(?![./\\])"
+_EXPLICIT_SEARCH = rf"用浏览器|搜索|搜一下|搜一搜|百度一下|百度|{_LATIN_SEARCH}"
+
+# The weak cousins: 「查一下天气」 is a question this assistant can answer, so
+# these only reach SEARCH_WEB when no more specific intent matched.
+_WEAK_SEARCH = r"查一下|查询"
+
+# Every way a user can ask for a search, explicit ones first so the extractor
+# never leaves a verb fragment in the query.
+_SEARCH_VERBS = rf"{_EXPLICIT_SEARCH}|{_WEAK_SEARCH}"
+
 # Patterns are evaluated in dict order and the first hit wins, so the more
 # specific intents are listed first. In particular `运行脚本` must be checked
 # before OPEN_APP, whose verb list also contains `运行`.
@@ -129,8 +150,9 @@ RULE_PATTERNS: Dict[IntentName, List[str]] = {
     IntentName.MEDIA_CONTROL: [
         r"播放|暂停|停止播放|下一首|上一首|play|pause|resume|next|previous|prev",
     ],
-    # Before SEARCH_WEB: 「查一下天气」 and 「搜一下天气」 contain a search verb but
-    # ask a question this assistant can answer — the browser must not open.
+    # Before SEARCH_WEB so that 「查一下天气」 — a weak verb, a topic we can
+    # answer — reaches the weather tool instead of opening a browser. An
+    # explicit search is matched ahead of this table entirely.
     IntentName.GET_WEATHER: [
         r"天气|weather",
     ],
@@ -138,7 +160,7 @@ RULE_PATTERNS: Dict[IntentName, List[str]] = {
         r"几点|什么时间|现在时间|time|clock",
     ],
     IntentName.SEARCH_WEB: [
-        r"搜索|查一下|搜一下|search|google|百度",
+        _SEARCH_VERBS,
     ],
     IntentName.OPEN_APP: [
         # `运行` alone is deliberately excluded to avoid stealing RUN_SCRIPT.
@@ -148,6 +170,17 @@ RULE_PATTERNS: Dict[IntentName, List[str]] = {
         r"关闭|退出|close|quit|exit",
     ],
 }
+
+
+# Intents whose argument is a literal path or name. They are decided *before*
+# the explicit-search check, because their argument may contain a search word
+# (`运行脚本 search.py`, `读取文件 我的搜索记录.txt`): reading those as search
+# requests would open a browser instead of using the file the user named.
+_PATH_ARGUMENT_INTENTS: tuple[IntentName, ...] = (
+    IntentName.RUN_SCRIPT,
+    IntentName.READ_FILE,
+    IntentName.WRITE_FILE,
+)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -198,27 +231,69 @@ def _weather_city(text: str) -> Optional[str]:
 # Matching
 # ──────────────────────────────────────────────────────────────
 
+def _rule_result(intent: IntentName, text: str) -> IntentResult:
+    """A rule-tier match for `intent`, with its arguments extracted."""
+    return IntentResult(
+        trace_id="",
+        intent=intent,
+        args=_extract_args(intent, text),
+        confidence=0.95,
+        source="rules",
+        raw_text=text,
+    )
+
+
+def _matches(intent: IntentName, text_lower: str) -> bool:
+    return any(re.search(p, text_lower, re.IGNORECASE) for p in RULE_PATTERNS[intent])
+
+
 def match_rules(text: str) -> Optional[IntentResult]:
     """
     Match text against rule patterns.
+
+    Three tiers of precedence, because the interesting cases conflict:
+
+    1. intents whose argument is a path (`_PATH_ARGUMENT_INTENTS`) — the path
+       may itself contain a search word;
+    2. an explicit search request, which names the tool it wants;
+    3. everything else, in declaration order (specific topics before the weak
+       search verbs — see `RULE_PATTERNS`).
 
     Returns IntentResult if matched, None otherwise.
     """
     text_lower = text.lower()
 
+    for intent in _PATH_ARGUMENT_INTENTS:
+        if _matches(intent, text_lower):
+            return _rule_result(intent, text)
+
+    if re.search(_EXPLICIT_SEARCH, text_lower, re.IGNORECASE):
+        return _rule_result(IntentName.SEARCH_WEB, text)
+
     for intent, patterns in RULE_PATTERNS.items():
-        for pattern in patterns:
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                args = _extract_args(intent, text)
-                return IntentResult(
-                    trace_id="",
-                    intent=intent,
-                    args=args,
-                    confidence=0.95,
-                    source="rules",
-                    raw_text=text,
-                )
+        if intent in _PATH_ARGUMENT_INTENTS:
+            continue  # already decided above
+        if any(re.search(pattern, text_lower, re.IGNORECASE) for pattern in patterns):
+            return _rule_result(intent, text)
     return None
+
+
+def _search_query(text: str) -> Optional[str]:
+    """
+    What to search for: everything after the *last* verb, not the first.
+
+    `after_verb`-style matching takes the leftmost verb, so 「google 搜索天气」
+    left 「搜索天气」 as the query — a verb fragment, the same shape as the
+    「览器搜索」 that reached the weather provider. Leading verbs are stripped
+    here, and a phrase that is nothing but verbs yields None (the tool then
+    says it did not catch a query instead of searching for the word "搜索").
+    """
+    match = re.search(rf"(?:{_SEARCH_VERBS})\s*(.+)", text, re.IGNORECASE)
+    if not match:
+        return None
+    value = re.sub(rf"^(?:(?:{_SEARCH_VERBS})\s*)+", "", match.group(1), flags=re.IGNORECASE)
+    value = value.strip(" ，,。.！!？?")
+    return value or None
 
 
 def _extract_args(intent: IntentName, text: str) -> dict:
@@ -269,9 +344,9 @@ def _extract_args(intent: IntentName, text: str) -> dict:
                 break
 
     elif intent == IntentName.SEARCH_WEB:
-        value = after_verb(r"搜索|搜一下|查一下|查询|search|google|百度")
-        if value:
-            args["query"] = value
+        query = _search_query(text)
+        if query:
+            args["query"] = query
 
     elif intent == IntentName.GET_WEATHER:
         # No city named → `get_weather` uses `weather.city` from the config.

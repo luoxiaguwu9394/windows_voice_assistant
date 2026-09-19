@@ -188,10 +188,17 @@ filling happen in code (`AudioPipeline._intent_to_tool_calls`).
 「抱歉，这个请求我还没有实现。」 There is no chat/QA fallback: the assistant routes
 commands and answers time and weather, it does not answer questions.
 
-The rule layer is consulted first and in declaration order, so the more specific
-intents are declared above the general ones. `get_weather`/`get_time` therefore sit
-**above** `search_web`: 「查一下天气」 contains a search verb but asks something the
-assistant can answer, and it must not open a browser.
+The rule layer resolves conflicts in three tiers, because the interesting cases
+collide: (1) intents whose argument is a literal path (`run_script`, `read_file`,
+`write_file`) — the path may itself contain a search word, and 「运行脚本 search.py」
+must not become a browser search for 「py」; (2) an explicit search request
+(`用浏览器`/`搜索`/`搜一下`/`百度`/`google`/`search`, the Latin ones not followed by a
+path separator) — it names the tool it wants, so it outranks the topic, which is what
+「用浏览器搜索天气」 needs; (3) everything else in declaration order, so
+`get_weather`/`get_time` sit above the *weak* search verbs (`查一下`/`查询`):
+「查一下天气」 is a question this assistant can answer and must not open a browser.
+The extracted query is everything after the **last** verb, so 「google 搜索天气」
+searches for 「天气」 rather than for the verb fragment 「搜索天气」.
 
 🔶 **Failure handling**: the local call makes at most two attempts (grammar, then
 `json_object`); a transport error, a timeout, or a low-confidence parse is caught by
@@ -211,7 +218,7 @@ and no 2 s deadline beyond the client's 60 s HTTP timeout.
 | `close_app` 🔶 | `app: str` — as above | ❌ | Non-sensitive only ⛔ |
 | `set_volume` 🔶 | `delta: int` (relative) **or** `level: int` 0–100 (absolute); at least one required | ❌ | ✅ |
 | `media_control` | `action: Enum[play,pause,next,prev]` | ❌ | ✅ |
-| `search_web` 🔶 | `query: str` — opens the default browser immediately, no confirmation, no URL encoding | ❌ | ✅ |
+| `search_web` 🔶 | `query: str` — percent-encoded; opens the default browser immediately, no confirmation | ❌ | ✅ |
 | `read_file` 🔶 | `path: str` (must resolve under `C:\Users\<you>\`, ≤10 MB, UTF-8) | ❌ | ❌ |
 | `write_file` | `path: str, content: str` | ✅ | ❌ |
 | `run_script` 🔶 | `path: str` with suffix `.py` / `.ps1` / `.bat` / `.cmd` (under `C:\Users\<you>\`) | ✅ | ❌ |
@@ -221,6 +228,17 @@ and no 2 s deadline beyond the client's 60 s HTTP timeout.
 The 9 allowlisted apps and their spoken Chinese names live in
 `winvoice/tools/builtin.py` (`ALLOWED_APPS` / `APP_SPEECH`). Adding an app means adding
 to both, plus optionally an alias.
+
+🔶 Apps are launched by their **resolved path** (`resolve_app_command`: the `App Paths`
+registry key first, then `PATH`), because `chrome.exe`, `msedge.exe` and `Code.exe` are
+not on `PATH` — launching the bare name through a shell printed
+`'chrome.exe' 不是内部或外部命令` while the tool reported success (live report,
+2026-09-19). A program that cannot be located is reported in Chinese, never launched
+optimistically; `close_app` reports a non-zero `taskkill` (nothing was running) and
+refuses URI targets instead of claiming success; `search_web` percent-encodes its query.
+`Popen` runs without a shell, so a missing program raises instead of being swallowed.
+Nothing beyond "the OS accepted the start" is claimed: Chrome exits immediately when an
+instance already runs, so polling the process would report false failures.
 
 `get_time` and `get_weather` are the only read-only *query* tools: they answer with a
 sentence rather than acting on the machine, so they need no confirmation and no
@@ -415,7 +433,7 @@ Full schema in README. Key points:
 🔶 **Markers are declared but barely used.** `pytest.ini` registers `unit`,
 `integration` and `manual`, but only `tests/e2e/test_e2e.py` carries a marker
 (`manual`). `pytest -m unit` therefore selects **nothing** — select by directory or
-file instead. The suite today is **235 passed, 1 skipped**; the skip is
+file instead. The suite today is **274 passed, 1 skipped**; the skip is
 `test_core.py`'s LLM probe, which skips itself when `llama-server` is not reachable.
 Tests that load a real engine `skipif` when the model is absent.
 
@@ -542,7 +560,7 @@ in Chinese) — answer questions rather than acting on the machine.
 ### Verified numbers (2026-09-19, this machine)
 | Metric | Value |
 |---|---|
-| Test suite | 235 passed, 1 skipped |
+| Test suite | 274 passed, 1 skipped |
 | Local LLM latency | 0.8–1.1 s per intent classification |
 | ASR latency | 40–50 ms per VAD segment |
 | TTS synthesis | 100–300 ms, 8 kHz |

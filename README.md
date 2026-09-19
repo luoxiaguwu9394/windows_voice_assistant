@@ -230,7 +230,10 @@ Say a wake word, wait for the acknowledgement, then speak one command.
 
 A successful tool answers with what it found or did — 「已经打开记事本了。」,
 「音量已经调到百分之45。」, 「现在是上午 9 点 5 分。」 — and only falls back to
-「好的，已为您完成。」 when the tool has nothing to add.
+「好的，已为您完成。」 when the tool has nothing to add. When an action cannot be
+carried out it says so instead of claiming success: a program that cannot be
+located answers 「我没找到谷歌浏览器的安装位置。」, and closing something that is
+not running answers 「记事本好像没有在运行。」.
 
 
 Allowlisted apps — say the Chinese or the English name, close spellings are
@@ -248,10 +251,22 @@ matched too (ASR slips such as `Notpa` still land on `notepad`):
 | 微软浏览器 | Edge |
 | 系统设置 · 设置 | Windows Settings |
 
+Apps are launched by their real path: the `App Paths` registry key first (how
+Windows itself finds Chrome, Edge and VS Code — none of the three is on `PATH`;
+VS Code registers `Code.exe` while its command is `code`), then `PATH` for the
+system tools. If neither knows the program, the assistant says
+「我没找到…的安装位置。」 instead of pretending it opened something. `打开浏览器`
+opens Chrome; say `搜索…` to open a search instead.
+
 The weather answer is a single sentence about today (the current condition plus
 the day's high and low). The city comes from the sentence when you name one;
-otherwise it is `weather.city` from the config. `查一下天气` and `今天天气怎么样`
-do **not** open a browser — they are routed to the weather tool.
+otherwise it is `weather.city` from the config — and if the name is not a place
+the provider recognises (「外面天气」), the configured city answers instead.
+
+Search routing: `查一下天气` / `今天天气怎么样` reach the weather tool, while
+`搜索天气` / `搜一下天气` / `百度一下天气` / `用浏览器搜索天气` open the browser —
+an explicit search verb says which tool you want. A search word inside a path is
+part of the file name: `运行脚本 search.py` runs that script.
 
 Anything outside these ten tools is **not** handled — see
 [Known limitations](#known-limitations). Questions that are not one of them
@@ -496,7 +511,7 @@ The following are **not yet decided**. They are documented here so they aren't s
 | Weather needs the internet | `get_weather` queries `wttr.in` (no API key) with a `weather.timeout_s` deadline covering the whole request (5 s by default, and the answer is silent until it arrives). Offline or timed out it says 「暂时查不到天气。」; `weather.enabled: false` disables it entirely. Conditions come from the tool's own Chinese table because `lang=zh` returns English descriptions |
 | No directory listing | There is no `list_dir` tool; "what is in this folder" cannot be answered |
 | Confirmation not wired | `write_file` and `run_script` are registered but the double-confirmation round trip is not implemented, so every call is refused |
-| `search_web` is immediate | It opens the browser the moment the intent is classified — no confirmation, and a misrouted question will pop a browser window |
+| `search_web` is immediate | It opens the browser the moment the intent is classified — no confirmation. Only an explicit search verb reaches it (「搜索/搜一下/百度/google」), so the misrouted *question* that used to pop a browser is gone, but any explicit 「搜索 X」 still opens a window unasked. The query is percent-encoded |
 | Speech is Chinese-only | The TTS lexicon contains no Latin entries and digits are expanded by `number.fst`/`date.fst`/`phone.fst`. Text handed to TTS must be spoken Chinese; English words are dropped silently (`OOV ... Ignore it!`) |
 | Guest tier not enforced | The `guest_denied` config is declared but no caller applies it; tool calls are validated as `full` |
 | Half-duplex | ASR input is paused during TTS; only the wake word can interrupt |

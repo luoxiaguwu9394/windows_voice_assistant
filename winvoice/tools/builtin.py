@@ -20,11 +20,14 @@ because its reason to change is the provider, not the machine.
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import quote
 
 from winvoice.contracts import has_latin
 from winvoice.logging import get_logger
@@ -151,6 +154,72 @@ def resolve_app(name: str) -> Optional[str]:
     return APP_ALIASES[matches[0]] if matches else None
 
 
+def _app_paths_entry(exe_name: str) -> Optional[str]:
+    """
+    The program Windows itself would start for `exe_name`, or None.
+
+    `HK*\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\<exe>` is the
+    registry key installers write so that `start chrome` works from anywhere.
+    Chrome, Edge and VS Code rely on it (`chrome.exe`, `msedge.exe`, `Code.exe`
+    are all absent from PATH — measured on this machine), which is why launching
+    them by bare name failed.
+    """
+    try:
+        import winreg
+    except ImportError:  # pragma: no cover - the assistant is Windows-only
+        return None
+
+    key_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, rf"{key_path}\{exe_name}") as key:
+                value = winreg.QueryValueEx(key, "")[0]
+        except OSError:
+            continue  # not registered in this hive
+        candidate = str(value).strip().strip('"')
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
+
+
+# Registry key names that differ from the command we run. VS Code registers
+# `Code.exe`; its command — and the PATH shim — is `code`. Without this the
+# App Paths lookup would miss an install whose shim was not added to PATH.
+_APP_PATHS_NAMES = {"code": "Code.exe"}
+
+
+def resolve_app_command(command: str) -> Optional[str]:
+    """
+    The real, on-disk program for an allowlisted command, or None.
+
+    `App Paths` first, then PATH: the registry knows where Chrome, Edge and VS
+    Code are, while PATH covers the system tools (`notepad`, `cmd`,
+    `powershell`). Returning None is a normal outcome — it means "not
+    installed", which the caller has to *say* rather than launching a name that
+    cmd.exe will not recognise.
+    """
+    if not command:
+        return None
+
+    for name in filter(None, (_APP_PATHS_NAMES.get(command), command)):
+        entry = _app_paths_entry(name)
+        if entry:
+            return entry
+    return shutil.which(command) or None
+
+
+def _launch(command: str) -> None:
+    """Start a resolved program; raises when the OS refuses."""
+    if Path(command).suffix.lower() in (".cmd", ".bat"):
+        # CreateProcess cannot run a script file: it needs a shell. VS Code's
+        # `code.cmd` is reached this way when it has no App Paths entry.
+        subprocess.run([os.environ.get("COMSPEC", "cmd.exe"), "/c", command], check=True)
+    else:
+        # No shell: a shell would start, print 「不是内部或外部命令」 and exit 0,
+        # which is how a failed launch was reported as success.
+        subprocess.Popen([command])
+
+
 def open_app(args: Dict[str, Any]) -> Dict[str, Any]:
     """Open an application from the allowlist, by Chinese or English name."""
     spoken = str(args.get("app", ""))
@@ -168,10 +237,24 @@ def open_app(args: Dict[str, Any]) -> Dict[str, Any]:
         if cmd.startswith("ms-"):
             # URI-style targets (e.g. ms-settings:) must go through `start`.
             subprocess.run(["cmd", "/c", "start", "", cmd], check=True, capture_output=True)
-        else:
-            subprocess.Popen(cmd, shell=True)
+            return {"success": True, "message": f"已经打开{APP_SPEECH[app]}了。"}
+
+        path = resolve_app_command(cmd)
+        if path is None:
+            logger.warning("open_app_not_found", app=app, command=cmd)
+            return {
+                "success": False,
+                "error": f"Cannot locate {cmd}: not on PATH and not in App Paths",
+                "message": f"我没找到{APP_SPEECH[app]}的安装位置。",
+            }
+
+        _launch(path)
+        # Nothing beyond "the OS accepted the start": Chrome exits immediately
+        # when an instance is already running, so polling the process would
+        # report failures for launches that worked.
         return {"success": True, "message": f"已经打开{APP_SPEECH[app]}了。"}
     except Exception as e:
+        logger.warning("open_app_failed", app=app, error=str(e))
         return {"success": False, "error": str(e), "message": f"打开{APP_SPEECH[app]}的时候出错了。"}
 
 
@@ -189,9 +272,36 @@ def close_app(args: Dict[str, Any]) -> Dict[str, Any]:
 
     exe = ALLOWED_APPS[app]
     try:
-        if exe.endswith(".exe"):
-            subprocess.run(["taskkill", "/f", "/im", exe], capture_output=True)
+        if not exe.lower().endswith(".exe"):
+            # URI targets ("ms-settings:") are not processes; there is nothing
+            # to kill, and 「已经关闭」 would be a claim about something that
+            # never happened.
+            logger.info("close_app_unsupported_target", app=app, target=exe)
+            return {
+                "success": False,
+                "error": f"{app} has no process to kill ({exe})",
+                "message": f"我关不掉{APP_SPEECH[app]}。",
+            }
+
+        proc = subprocess.run(["taskkill", "/f", "/im", exe], capture_output=True, text=True)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            # 128 is taskkill's "no process matches"; anything else (access
+            # denied, a driver process, a sandbox) is a different story and
+            # must not be reported as 「没有在运行」.
+            not_running = proc.returncode == 128 or "not found" in detail.lower() or "找不到" in detail
+            logger.info("close_app_failed", app=app, returncode=proc.returncode)
+            return {
+                "success": False,
+                "error": detail[:400] or f"taskkill exit {proc.returncode}",
+                "message": (
+                    f"{APP_SPEECH[app]}好像没有在运行。"
+                    if not_running
+                    else f"我没能关掉{APP_SPEECH[app]}。"
+                ),
+            }
         return {"success": True, "message": f"已经关闭{APP_SPEECH[app]}了。"}
+
     except Exception as e:
         return {"success": False, "error": str(e), "message": f"关闭{APP_SPEECH[app]}的时候出错了。"}
 
@@ -381,8 +491,18 @@ def search_web(args: Dict[str, Any]) -> Dict[str, Any]:
         return {"success": False, "error": "Empty query", "message": "我没有听清要搜索什么。"}
 
     try:
-        url = f"https://www.bing.com/search?q={query}"
-        webbrowser.open(url)
+        # Percent-encode: ASR produces Chinese, and a raw UTF-8 query in a URL
+        # is at best browser-dependent.
+        url = f"https://www.bing.com/search?q={quote(query)}"
+        if webbrowser.open(url) is False:
+            # `open` reports whether a browser was found. Claiming success here
+            # would be the same lie as 「已经打开谷歌浏览器了。」 with no window.
+            logger.warning("search_web_no_browser", query=query)
+            return {
+                "success": False,
+                "error": f"No browser handled {url}",
+                "message": "我没能打开浏览器。",
+            }
         # The query only reaches the sentence when it is already Chinese: an
         # English one would be dropped word by word by the TTS lexicon.
         spoken = _speakable(query, "")

@@ -21,6 +21,7 @@ import asyncio
 import time
 from urllib.parse import quote
 
+import httpx
 import pytest
 
 from winvoice.intent.rules import match_rules
@@ -287,3 +288,120 @@ def test_the_city_is_taken_from_the_utterance_only_when_it_is_one(utterance, cit
     intent = match_rules(utterance)
     assert intent is not None and intent.intent.value == "get_weather", utterance
     assert intent.args.get("city") == city, f"{utterance!r} -> {intent.args!r}"
+
+
+@pytest.mark.parametrize(
+    "utterance,query",
+    [
+        ("用浏览器搜索天气", "天气"),
+        ("搜索今天新闻", "今天新闻"),
+        ("搜一下天气", "天气"),
+        ("百度一下明天天气", "明天天气"),
+        ("google 天气", "天气"),
+        # The leftmost verb wins the match, so the *later* verb must not stay
+        # in the query — 「搜索天气」 was a verb fragment, not a search term.
+        ("google 搜索天气", "天气"),
+        # 「用浏览器查天气」 is deliberately *not* here: the weak stem 查 is
+        # indistinguishable from the first character of a name (查尔斯顿), so
+        # the query keeps it. Searching for 「查天气」 finds the weather anyway.
+    ],
+)
+def test_an_explicit_search_goes_to_the_browser_not_the_weather_tool(utterance, query):
+    """
+    Live report: 「用浏览器搜索天气」 was answered by the weather tool.
+
+    The city extractor then read the four characters before 「天气」 — the
+    fragment 「览器搜索」 — as a place name and sent it to the provider. An
+    explicit search verb has to outrank the topic, because that is what it asks
+    for: the browser, not an answer.
+    """
+    intent = match_rules(utterance)
+
+    assert intent is not None
+    assert intent.intent.value == "search_web", f"{utterance!r} -> {intent.intent.value}"
+    assert intent.args.get("query") == query, f"{utterance!r} -> {intent.args!r}"
+
+
+@pytest.mark.parametrize(
+    "utterance,intent_name,args",
+    [
+        # A search word *inside a path* is part of the file name, not a request
+        # to open a browser: both of these used to be stolen by the explicit
+        # search check and answered with a verb fragment.
+        ("运行脚本 search.py", "run_script", {"path": "search.py"}),
+        ("读取文件 C:/google/notes.txt", "read_file", {"path": "C:/google/notes.txt"}),
+        ("查看文件 我的搜索记录.txt", "read_file", {"path": "我的搜索记录.txt"}),
+        ("打开浏览器", "open_app", {"app": "浏览器"}),
+        ("退出浏览器", "close_app", {"app": "浏览器"}),
+        # 「用浏览器」 asks for a search even with a weak verb, but the query
+        # keeps the bare 查 — see the note in the search table above.
+        ("用浏览器查天气", "search_web", {"query": "查天气"}),
+    ],
+)
+def test_a_search_word_in_an_argument_does_not_hijack_the_intent(utterance, intent_name, args):
+    intent = match_rules(utterance)
+
+    assert intent is not None, utterance
+    assert intent.intent.value == intent_name, f"{utterance!r} -> {intent.intent.value}"
+    assert intent.args == args, f"{utterance!r} -> {intent.args!r}"
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    ["查一下天气", "今天天气怎么样", "天气如何", "北京的天气"],
+)
+def test_a_weak_query_verb_still_reaches_the_weather_tool(utterance):
+    """「查一下」 may be a query or a command; the topic decides, so no browser."""
+    intent = match_rules(utterance)
+
+    assert intent is not None and intent.intent.value == "get_weather", utterance
+
+
+# ── a city the provider cannot place ───────────────────────────────────────
+
+async def test_a_city_the_provider_cannot_place_falls_back_to_the_configured_one(
+    monkeypatch,
+):
+    """
+    Live report, second half: the fragment 「览器搜索」 made wttr.in answer 500.
+
+    A token that is not a place (a mistranscribed fragment, 「外面」) should not
+    cost the user their answer — the configured city is what the same question
+    without a city token would have used.
+    """
+    monkeypatch.setattr(weather, "get_config", lambda: _FakeConfig(DEFAULT_CONFIG))
+
+    async def fake_fetch(url: str, timeout_s: float) -> dict:
+        captured_urls.append(url)
+        if quote("北京") in url:
+            return FULL_PAYLOAD
+        request = httpx.Request("GET", url)
+        raise httpx.HTTPStatusError("500", request=request, response=httpx.Response(500, request=request))
+
+    captured_urls: list[str] = []
+    monkeypatch.setattr(weather, "_fetch_weather_json", fake_fetch)
+
+    result = await get_weather({"city": "览器搜索"})
+
+    assert result["success"] is True, result
+    assert result["message"] == "北京今天晴，气温 10 到 20 度，现在 15 度。"
+    assert len(captured_urls) == 2, captured_urls
+
+
+async def test_a_network_failure_never_substitutes_another_city(monkeypatch):
+    """Being offline is not a reason to answer about a different place."""
+    monkeypatch.setattr(weather, "get_config", lambda: _FakeConfig(DEFAULT_CONFIG))
+    urls: list[str] = []
+
+    async def offline(url: str, timeout_s: float) -> dict:
+        urls.append(url)
+        raise OSError("getaddrinfo failed")
+
+    monkeypatch.setattr(weather, "_fetch_weather_json", offline)
+
+    result = await get_weather({"city": "上海"})
+
+    assert result["success"] is False
+    assert result["message"] == "暂时查不到天气。"
+    assert len(urls) == 1, f"a transport failure must not be retried elsewhere: {urls}"
+

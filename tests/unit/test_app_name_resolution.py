@@ -17,6 +17,8 @@ that is genuinely not on the list.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from winvoice.tools import builtin
@@ -61,14 +63,26 @@ def test_names_outside_the_allowlist_still_resolve_to_nothing(spoken: str) -> No
     assert builtin.resolve_app(spoken) is None
 
 
-def test_open_app_takes_the_chinese_name_and_launches_the_right_executable(monkeypatch) -> None:
+def test_open_app_takes_the_chinese_name_and_launches_a_resolved_program(monkeypatch) -> None:
+    """
+    The name resolves to an id, and the id resolves to a real program.
+
+    This used to assert `launched == ["notepad.exe"]` — the bare name. That is
+    what broke 「打开谷歌浏览器」: `chrome.exe` is not on PATH, so cmd.exe printed
+    「不是内部或外部命令」 while the tool reported success (see
+    `tests/unit/test_app_launch.py`).
+    """
     launched = []
     monkeypatch.setattr(builtin.subprocess, "Popen", lambda cmd, **kw: launched.append(cmd))
 
     result = builtin.open_app({"app": "记事本"})
 
     assert result["success"] is True, result
-    assert launched == ["notepad.exe"]
+    assert len(launched) == 1, launched
+    command = launched[0]
+    assert isinstance(command, list) and len(command) == 1, command
+    assert Path(command[0]).name.lower() == "notepad.exe", command
+    assert Path(command[0]).is_absolute(), command
 
 
 def test_open_app_still_refuses_an_unknown_app() -> None:
@@ -80,7 +94,17 @@ def test_open_app_still_refuses_an_unknown_app() -> None:
 
 def test_close_app_takes_the_chinese_name_too(monkeypatch) -> None:
     killed = []
-    monkeypatch.setattr(builtin.subprocess, "run", lambda cmd, **kw: killed.append(cmd))
+
+    class _Proc:
+        returncode = 0
+        stdout = "SUCCESS: sent termination signal"
+        stderr = ""
+
+    def fake_run(cmd, **kw):
+        killed.append(cmd)
+        return _Proc()
+
+    monkeypatch.setattr(builtin.subprocess, "run", fake_run)
 
     result = builtin.close_app({"app": "计算器"})
 

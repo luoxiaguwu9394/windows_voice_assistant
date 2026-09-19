@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, Optional
 from urllib.parse import quote
 
@@ -202,6 +203,48 @@ def _float_or(value: Any, default: float) -> float:
         return default
 
 
+class LookupFailure(str, Enum):
+    """
+    Why a lookup produced no summary.
+
+    A named type rather than a bare string: the caller has to tell "the provider
+    does not know this place" (worth retrying elsewhere) from "there is no
+    network" (retrying elsewhere would be a waste and a lie).
+    """
+
+    NONE = ""
+    UNRESOLVED = "unresolved"
+    OFFLINE = "offline"
+
+
+async def _lookup(city: str, timeout_s: float) -> tuple[Optional[WeatherSummary], LookupFailure]:
+    """
+    Fetch and read one city.
+
+    Returns `(summary, failure)`. `failure` is `NONE` on success,
+    `UNRESOLVED` when the provider could not place the city or sent nothing
+    usable, and `OFFLINE` for a transport problem (no network, timeout).
+    """
+    url = WEATHER_URL.format(city=quote(city))
+    try:
+        # A deadline on the whole exchange, not on one of its phases: the user
+        # waits in silence until the sentence is ready.
+        payload = await asyncio.wait_for(_fetch_weather_json(url, timeout_s), timeout_s)
+    except httpx.HTTPStatusError as e:
+        # wttr.in answers 500 for a location it cannot resolve.
+        logger.warning("weather_lookup_unresolved", city=city, error=str(e))
+        return None, LookupFailure.UNRESOLVED
+    except Exception as e:
+        logger.warning("weather_lookup_failed", city=city, error=str(e))
+        return None, LookupFailure.OFFLINE
+
+    summary = WeatherSummary.from_payload(payload if isinstance(payload, dict) else {})
+    if summary.is_empty():
+        logger.warning("weather_payload_unusable", city=city)
+        return None, LookupFailure.UNRESOLVED
+    return summary, LookupFailure.NONE
+
+
 async def get_weather(args: Dict[str, Any]) -> Dict[str, Any]:
     """
     Answer 「今天天气怎么样」 with one spoken sentence.
@@ -217,30 +260,33 @@ async def get_weather(args: Dict[str, Any]) -> Dict[str, Any]:
             "message": "天气查询没有打开。",
         }
 
-    city = str(args.get("city") or "").strip() or str(cfg.get("weather.city") or "北京")
+    requested = str(args.get("city") or "").strip()
+    configured = str(cfg.get("weather.city") or "北京")
     timeout_s = _float_or(cfg.get("weather.timeout_s", 5.0), 5.0)
-    url = WEATHER_URL.format(city=quote(city))
+    city = requested or configured
 
-    try:
-        # A deadline on the whole exchange, not on one of its phases: the user
-        # waits in silence until the sentence is ready.
-        payload = await asyncio.wait_for(_fetch_weather_json(url, timeout_s), timeout_s)
-    except Exception as e:
-        logger.warning("weather_lookup_failed", city=city, error=str(e))
+    summary, failure = await _lookup(city, timeout_s)
+
+    if failure is LookupFailure.UNRESOLVED and requested and requested != configured:
+        # The sentence named something the provider cannot place — a
+        # mistranscribed fragment, 「外面」, 「家里」. That token is not a place,
+        # so answer for the configured city: it is exactly what the same
+        # question without a city token would have produced. A transport
+        # failure is *not* handled here, because another city would not help.
+        logger.info("weather_city_unresolved", city=requested, fallback=configured)
+        city = configured
+        summary, failure = await _lookup(configured, timeout_s)
+
+    if summary is None:
         return {
             "success": False,
-            "error": f"{type(e).__name__}: {e}",
+            "error": f"weather lookup failed ({failure.value or 'unknown'})",
             "message": "暂时查不到天气。",
         }
 
-    summary = WeatherSummary.from_payload(payload if isinstance(payload, dict) else {})
-    spoken = summary.speech(city)
-    if not spoken:
-        logger.warning("weather_payload_unusable", city=city)
-        return {
-            "success": False,
-            "error": "weather payload carried nothing usable",
-            "message": "暂时查不到天气。",
-        }
-
-    return {"success": True, "message": spoken, "city": city, **summary.as_result_fields()}
+    return {
+        "success": True,
+        "message": summary.speech(city),
+        "city": city,
+        **summary.as_result_fields(),
+    }
