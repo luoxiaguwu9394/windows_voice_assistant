@@ -1,10 +1,18 @@
 """
-Local LLM Backend (Ollama + llama.cpp server with GBNF grammar).
+Local LLM backend — llama.cpp `llama-server` over its OpenAI-compatible API.
+
+Structured output is requested two ways, in order of preference:
+
+1. `grammar` (GBNF) in the request body — a llama.cpp extension, so no server
+   flag is needed: the b7376 CPU build accepts it per-request even when
+   started without `-mgf`.
+2. `response_format: {"type": "json_object"}` — used when the server rejects
+   the grammar (`400 Failed to parse grammar`), so a grammar/build mismatch
+   degrades instead of taking the whole assistant down.
 """
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -12,36 +20,32 @@ from typing import Any, Dict, Optional
 import httpx
 
 from winvoice.config import get_config
-from winvoice.logging import get_logger, observe_latency, inc_request
 from winvoice.contracts import IntentName
+from winvoice.logging import get_logger, inc_request, observe_latency
+from .grammar import INTENT_GRAMMAR, build_intent_prompt, parse_intent_json
 
 logger = get_logger(__name__)
 
+# Models known to produce usable structured output for intent classification.
+# Below ~1.5B the argument keys drift badly.
+ALLOWED_MODELS = {
+    "qwen2.5-0.5b-instruct",
+    "qwen2.5-1.5b-instruct",
+    "qwen2.5-3b-instruct",
+    "qwen2.5-7b-instruct",
+    "qwen2.5-14b-instruct",
+    "qwen2.5-32b-instruct",
+    "qwen2.5:3b-instruct",
+    "qwen2.5:7b-instruct",
+    "phi-3-mini-4k-instruct",
+    "phi-3.5-mini-instruct",
+    "gemma-2-2b-instruct",
+    "gemma-2-9b-instruct",
+    "llama-3.2-1b-instruct",
+    "llama-3.2-3b-instruct",
+    "llama-3.1-8b-instruct",
+}
 
-# ──────────────────────────────────────────────────────────────
-# GBNF Grammar for Constrained Decoding
-# ──────────────────────────────────────────────────────────────
-
-INTENT_GRAMMAR = r"""
-?start: intent
-intent: "{" ws "\"intent\"" ws ":" ws intent_name ws "," ws "\"args\"" ws ":" ws args ws "}"
-intent_name: "\"" intent_enum "\""
-intent_enum: "open_app" | "close_app" | "set_volume" | "media_control" | "search_web" | "read_file" | "write_file" | "run_script" | "get_time" | "get_weather" | "unknown"
-args: "{" ws arg_pair (ws "," ws arg_pair)* ws "}"
-arg_pair: string ":" value
-value: string | number | boolean | "null" | array | object
-string: "\"" ( [^"\\] | "\\" ["\\/bfnrt] | "\\" "u" [0-9a-fA-F]{4} )* "\""
-number: "-" ? [0-9]+ ("." [0-9]+) ? ([eE] [+-]? [0-9]+) ?
-boolean: "true" | "false"
-array: "[" ws (value (ws "," ws value)*)? ws "]"
-object: "{" ws (string ":" value (ws "," ws string ":" value)*)? ws "}"
-ws: [ \t\n\r]*
-"""
-
-
-# ──────────────────────────────────────────────────────────────
-# Data Classes
-# ──────────────────────────────────────────────────────────────
 
 @dataclass
 class LlmResponse:
@@ -49,18 +53,16 @@ class LlmResponse:
     args: Dict[str, Any]
     confidence: float
     raw: str
-    source: str  # "local" or "cloud"
+    source: str = "local"
 
-
-# ──────────────────────────────────────────────────────────────
-# Local LLM Backend
-# ──────────────────────────────────────────────────────────────
 
 class LocalLlmBackend:
     """
-    Local LLM via Ollama + llama.cpp server with GBNF grammar.
+    Local model behind `llama-server`.
 
-    Requires: `llama-server -m model.gguf -mgf grammar.gbnf --port 8080`
+    Start the server with:
+
+        llama-server -m models/llm/qwen2.5-3b-instruct-q4_k_m.gguf --port 8080 -c 4096
     """
 
     def __init__(
@@ -68,105 +70,148 @@ class LocalLlmBackend:
         base_url: Optional[str] = None,
         model: Optional[str] = None,
         grammar: str = INTENT_GRAMMAR,
+        timeout: float = 60.0,
     ):
         cfg = get_config()
-        self.base_url = base_url or cfg.get("llm.local.base_url", "http://localhost:11434/v1")
-        self.model = model or cfg.get("llm.local.model", "qwen2.5:7b-instruct")
+        self.base_url = (
+            base_url or cfg.get("llm.local.base_url", "http://localhost:8080/v1")
+        ).rstrip("/")
+        self.model = model or cfg.get("llm.local.model", "qwen2.5-3b-instruct")
         self.grammar = grammar
-        self._client = httpx.AsyncClient(timeout=30.0)
+        self._client = httpx.AsyncClient(timeout=timeout)
+        # Set once the server rejects a grammar, so we stop retrying it.
+        self._grammar_supported: Optional[bool] = None
 
-        # Allowed models whitelist (包含小模型，适配轻量级设备)
-        self.allowed_models = {
-            # 原有大模型
-            "qwen2.5:7b-instruct",
-            "qwen2.5:14b-instruct",
-            "qwen2.5:32b-instruct",
-            # 新增小模型（推荐用于灵耀14 Air 等轻薄本）
-            "qwen2.5-1.5b-instruct",
-            "qwen2.5-3b-instruct",
-            "qwen2.5-0.5b-instruct",
-            "phi-3-mini-4k-instruct",
-            "phi-3.5-mini-instruct",
-            "gemma-2-2b-instruct",
-            "gemma-2-9b-instruct",
-            "llama-3.2-1b-instruct",
-            "llama-3.2-3b-instruct",
-            "llama-3.1-8b-instruct",
-        }
+    # ── public API ─────────────────────────────────────────────
 
     async def complete(self, prompt: str, grammar: Optional[str] = None) -> LlmResponse:
-        grammar = grammar or self.grammar
-        start_time = time.perf_counter()
+        """
+        Classify into an intent.
 
-        # Validate model
-        if self.model not in self.allowed_models:
-            logger.warning("local_model_not_allowed", model=self.model)
-            raise ValueError(f"Model {self.model} not in allowed list")
+        `prompt` may be a bare utterance or an already-built prompt; a bare
+        utterance is wrapped with the argument schema.
+        """
+        if self.model not in ALLOWED_MODELS:
+            logger.warning("local_model_not_in_allowlist", model=self.model)
 
-        # Build request for llama.cpp server (OpenAI-compatible)
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": "You are an intent classifier. Output only valid JSON matching the grammar."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.1,
-            "max_tokens": 256,
-            "grammar": grammar,  # llama.cpp extension
-        }
+        if "Intents and their argument objects" not in prompt:
+            prompt = build_intent_prompt(prompt)
 
-        try:
-            response = await self._client.post(f"{self.base_url}/chat/completions", json=payload)
-            response.raise_for_status()
-            data = response.json()
-            content = data["choices"][0]["message"]["content"]
+        start = time.perf_counter()
+        content = await self._chat(prompt, grammar or self.grammar)
+        latency = time.perf_counter() - start
 
-            latency = time.perf_counter() - start_time
-            observe_latency("llm_local", latency)
-            inc_request("llm_local", "success")
+        observe_latency("llm_local", latency)
+        inc_request("llm_local", "success")
 
-            return self._parse_response(content, "local")
+        intent, args, confidence = parse_intent_json(content)
+        logger.info(
+            "local_llm_result",
+            intent=intent.value,
+            args=args,
+            latency_ms=int(latency * 1000),
+        )
+        return LlmResponse(
+            intent=intent,
+            args=args,
+            confidence=confidence,
+            raw=content,
+            source="local",
+        )
 
-        except httpx.TimeoutException:
-            inc_request("llm_local", "timeout")
-            raise
-        except Exception as e:
-            inc_request("llm_local", "error")
-            logger.error("local_llm_error", error=str(e))
-            raise
+    async def classify_text(self, text: str) -> LlmResponse:
+        """Convenience wrapper for a raw user utterance."""
+        return await self.complete(build_intent_prompt(text))
 
     async def health_check(self) -> bool:
-        try:
-            resp = await self._client.get(f"{self.base_url}/models", timeout=5.0)
-            return resp.status_code == 200
-        except Exception:
-            return False
+        """True when llama-server answers on the configured base_url."""
+        for path in ("/models", "/health"):
+            try:
+                resp = await self._client.get(f"{self.base_url}{path}", timeout=5.0)
+                if resp.status_code < 500:
+                    return True
+            except Exception:
+                continue
+        return False
 
-    def _parse_response(self, content: str, source: str) -> LlmResponse:
-        try:
-            parsed = json.loads(content)
-            intent_str = parsed.get("intent", "unknown")
-            intent = IntentName(intent_str) if intent_str in IntentName.__members__.values() else IntentName.UNKNOWN
-            args = parsed.get("args", {})
-            return LlmResponse(
-                intent=intent,
-                args=args,
-                confidence=0.8,  # local model confidence estimate
-                raw=content,
-                source=source,
-            )
-        except json.JSONDecodeError:
-            logger.warning("llm_json_parse_failed", content=content[:200])
-            return LlmResponse(
-                intent=IntentName.UNKNOWN,
-                args={},
-                confidence=0.0,
-                raw=content,
-                source=source,
-            )
-
-    async def close(self):
+    async def close(self) -> None:
         await self._client.aclose()
+
+    # ── transport ──────────────────────────────────────────────
+
+    async def _chat(self, prompt: str, grammar: Optional[str]) -> str:
+        """POST the chat request, degrading gracefully if the grammar is refused."""
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an intent classifier. Reply with a single JSON object "
+                    "matching the required schema. No prose, no markdown."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+        attempts = []
+        if grammar and self._grammar_supported is not False:
+            attempts.append("grammar")
+        attempts.append("json_object")
+
+        last_status = None
+        last_body = ""
+
+        for attempt in attempts:
+            payload: Dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": 0.1,
+                "max_tokens": 256,
+            }
+            if attempt == "grammar":
+                payload["grammar"] = grammar
+            else:
+                payload["response_format"] = {"type": "json_object"}
+
+            try:
+                resp = await self._client.post(f"{self.base_url}/chat/completions", json=payload)
+            except httpx.TimeoutException:
+                inc_request("llm_local", "timeout")
+                raise
+            except httpx.HTTPError as e:
+                inc_request("llm_local", "error")
+                logger.error("local_llm_transport_error", error=str(e))
+                raise
+
+            if resp.status_code == 200:
+                if attempt == "grammar":
+                    self._grammar_supported = True
+                return resp.json()["choices"][0]["message"]["content"]
+
+            last_status, last_body = resp.status_code, _short(resp.text)
+
+            # A grammar this build cannot parse: remember it and fall back once.
+            if attempt == "grammar" and resp.status_code == 400 and "grammar" in last_body.lower():
+                self._grammar_supported = False
+                logger.warning(
+                    "local_llm_grammar_rejected",
+                    status=resp.status_code,
+                    detail=last_body,
+                    action="falling back to response_format=json_object",
+                )
+                continue
+
+            inc_request("llm_local", "error")
+            logger.error("local_llm_error", status=resp.status_code, detail=last_body)
+            raise RuntimeError(f"llama-server returned HTTP {last_status}: {last_body}")
+
+        inc_request("llm_local", "error")
+        raise RuntimeError(
+            f"llama-server rejected every output mode (last: HTTP {last_status}: {last_body})"
+        )
+
+
+def _short(text: str, limit: int = 300) -> str:
+    return " ".join((text or "").split())[:limit]
 
 
 def create_local_llm_backend() -> LocalLlmBackend:

@@ -1,13 +1,23 @@
-?start: intent
-intent: "{" ws "\"intent\"" ws ":" ws intent_name ws "," ws "\"args\"" ws ":" ws args ws "}"
-intent_name: "\"" intent_enum "\""
-intent_enum: "open_app" | "close_app" | "set_volume" | "media_control" | "search_web" | "read_file" | "write_file" | "run_script" | "get_time" | "get_weather" | "unknown"
-args: "{" ws arg_pair (ws "," ws arg_pair)* ws "}"
-arg_pair: string ":" value
-value: string | number | boolean | "null" | array | object
-string: "\"" ( [^"\\] | "\\" ["\\/bfnrt] | "\\" "u" [0-9a-fA-F]{4} )* "\""
-number: "-" ? [0-9]+ ("." [0-9]+) ? ([eE] [+-]? [0-9]+) ?
-boolean: "true" | "false"
-array: "[" ws (value (ws "," ws value)*)? ws "]"
-object: "{" ws (string ":" value (ws "," ws string ":" value)*)? ws "}"
-ws: [ \t\n\r]*
+# GBNF grammar for constrained decoding of voice-assistant intents.
+#
+# Used by llama.cpp / llama-server. Pass it either per-request
+#   {"grammar": "<contents of this file>"}
+# or at startup
+#   llama-server -m model.gguf --grammar-file grammar.gbnf --port 8080
+#
+# NOTE: the entry rule MUST be named `root`. The `?start:` / `rule:` form used
+# by some other grammar toolchains is rejected by llama.cpp with
+# "400 Failed to parse grammar".
+#
+# Keep in sync with winvoice/llm/grammar.py (INTENT_GRAMMAR).
+
+root ::= "{" ws "\"intent\"" ws ":" ws intent ws "," ws "\"args\"" ws ":" ws obj ws "}"
+intent ::= "\"" ("open_app" | "close_app" | "set_volume" | "media_control" | "search_web" | "read_file" | "write_file" | "run_script" | "get_time" | "get_weather" | "unknown") "\""
+obj ::= "{" ws (pair (ws "," ws pair)*)? ws "}"
+pair ::= str ws ":" ws val
+val ::= str | num | "true" | "false" | "null" | obj | arr
+arr ::= "[" ws (val (ws "," ws val)*)? ws "]"
+str ::= "\"" char* "\""
+char ::= [^"\\] | "\\" ["\\/bfnrt]
+num ::= "-"? [0-9]+ ("." [0-9]+)?
+ws ::= [ \t\n]*

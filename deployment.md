@@ -11,7 +11,7 @@
 | 阶段 | 预计耗时 | 关键产出 |
 |------|----------|----------|
 | 1. 系统前置 | 10-20 min | Python、Git、VS Build Tools、OpenVINO 运行时 |
-| 2. 外部运行时 | 15-30 min | Ollama、llama.cpp (b6000+)、sherpa-onnx OpenVINO 版 |
+| 2. 外部运行时 | 15-30 min | Ollama、llama.cpp (**b7376 win-cpu-x64，实测可用**)、sherpa-onnx (pip CPU 版) |
 | 3. Python 环境 | 5-10 min | venv、依赖包安装 |
 | 4. 模型下载 | 10-60 min | KWS/VAD/ASR/TTS/SV + 小模型 LLM |
 | 5. 配置与验证 | 5-10 min | config.yaml、声纹注册、端到端测试 |
@@ -87,34 +87,64 @@ ollama serve
 ollama list
 ```
 
-### 2.2 获取 llama.cpp (b6000+，支持 `-mgf` GBNF 语法)
+### 2.2 获取 llama.cpp（**实测可用版本：b7376 CPU 版**）
 
-**⚠️ 关键：必须用支持 `-mgf` 的版本，旧版本不支持约束解码**
+> ⚠️ **踩坑记录（2026-09-19 实测）**
+> 新版 OpenVINO 构建（b11046）**在 Windows 上有 bug**，已回退到旧版 CPU 构建。
+> 当前**已验证可用**的是 **b7376 (380b4c984) win-cpu-x64**：
+> ```
+> version: 7376 (380b4c984)
+> built with Clang 19.1.5 for Windows x86_64
+> ```
+> CPU 后端已启用 `AVX_VNNI` / `AVX2` / `FMA` / `REPACK`，3B Q4_K_M 推理约 1.4–4.0 s。
 
 ```powershell
-# 方案 A: 下载预编译 Release (推荐)
+# 下载 llama.cpp Release（选择 win-cpu-x64 构建）
 # https://github.com/ggml-org/llama.cpp/releases
-# 找最新版 (b6000+)，下载 llama-b6000-win64-openvino.zip (含 OpenVINO 支持)
 
-# 创建工具目录并解压到工作区
-mkdir -Force .\tools\llama.cpp
-Expand-Archive $env:USERPROFILE\Downloads\llama-b6000-win64-openvino.zip .\tools\llama.cpp
-
-# 方案 B: 自行编译 (需 VS Build Tools + CMake)
-git clone https://github.com/ggml-org/llama.cpp
-cd llama.cpp
-mkdir build && cd build
-cmake .. -DGGML_OPENVINO=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build . --config Release -j
-# 生成的 llama-server.exe 在 build/bin/Release/
+# 解压到工作区
+mkdir -Force .\tools\llama-b7376-bin-win-cpu-x64
+Expand-Archive <下载的zip> .\tools\llama-b7376-bin-win-cpu-x64
 
 # 验证
-llama-server --version
-# 应显示版本号且包含 openvino 支持
+cd .\tools\llama-b7376-bin-win-cpu-x64
+.\llama-server.exe --version
+# 期望：version: 7376 (380b4c984)
 ```
 
-> **环境变量**：将 `llama-server.exe` 所在目录加入系统 PATH，或在启动脚本中使用相对路径。
-> **推荐路径**：`.\tools\llama.cpp\` (项目根目录下)
+**启动服务（实测命令）：**
+
+```powershell
+cd C:\Users\<you>\Desktop\windows_voice_assistant\tools\llama-b7376-bin-win-cpu-x64
+
+.\llama-server.exe `
+  -m ..\..\models\llm\qwen2.5-3b-instruct-q4_k_m.gguf `
+  --port 8080 `
+  -ngl 0 `
+  -c 4096
+```
+
+成功标志：
+```
+main: model loaded
+main: server is listening on http://127.0.0.1:8080
+main: starting the main loop...
+srv  update_slots: all slots are idle
+```
+
+> **参数说明**
+> - `-ngl 0`：全部在 CPU 上跑（CPU 构建无 GPU 后端，必须为 0）
+> - `-c 4096`：上下文长度（Qwen2.5 训练时是 32768，4096 足够意图分类）
+> - **不需要 `-mgf grammar.gbnf`**：GBNF 语法由客户端**逐请求**通过 `grammar` 字段下发，
+>   服务端无需任何语法参数
+>
+> **验证 LLM 层**（服务启动后另开终端）：
+> ```powershell
+> cd C:\Users\<you>\Desktop\windows_voice_assistant
+> python scripts/check_llm.py
+> # 期望：9/9 intents matched
+> #       grammar-constrained decoding: ACTIVE (GBNF accepted)
+> ```
 
 ### 2.3 安装 sherpa-onnx (CPU 版优先，OpenVINO 为进阶选项)
 
@@ -168,16 +198,16 @@ git clone https://github.com/luoxiaguwu9394/windows_voice_assistant.git
 cd windows_voice_assistant
 ```
 
-### 3.2 创建虚拟环境并安装依赖
+### 3.2 安装依赖
+
+> **不需要 venv**：依赖装在用户级 site-packages，`python` 随处可用。
+> 若你确实想用 venv，注意 venv 是隔离的，需要在里面重新装一遍依赖。
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-
 # 升级 pip
 python -m pip install --upgrade pip
 
-# 安装项目依赖 (含开发工具)
+# 安装项目依赖 (含开发工具: pytest / mypy / ruff)
 pip install -e .[dev]
 
 # 验证核心包
@@ -185,6 +215,9 @@ python -c "
 import sherpa_onnx, numpy, pydantic, yaml, watchdog, structlog, orjson, httpx, sounddevice, scipy, win32api, pyautogui
 print('All core packages OK')
 "
+
+# KWS 唤醒词需要把文字转成模型 token，额外需要这两个
+pip install sentencepiece pypinyin
 ```
 
 ---
@@ -201,7 +234,7 @@ python scripts/download_models.py --all
 python scripts/download_models.py --kws zipformer-zh-en
 python scripts/download_models.py --vad silero
 python scripts/download_models.py --asr sense-voice
-python scripts/download_models.py --tts piper-zh
+python scripts/download_models.py --tts
 python scripts/download_models.py --sv campplus
 ```
 
@@ -273,31 +306,40 @@ $env:REMOTE_API_KEY = "sk-xxx-your-api-key"
 
 ## 6️⃣ 启动服务 (按顺序，每个开一个终端)
 
-### 终端 1：llama.cpp server (GBNF 约束解码，**必须先启动**）
+### 终端 1：llama.cpp server（**必须先启动**）
 
 ```powershell
-# 进入 llama.cpp 解压目录 (工作区工具目录)
-cd .\tools\llama.cpp
+# 进入 llama.cpp 解压目录（实测可用版本）
+cd C:\Users\<you>\Desktop\windows_voice_assistant\tools\llama-b7376-bin-win-cpu-x64
 
-# 启动 OpenVINO 加速 (NPU + GPU)
 .\llama-server.exe `
   -m ..\..\models\llm\qwen2.5-3b-instruct-q4_k_m.gguf `
-  -mgf ..\..\grammar.gbnf `
   --port 8080 `
-  -ngl 99 `                    # 卸载尽可能多层到 GPU/NPU (OpenVINO)
-  -c 4096 `                    # 上下文长度
-  --host 127.0.0.1
+  -ngl 0 `
+  -c 4096
 
-# 看到 "HTTP server listening on 127.0.0.1:8080" 即成功
+# 看到下面两行即成功：
+#   main: server is listening on http://127.0.0.1:8080
+#   main: starting the main loop...
 ```
 
-> **参数说明**：
-> - `-mgf grammar.gbnf`：启用 GBNF 语法约束，**小模型必须开启**
-> - `-ngl 99`：将所有层卸载到 OpenVINO (NPU/Arc GPU)
-> - `--host 127.0.0.1`：仅本地访问
-> 
-> **路径说明**：从 `.\tools\llama.cpp` 出发，`..\..\` 回到项目根目录，再进入 `models\llm\` 和 `grammar.gbnf`。
-> 请根据实际路径调整 `-m` 和 `-mgf` 的相对/绝对路径。
+> **参数说明**
+> - `-ngl 0`：CPU 构建必须为 0（无 GPU 后端）
+> - `-c 4096`：上下文长度
+> - **不需要 `-mgf grammar.gbnf`**：GBNF 由客户端逐请求下发（`grammar` 字段），
+>   服务端加不加语法参数都能约束输出
+>
+> **相对路径**：从 `tools\llama-b7376-bin-win-cpu-x64` 出发，`..\..\` 回到项目根目录。
+> 若换过目录，直接写绝对路径即可。
+
+### 终端 1.5：验证 LLM 层（可选但强烈建议）
+
+```powershell
+cd C:\Users\<you>\Desktop\windows_voice_assistant
+python scripts/check_llm.py
+# 期望：9/9 intents matched
+#       grammar-constrained decoding: ACTIVE (GBNF accepted)
+```
 
 ### 终端 2：Ollama (可选，云端回退/大模型用)
 
@@ -305,14 +347,18 @@ cd .\tools\llama.cpp
 ollama serve
 ```
 
-### 终端 3：主程序 (开发/测试模式)
+### 终端 3：主程序
 
 ```powershell
-cd C:\path\to\windows_voice_assistant
-.\.venv\Scripts\Activate.ps1
+# 不需要 venv：依赖装在用户级 site-packages，python 随处可用。
+# 但进程工作目录必须是仓库根目录（config.yaml 与 models/ 按 CWD 解析）
+cd C:\Users\<you>\Desktop\windows_voice_assistant
 
-# 存根模式 (无需模型，验证流程)
-python -m winvoice --stub-audio --test-pipeline
+# 自检：加载全部真实模型后退出（不需要麦克风）
+python -m winvoice --check
+
+# 存根模式（无需模型，验证流程）
+python -m winvoice --stub-audio --check
 
 # 完整模式 (需模型已下载、llama-server 已启动)
 python -m winvoice
@@ -322,63 +368,106 @@ python -m winvoice
 
 ## 7️⃣ 声纹注册 (首次运行必须)
 
+> 启动日志里 `sv_initialized ... enrolled=[]` 说明**还没注册声纹**。
+> 未注册时 `verify()` 返回 `None`，说话人分级不生效（不做拦截），
+> 功能可用但**没有声纹保护**。要启用请先注册。
+
 ```powershell
-cd C:\path\to\windows_voice_assistant
-.\.venv\Scripts\Activate.ps1
+cd C:\Users\<you>\Desktop\windows_voice_assistant
 
 # 注册 8 个样本 (每个 3-5 秒，变化音量/距离/内容)
 python -m winvoice.enroll --speaker me --samples 8 --duration 4
 
 # 交互过程：
-# 🎤 Sample 1/8 - Speak for 4s...
-#    Starting in 3... Recording! Done recording.
-#    ...
-# ✅ Enrollment complete for 'me'
-#    Threshold HIGH: 0.623
-#    Threshold LOW:  0.450
+# ================================================================
+# Speaker enrollment
+#   speaker          : me
+#   samples          : 8 x 4s
+#   min speech floor : 0.40 (samples below this are rejected)
+# ================================================================
+# [*] Sample 1/8 - speak for 4s
+#     (vary wording, volume and distance)
+#     starting in 3... recording...
+#     done.
+# ...
+# [OK] Enrollment complete for 'me'
+#      samples         : 8
+#      threshold HIGH  : 0.623
+#      threshold LOW   : 0.450
+#      profile saved   : models/sv/profiles/me.json
 ```
 
 > **提示**：
 > - 安静环境，贴近麦克风
 > - 内容多样化：数字、指令、闲聊
-> - 若 `min_intra < 0.4` 报错，重新录制
+> - 若 `min_intra < 0.4` 会报错并提示重录
+> - 注册后再跑 `--check`，`enrolled` 应显示 `['me']`
 
 ---
 
 ## 8️⃣ 验证与测试
 
-### 8.1 安装验证脚本
+### 8.1 启动自检（真实模型，最快）
 
 ```powershell
-python scripts/verify_install.py
-# 应输出: ✅ ALL CHECKS PASSED
+python -m winvoice --check
+# 期望: [OK] Startup check PASSED - all engines initialize with the current config
 ```
 
-### 8.2 存根管道测试 (无需模型)
+### 8.2 引擎冒烟测试（真实模型，含实际推理）
 
 ```powershell
-python scripts/test_stub_pipeline.py
-# 应通过所有意图分类测试
+python scripts/smoke_test_models.py
+# 期望: 18/18 passed
 ```
 
-### 8.3 单元测试
+### 8.3 LLM 层检查（需 llama-server 运行中）
 
 ```powershell
-pytest tests/unit -v
-# 应全绿
+python scripts/check_llm.py
+# 期望: 9/9 intents matched
+#       grammar-constrained decoding: ACTIVE (GBNF accepted)
 ```
 
-### 8.4 端到端手动测试
+### 8.4 完整测试套件
 
 ```powershell
-# 确保 llama-server 运行中
-# 运行主程序
+python -m pytest tests/ -q
+# 期望: 55 passed, 1 skipped
+```
+
+### 8.5 端到端手动测试
+
+```powershell
+# 确保 llama-server 运行中，然后运行主程序
 python -m winvoice
+
+# 成功启动后应看到：
+#   microphone_open
+#   Assistant is listening. Say the wake word (default: 'assistant'). Ctrl+C to stop.
+#   pipeline_started
 
 # 说唤醒词："assistant" 或 "hey assistant"
 # 然后发指令："打开记事本"、"音量调大 20"、"搜索 Python 教程"
 # 观察日志输出
 ```
+
+> **实测启动日志（2026-09-19）**
+> ```
+> kws_initialized   keywords=['assistant', 'hey assistant'] threshold=0.25
+> vad_initialized   model=...\silero_vad_v5.onnx
+> asr_initialized   language=auto mode=sense_voice
+> sv_initialized    dim=192 enrolled=[]          <- 尚未注册声纹
+> tts_initialized   num_speakers=174 sample_rate=8000
+> pipeline_initialized stub=False
+> audio_input_started blocksize=1600 sample_rate=16000
+> microphone_open
+> Assistant is listening. Say the wake word (default: 'assistant'). Ctrl+C to stop.
+> pipeline_started
+> ```
+> `enrolled=[]` 表示**还没注册声纹**：此时 `verify()` 返回 `None`，
+> 说话人分级不生效（不做拦截），功能可用但**没有声纹保护**。
+> 要启用请执行第 7 节的注册命令
 
 ---
 
@@ -386,12 +475,14 @@ python -m winvoice
 
 | 场景 | 命令 |
 |------|------|
-| 激活虚拟环境 | `.\.venv\Scripts\Activate.ps1` |
+| 启动自检（真实模型） | `python -m winvoice --check` |
+| 引擎冒烟测试 | `python scripts/smoke_test_models.py` |
+| LLM 层检查 | `python scripts/check_llm.py` |
+| 从任意目录运行 | `& <repo>\run.ps1 --check` |
 | 更新依赖 | `pip install -e .[dev] --upgrade` |
 | 重新下载模型 | `python scripts/download_models.py --force --all` |
-| 重新注册声纹 | `python -m winvoice.enroll --speaker me --samples 8` |
-| 分析 SV 阈值 | `python scripts/analyze_sv_scores.py --log-dir logs/sv_scores` |
-| 查看结构化日志 | `Get-Content logs/main.jsonl -Tail 20` |
+| 重新注册声纹 | `python -m winvoice.enroll --speaker me --samples 8 --force` |
+| 查看可用模型 | `python scripts/download_models.py --list` |
 | 运行类型检查 | `mypy winvoice` |
 | 代码格式化 | `ruff check --fix winvoice` |
 
@@ -401,14 +492,17 @@ python -m winvoice
 
 | 现象 | 排查步骤 |
 |------|----------|
-| `ModuleNotFoundError: sherpa_onnx` | 1) 确认安装 OpenVINO 版 2) dll 在 PATH 中 3) `pip install sherpa-onnx==1.12.3` |
-| `llama-server: unrecognized option '-mgf'` | llama.cpp 版本太旧，升级到 b6000+ |
+| `ModuleNotFoundError: sherpa_onnx` | `pip install sherpa-onnx==1.13.8` |
+| `ModuleNotFoundError: sentencepiece` / `pypinyin` | KWS 唤醒词转 token 需要：`pip install sentencepiece pypinyin` |
+| `400 Failed to parse grammar` | GBNF 语法不被该 llama.cpp 版本接受。本项目已改为**自动回退**到 `json_object` 模式，日志会打印 `local_llm_grammar_rejected`；仍想用 GBNF 请换用实测版本（见 2.2） |
+| `llama-server: unrecognized option '-mgf'` | 该版本无此参数。**改用客户端下发语法**（本项目默认方式），或换用 2.2 节的实测版本 |
+| llama-server 连不上（`health_check` 失败） | 1) 确认服务在 `http://127.0.0.1:8080` 2) 确认 `config.yaml` 的 `llm.local.base_url` 为 `http://localhost:8080/v1` |
 | `sounddevice.PortAudioError` | 检查麦克风权限/驱动，或用 `--stub-audio` |
-| `Config value unresolved: ${REMOTE_API_KEY}` | 设置环境变量或关闭 `llm.remote.enabled` |
+| `Unresolved environment variable at 'llm.remote.api_key'` | 设置 `setx REMOTE_API_KEY "sk-..."`，或把 `llm.remote.enabled` 设为 `false`（默认已是 false） |
 | `min_intra < 0.4` 注册失败 | 换安静环境、贴近麦克风、重录 8 遍 |
 | `numpy` 版本冲突 | `pip install "numpy<2"` 或确认所有依赖支持 numpy 2.x |
-| OpenVINO 报错缺 DLL | 更新 Intel 显卡/NPU 驱动，重装 `pip install openvino==2024.6.0` |
-| 意图分类总是 UNKNOWN | 1) 确认 llama-server 跑通 2) 检查 GBNF 语法 3) 降低 confidence_threshold |
+| 意图分类总是 UNKNOWN | 1) `python scripts/check_llm.py` 确认 LLM 层 2) 检查 `llm.local.model` 是否与 llama-server 加载的一致 |
+| TTS 只有 8 kHz 音质 | icefall aishell3 原生即为 8 kHz，属正常现象 |
 
 ---
 
@@ -416,33 +510,40 @@ python -m winvoice
 
 ```
 项目根目录/
-├── config/config.yaml          # 主配置
-├── grammar.gbnf                # GBNF 语法 (llama-server 必需)
+├── config/config.yaml                       # 主配置
+├── grammar.gbnf                             # GBNF 语法（客户端逐请求下发，非必需）
+├── run.ps1                                  # 从任意目录启动
 ├── models/
-│   ├── kws/zipformer-zh-en/
-│   ├── vad/silero_vad.onnx
-│   ├── asr/sense-voice/
-│   ├── tts/piper-zh/
-│   ├── sv/campplus.onnx
+│   ├── kws/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/
+│   ├── vad/silero_vad_v5.onnx
+│   ├── asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/
+│   ├── tts/vits-icefall-zh-aishell3/
+│   ├── sv/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx
+│   ├── sv/profiles/me.json                  # 声纹档案（注册后生成）
 │   └── llm/qwen2.5-3b-instruct-q4_k_m.gguf
-├── logs/                       # 结构化日志 (每日轮转)
-├── snapshots/                  # 破坏性操作快照
+├── tools/                                   # 本地解压的 llama.cpp（gitignore）
+├── logs/                                    # 结构化日志（每日轮转）
+├── snapshots/                               # 破坏性操作快照
 ├── scripts/
-│   ├── download_models.py
-│   ├── verify_install.py
-│   └── test_stub_pipeline.py
-└── winvoice/                   # 源码包
+│   ├── download_models.py                   # 下载模型
+│   ├── smoke_test_models.py                 # 引擎冒烟测试（真实模型）
+│   ├── check_llm.py                         # LLM 层检查
+│   └── verify_install.py                    # 依赖检查
+└── winvoice/                                # 源码包
 ```
 
 ---
 
 ## 🎉 部署完成标志
 
-- [ ] `python scripts/verify_install.py` → ✅ ALL CHECKS PASSED
-- [ ] `llama-server` 在 8080 端口监听，加载 GGUF + GBNF 成功
-- [ ] `python -m winvoice --stub-audio --test-pipeline` → 流程跑通
-- [ ] `python -m winvoice.enroll --speaker me --samples 8` → 阈值生成
-- [ ] `python -m winvoice` 启动，说 "assistant" → 唤醒 → 指令执行 → TTS 回复
+- [ ] `python -m winvoice --check` → `Startup check PASSED`（5 个引擎全部加载）
+- [ ] `python scripts/smoke_test_models.py` → `18/18 passed`
+- [ ] `python -m pytest tests/ -q` → `55 passed, 1 skipped`
+- [ ] `llama-server` 在 8080 端口监听，`main: server is listening on http://127.0.0.1:8080`
+- [ ] `python scripts/check_llm.py` → `9/9 intents matched`，`grammar-constrained decoding: ACTIVE`
+- [ ] `python -m winvoice` 启动 → `microphone_open` + `pipeline_started`
+- [ ] `python -m winvoice.enroll --speaker me --samples 8` → 生成 `models/sv/profiles/me.json`，`--check` 显示 `enrolled=['me']`
+- [ ] 说 "assistant" → 唤醒 → 指令执行 → TTS 回复
 
 ---
 

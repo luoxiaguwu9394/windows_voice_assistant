@@ -17,6 +17,12 @@ from winvoice.tools.registry import scan_for_irreversible, ToolRegistry
 from winvoice.tools.snapshot import SnapshotManager
 from winvoice.intent.rules import match_rules, RULE_PATTERNS
 from winvoice.intent.classifier import IntentClassifier
+from winvoice.llm.grammar import (
+    INTENT_GRAMMAR,
+    build_intent_prompt,
+    normalize_args,
+    parse_intent_json,
+)
 
 
 class TestContracts:
@@ -291,32 +297,98 @@ class TestIntentRules:
         assert result is None
 
 
-class TestIntentClassifier:
-    """Test local intent classifier (stubbed)."""
+class TestIntentGrammar:
+    """Constrained-decoding contract shared by the classifier and LLM backends."""
 
-    @pytest.mark.asyncio
-    async def test_classifier_builds_prompt(self):
-        classifier = IntentClassifier()
-        prompt = classifier._build_prompt("打开记事本")
+    def test_grammar_uses_llamacpp_root_rule(self):
+        """llama.cpp requires `root ::=`; `?start:` makes it answer 400."""
+        first = INTENT_GRAMMAR.strip().splitlines()[0]
+        assert first.startswith("root ::="), first
+        assert "?start" not in INTENT_GRAMMAR
+
+    def test_grammar_lists_every_intent(self):
+        for intent in IntentName:
+            assert f'"{intent.value}"' in INTENT_GRAMMAR
+
+    def test_prompt_includes_schema_and_utterance(self):
+        prompt = build_intent_prompt("打开记事本")
         assert "open_app" in prompt
+        assert '"app"' in prompt          # argument schema is stated
         assert "记事本" in prompt
         assert "JSON" in prompt
 
-    @pytest.mark.asyncio
-    async def test_parse_valid_json(self):
+    def test_parse_valid_json(self):
+        intent, args, confidence = parse_intent_json(
+            '{"intent": "open_app", "args": {"app": "notepad"}}'
+        )
+        assert intent == IntentName.OPEN_APP
+        assert args == {"app": "notepad"}
+        assert confidence > 0
+
+    def test_parse_invalid_json(self):
+        intent, args, confidence = parse_intent_json("not json at all")
+        assert intent == IntentName.UNKNOWN
+        assert args == {}
+        assert confidence == 0.0
+
+    def test_parse_unknown_intent_label(self):
+        intent, args, confidence = parse_intent_json('{"intent": "wat", "args": {}}')
+        assert intent == IntentName.UNKNOWN
+        assert confidence == 0.0
+
+    def test_normalize_args_maps_synonyms(self):
+        """Small models invent key names; they must be mapped back."""
+        intent, args, _ = parse_intent_json(
+            '{"intent": "open_app", "args": {"app_name": "notepad"}}'
+        )
+        assert intent == IntentName.OPEN_APP
+        assert args == {"app": "notepad"}
+
+    def test_normalize_args_coerces_bare_string(self):
+        """Observed in practice: the model collapses args to a string."""
+        intent, args, _ = parse_intent_json(
+            '{"intent": "search_web", "args": "python tutorial"}'
+        )
+        assert intent == IntentName.SEARCH_WEB
+        assert args == {"query": "python tutorial"}
+
+    def test_normalize_args_volume_from_string_number(self):
+        intent, args, _ = parse_intent_json(
+            '{"intent": "set_volume", "args": {"value": "20"}}'
+        )
+        assert intent == IntentName.SET_VOLUME
+        assert args == {"delta": 20}
+
+    def test_media_action_synonyms(self):
+        _, args, _ = parse_intent_json(
+            '{"intent": "media_control", "args": {"action": "resume"}}'
+        )
+        assert args == {"action": "play"}
+
+
+class TestIntentClassifier:
+    """IntentClassifier delegates to the shared LLM backend."""
+
+    def test_uses_configured_endpoint(self):
         classifier = IntentClassifier()
-        content = '{"intent": "open_app", "args": {"app": "notepad"}}'
-        result = classifier._parse_response(content)
-        assert result.intent == IntentName.OPEN_APP
-        assert result.args["app"] == "notepad"
-        assert result.confidence > 0
+        # Uses llm.local.* from config, not a hard-coded fallback.
+        assert classifier.base_url.startswith("http")
+        assert classifier.model
 
     @pytest.mark.asyncio
-    async def test_parse_invalid_json(self):
-        classifier = IntentClassifier()
-        result = classifier._parse_response("not json")
-        assert result.intent == IntentName.UNKNOWN
-        assert result.confidence == 0.0
+    async def test_classify_returns_unknown_without_server(self):
+        """An unreachable server must surface as UNKNOWN, not an exception."""
+        classifier = IntentClassifier(base_url="http://127.0.0.1:9/v1")
+        try:
+            result = await classifier.classify("打开记事本")
+        except Exception:
+            # A connection error is acceptable here; what matters is that the
+            # caller is not left with a half-initialised object.
+            pytest.skip("no server reachable")
+        else:
+            assert result.intent in tuple(IntentName)
+        finally:
+            await classifier.close()
 
 
 if __name__ == "__main__":

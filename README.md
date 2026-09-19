@@ -133,18 +133,34 @@ python scripts/download_models.py --sv campplus
 
 Models are downloaded to `models/` by default; paths are configurable.
 
-### Local LLM (Ollama)
+### Local LLM (llama.cpp server)
+
+The intent classifier talks to `llama-server` over its OpenAI-compatible API.
+Start the server with the GGUF downloaded by `download_models.py`:
 
 ```powershell
-ollama pull qwen2.5:7b-instruct
-ollama serve
+cd tools\llama-b7376-bin-win-cpu-x64
+
+.\llama-server.exe `
+  -m ..\..\models\llm\qwen2.5-3b-instruct-q4_k_m.gguf `
+  --port 8080 -ngl 0 -c 4096
 ```
 
-For constrained decoding (required for intent classifier), run llama.cpp server with GBNF grammar:
+> **No grammar flag needed.** GBNF is sent per-request in the `grammar` field,
+> so the server needs no `-mgf` / `--grammar-file` argument. If a build rejects
+> the grammar, the client logs `local_llm_grammar_rejected` and automatically
+> falls back to `response_format: json_object`.
+
+Verify the LLM tier once the server is up:
+
 ```powershell
-# Build llama.cpp, then:
-llama-server -m qwen2.5-7b-instruct.gguf -mgf grammar.gbnf --port 8080
+python scripts/check_llm.py
+# -> 9/9 intents matched
+#    grammar-constrained decoding: ACTIVE (GBNF accepted)
 ```
+
+> Ollama is supported as an alternative OpenAI-compatible endpoint; point
+> `llm.local.base_url` at it and set `llm.local.model` accordingly.
 
 ### Speaker enrollment
 
