@@ -158,7 +158,15 @@ Thresholds `T_high` and `T_low` are computed automatically. If `min_intra < 0.4`
 
 ### Run
 
+> **No virtualenv required.** Dependencies install into your user
+> site-packages (`pip install -r requirements.txt`), and `python` resolves
+> from any directory — but the process must start with the **repo root as its
+> working directory**, because `config/config.yaml` and `models/` are resolved
+> relative to the CWD. `run.ps1` handles that for you.
+
 ```powershell
+cd C:\Users\<you>\Desktop\windows_voice_assistant   # repo root
+
 # Verify every model loads, then exit (no microphone required)
 python -m winvoice --check
 
@@ -167,6 +175,13 @@ python -m winvoice
 
 # Run with model-free stubs (development / plumbing checks)
 python -m winvoice --stub-audio
+```
+
+From any other directory, use the helper — it switches to the repo root first:
+
+```powershell
+& C:\Users\<you>\Desktop\windows_voice_assistant\run.ps1 --check
+& C:\Users\<you>\Desktop\windows_voice_assistant\run.ps1
 ```
 
 ### Development commands
