@@ -203,6 +203,15 @@ class ConfigManager:
         because an unused feature must not stop the assistant from booting.
         Any other unresolved placeholder raises, naming the offending key
         path so the fix is obvious.
+
+        `WINVOICE_CONFIG_TOLERANT=1` downgrades that error to the tolerated
+        path for every placeholder. The MCP tool server sets it, because it is
+        spawned by DeepSeek Harness with the environment **scrubbed of anything
+        matching /KEY|PASSWORD|SECRET|TOKEN/i** — so `DEEPSEEK_API_KEY` is gone
+        by design, and a config that names it would otherwise kill the tool
+        server at startup. That server needs the tool registry and nothing else;
+        refusing to serve tools because an unrelated cloud key is absent is a
+        worse failure than any key it could read.
         """
         if not self.config_path.exists():
             raise FileNotFoundError(f"Config not found: {self.config_path}")
@@ -215,9 +224,10 @@ class ConfigManager:
 
         unresolved = self._find_unresolved(self._config)
         tolerated: List[str] = []
+        lenient = strict is False and os.environ.get("WINVOICE_CONFIG_TOLERANT") == "1"
 
         for path in unresolved:
-            if strict or not self._is_in_disabled_section(path):
+            if strict or not (lenient or self._is_in_disabled_section(path)):
                 raise ValueError(
                     f"Unresolved environment variable at '{path}'.\n"
                     f"  Set it, e.g.:  setx {path.rsplit('.', 1)[-1].upper()} \"<value>\"\n"

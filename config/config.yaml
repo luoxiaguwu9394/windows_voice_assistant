@@ -134,33 +134,144 @@ tools:
 # and the bridge bundle — run `python scripts/install_dsh_bridge.py --install`.
 # ──────────────────────────────────────────────────────────────
 dsh:
-  enabled: false               # master switch; also requires dsh.local.enabled
+  enabled: true                # master switch; also requires dsh.local.enabled
   escalation_enabled: true     # allow Local -> Cloud when the machine disagrees
   max_local_attempts: 2        # 2 = one retry for a `retryable` verification failure
 
+  # The DeepSeek adapter defaults to reasoningEffort=high with thinking enabled,
+  # so even 「现在几点」 pays for high-effort reasoning. This sets the policy on
+  # that adapter's own row; it is inert unless a tier selects `deepseek-official`.
+  #
+  # Per-tier `reasoning_effort` below stays EMPTY on purpose: a hand-declared
+  # route whose model declares `reasoningEfforts: false` (a plain instruct model
+  # such as qwen2.5-3b) REJECTS an explicit effort with
+  #   provider "x" model "y" does not support reasoning effort "off"
+  # Omitting it uses the model's own default, which is right for a non-reasoning
+  # model and costs nothing.
+  reasoning_effort: "off"
+
+  # Hand-declared OpenAI-compatible routes. Each key is the name a request
+  # selects through `provider:` below. A route the installed pi-ai catalog does
+  # not describe — a local llama.cpp server, NVIDIA NIM — has to be spelled out,
+  # or the SDK fails at initialize with
+  #   no adapter registered for provider "<name>"
+  # `api_key_env` names the variable holding the key; the key itself never
+  # belongs in this file.
+  providers:
+    local-llamacpp:
+      display_name: "本地 llama.cpp"
+      api: openai-completions
+      base_url: "http://localhost:8080/v1"
+      api_key_env: "WINVOICE_LOCAL_LLM_KEY"
+      # pi-ai insists a route carries a key even when the server ignores it:
+      #   NO api_key_env  -> "No API key for provider: local-llamacpp" (PI_AI_ERROR)
+      #   api_key_env set -> "no credential ... which is not set" (MISSING_CREDENTIAL)
+      # `placeholder_key` settles it: the app exports a dummy value into the
+      # runtime's environment, so the route authenticates and llama.cpp ignores
+      # the header. Only use it for a server that really does not check.
+      placeholder_key: true
+      models:
+        - id: "qwen2.5-3b-instruct"
+          context_window: 32768
+          max_tokens: 2048
+    nvidia:
+      display_name: "NVIDIA NIM"
+      api: openai-completions
+      base_url: "https://integrate.api.nvidia.com/v1"
+      api_key_env: "NVIDIA_API_KEY"
+      # STATUS: declared, but NOT working yet. A hand-declared pi-ai route could
+      # not be given a credential by any route tried so far — the process
+      # environment is ignored (`No API key for provider: x`) and so is a
+      # `version: 1 / refs:` entry in $DSH_HOME/.credentials.yaml
+      # (`MISSING_CREDENTIAL`). The likely fix is to save the key through the
+      # DSH Models page, which writes the credential store properly.
+      #
+      # Pointing the *deepseek* adapter at NVIDIA instead does resolve the
+      # credential (it gets past MISSING_CREDENTIAL to an HTTP error), so the
+      # cheaper path is `provider: deepseek-official` with
+      #   base_url: https://integrate.api.nvidia.com
+      # and a real NVIDIA_API_KEY. That probe returned HTTP 404 with a dummy
+      # key, which with an invalid key cannot be told apart from an unknown
+      # model id — so confirm the exact id your account serves, e.g.
+      #   deepseek-ai/deepseek-r1
+      #   meta/llama-3.3-70b-instruct
+      models:
+        - id: "deepseek-ai/deepseek-r1"
+          context_window: 131072
+          max_tokens: 4096
+    deepseek-cloud:
+      display_name: "DeepSeek 官方"
+      api: openai-completions
+      base_url: "https://api.deepseek.com"
+      api_key_env: "DEEPSEEK_API_KEY"
+      models:
+        - id: "deepseek-v4-flash"
+          context_window: 200000
+          max_tokens: 4096
+
+  # Composed-profile rows switched off. Every mounted tool puts its full
+  # description into *every* request, and several also give the agent a route to
+  # the machine that bypasses ToolExecutor — so they cost tokens and weaken the
+  # allowlist at the same time. The only route the agent should have is
+  # mcp__winvoice__*. Unknown ids are skipped with a warning, not an error.
+  disabled_rows:
+    - tool-bash               # shell
+    - tool-pwsh
+    - tool-fs                 # read/write/edit/glob/grep across the machine
+    - tool-fs-search
+    - tool-str-replace-editor
+    - tool-web                # web search + fetch (the assistant has its own)
+    - tool-subagent           # nested agents: pure token cost for a voice turn
+    - tool-subagent-fork
+    - tool-subagent-control
+    - tool-subagent-list-agents
+    - tool-workflow
+    - tool-ralph
+    - tool-goal
+    - tool-jobs
+    - tool-skill
+    - tool-todo
+    - session-title-llm       # one extra LLM call per session, just to title it
+
   local:
-    enabled: false
+    enabled: true
     dsh_home: "runtime/dsh_home"   # this project's own DSH home; ~/.dsh is not used
+    # The profile must be one that mounts @deepseek-ai/dsh-llm-pi-ai, because
+    # that is the adapter the hand-declared routes hang off. `sdk-minimal` does
+    # NOT mount it (verified) — with it every route fails with
+    #   no adapter registered for provider "<name>"
+    # so this stays `sdk`, and the rows above are switched off individually,
+    # which is strictly more controlled anyway.
     profile: "sdk"
-    provider: "deepseek-official"  # must be a provider the chosen profile registers
-    model: ""                      # e.g. qwen2.5-3b-instruct behind your llama-server
-    reasoning_effort: ""
-    max_tokens: 49152
-    base_url: ""                   # e.g. http://localhost:8080/v1
-    api_key: ""
+    provider: "local-llamacpp"     # a route declared under dsh.providers above
+    model: "qwen2.5-3b-instruct"
+    reasoning_effort: ""           # see the note above: omit for instruct models
+    max_tokens: 2048
+    base_url: ""                   # the route above owns the endpoint
+    api_key: ""                    # llama-server ignores the key
     initialize_timeout_s: 60
     request_timeout_s: 90          # a wedged turn must not hold the microphone
 
   cloud:
-    enabled: false
+    enabled: true
     dsh_home: "runtime/dsh_home"
     profile: "sdk"
+    # `deepseek-official` is the adapter this was verified against end to end
+    # (provider route registered, credential resolved, turn completed). The
+    # hand-declared pi-ai routes above could NOT be made to authenticate — see
+    # the note under dsh.providers.nvidia.
     provider: "deepseek-official"
     model: "deepseek-v4-flash"
     reasoning_effort: ""
-    max_tokens: 49152
-    base_url: ""                   # empty = the provider's own endpoint
-    api_key: "${DEEPSEEK_API_KEY}"
+    max_tokens: 4096
+    base_url: "https://api.deepseek.com"   # DEEPSEEK_BASE_URL wins over this
+    # Deliberately empty. Naming `${DEEPSEEK_API_KEY}` here made the *config
+    # load* require the secret, so an unresolved placeholder raised inside every
+    # process that touched the config — including the MCP tool server and the
+    # whole test suite. The adapter already resolves `DEEPSEEK_API_KEY` from the
+    # environment (and the SDK forwards `api_key` into the runtime's env), so
+    # this file never needs to mention a credential.
+    api_key: ""
     initialize_timeout_s: 60
     request_timeout_s: 90
     guest_allowed: false           # guests cannot reach the cloud tier

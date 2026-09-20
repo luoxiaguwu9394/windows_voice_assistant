@@ -266,6 +266,12 @@ pytest-cache-files-*/
 # unanchored `runtime/` would also match any future `winvoice/runtime/`.
 /runtime/
 
-# Model helper files generated at runtime
-winvoice_keywords_*.txt
-winvoice_keywords.txt
+# Secrets. `api_key.txt` appeared at the repo root during development; nothing
+# in this project reads it (config never names a credential — DSH resolves
+# DEEPSEEK_API_KEY / NVIDIA_API_KEY from the environment), and a stray key file
+# at the repo root is one `git add -A` away from being published.
+api_key.txt
+*_api_key.txt
+*.credentials.yaml
+credentials.yaml
+.env.local

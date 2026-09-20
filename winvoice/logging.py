@@ -72,12 +72,21 @@ def configure_logging(
     log_dir: str | Path = "logs",
     level: str = "INFO",
     json_lines: bool = True,
+    stdout_is_a_wire: bool = False,
 ) -> structlog.BoundLogger:
     """
     Configure structlog once per process.
 
     `process_name` accepts either a ProcessName member or a plain string
     (e.g. "main", "enroll"). Returns a logger bound with that name.
+
+    `stdout_is_a_wire` is for processes whose stdout is a protocol stream — the
+    MCP tool server, where stdout is JSON-RPC. `structlog.BytesLoggerFactory()`
+    writes to `sys.stdout.buffer` when given no file (see
+    `structlog.BytesLogger.__init__`), and the root logger's file handler only
+    ever sees third-party stdlib records, so without this the structured events
+    are written *onto the wire*. Passing a real file keeps them in
+    `logs/<process>.jsonl` where they belong.
     """
     global _configured
 
@@ -89,10 +98,11 @@ def configure_logging(
 
         log_path = Path(log_dir)
         log_path.mkdir(parents=True, exist_ok=True)
+        structured_path = log_path / f"{proc}.jsonl"
 
         # File handler with daily rotation + gzip
         file_handler = logging.handlers.TimedRotatingFileHandler(
-            log_path / f"{proc}.jsonl",
+            structured_path,
             when="midnight",
             interval=1,
             backupCount=7,
@@ -136,10 +146,20 @@ def configure_logging(
             orjson_renderer if json_lines else structlog.dev.ConsoleRenderer(),
         ]
 
+        if stdout_is_a_wire:
+            # Append so a long-lived server keeps its history, and keep the
+            # handle open for the process lifetime.
+            structured_stream = open(structured_path, "ab", buffering=0)
+            logger_factory: object = structlog.BytesLoggerFactory(file=structured_stream)
+        elif json_lines:
+            logger_factory = structlog.BytesLoggerFactory()
+        else:
+            logger_factory = structlog.PrintLoggerFactory()
+
         structlog.configure(
             processors=processors,
             wrapper_class=structlog.BoundLogger,
-            logger_factory=structlog.BytesLoggerFactory() if json_lines else structlog.PrintLoggerFactory(),
+            logger_factory=logger_factory,
             cache_logger_on_first_use=True,
         )
 

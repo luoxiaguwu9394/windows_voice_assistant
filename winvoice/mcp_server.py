@@ -36,13 +36,23 @@ import json
 import sys
 from typing import Any, Dict, Optional
 
-# Logging must be configured before importing anything that builds a logger at
-# import time, otherwise those loggers freeze structlog's stdout-printing
-# default and scribble on the JSON-RPC wire (spec.md §10.1 is this bug in the
-# main process; here it would corrupt the protocol stream).
-from winvoice.logging import configure_logging, get_logger
+# Two things must be true before anything else is imported:
+#
+# 1. Logging goes to a FILE, never stdout. `structlog.BytesLoggerFactory()`
+#    writes to `sys.stdout.buffer` when given no file, and stdout here is the
+#    JSON-RPC wire — the events used to be written straight onto it, and only
+#    the `mcp` SDK's own fd diversion kept the protocol alive.
+# 2. The config loads leniently. DeepSeek Harness spawns this process with the
+#    environment scrubbed of anything matching /KEY|PASSWORD|SECRET|TOKEN/i, so
+#    `DEEPSEEK_API_KEY` is *supposed* to be absent; a strict load would abort
+#    the tool server over a secret it does not need.
+import os as _os
 
-configure_logging(process_name="mcp")
+_os.environ.setdefault("WINVOICE_CONFIG_TOLERANT", "1")
+
+from winvoice.logging import configure_logging, get_logger  # noqa: E402
+
+configure_logging(process_name="mcp", stdout_is_a_wire=True)
 
 from winvoice import _vendor  # noqa: E402
 

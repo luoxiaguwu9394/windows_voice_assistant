@@ -121,6 +121,10 @@ class HarnessBackend:
             base_url=self.settings.base_url or None,
             api_key=self.settings.api_key or None,
             patches=tuple(str(p) for p in self.settings.patches),
+            # Placeholder credentials for keyless routes travel here: the
+            # runtime subprocess inherits the caller's environment, and this
+            # dict is merged on top of it.
+            env=dict(getattr(self.settings, "runtime_env", {}) or {}),
             initialize_timeout_seconds=self.settings.initialize_timeout_seconds,
             # A bounded turn is what keeps a wedged model from holding the
             # microphone hostage; the router turns the resulting failure into
