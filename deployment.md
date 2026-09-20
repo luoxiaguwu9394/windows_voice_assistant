@@ -734,6 +734,10 @@ python -m winvoice
 | 说「打开记事本」被拒绝 | 应用名按中文标签/英文 id/近似拼写解析（`记事本`、`notepad`、`Notpa` 都能命中）；不在白名单内的（微信/QQ）仍会拒绝。若要新增，改 `ALLOWED_APPS` + `APP_SPEECH` |
 | 说「打开谷歌浏览器」回「我没找到…的安装位置」 | 程序既不在 `PATH`、也不在 `App Paths` 注册表里。查 `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe`（Chrome/Edge/VS Code 安装时都会写这个键）；绿色版/免安装版需要手动加进 `PATH`。**这是如实回答**：旧版拿裸名字 `Popen(..., shell=True)` 启动，`chrome.exe` 不在 `PATH` 时 cmd.exe 只打印「不是内部或外部命令」，而工具照样报成功 |
 | 说「关闭记事本」回「好像没有在运行」 | `taskkill` 退出码非 0（128 = 没找到该进程）：现在是如实回答，旧版无论有没有关掉都说「已经关闭」。系统设置是 URI 不是进程，会回「我关不掉系统设置。」 |
+| 说「关闭资源管理器」桌面/任务栏消失 | **旧版缺陷，已修**（2026-09-20）。`explorer.exe` 是 Windows 外壳，旧代码对它执行 `taskkill /f /im explorer.exe`，把整个 GUI 一起杀了。现在改成用 Explorer 自己的自动化对象只关**文件夹窗口**，并且 `explorer.exe` 在 `PROTECTED_PROCESSES` 里、任何情况下都不会被强杀。桌面已丢失的话：`Ctrl+Shift+Esc` → 文件 → 运行新任务 → `explorer.exe` |
+| 「关闭记事本」没有弹出「是否保存」 | 现在**默认优雅关闭**，应该会弹。若真的没弹，说明请求里带了 `force`（句子里有「强制/强行/硬关」）。`taskkill /f` 会跳过保存提示 |
+| 说「关闭 X」后卡了十几秒 | 优雅关闭在等**应用自己**的「是否保存？」对话框。这是预期行为，助手会说「…好像在等你确认，可能有没保存的内容。」（超时 12 秒）。点掉那个对话框即可 |
+| 想强制关闭 | 说「**强制**关闭记事本」。`force` 只在你明确要求时才用 —— 它不弹保存提示，未保存的内容会直接被丢掉 |
 | 「用浏览器搜索天气」没开浏览器 / 「查一下天气」却开了浏览器 | 规则层按触发词分流：`搜索/搜一下/百度/google/search` 属**显式搜索**，优先于一切话题（开浏览器）；`查一下/查询` 是弱触发词，由话题决定（问天气）。改 `_EXPLICIT_SEARCH` / `_WEAK_SEARCH` 后跑 `pytest tests/unit/test_weather_speech.py tests/unit/test_web_search.py` |
 | 音量「调高」「调低」方向不对 | 方向词已覆盖 `调高/调低/调大/调小/减小/降低/小声/小一点/down/lower…`；绝对量走 `level`（0–100），相对量走 `delta`，两者不可混用 |
 | 写文件/跑脚本永远提示需要确认 | 确认回路尚未实现（`CONFIRMATION_REQUIRED`），见 README「Known limitations」 |

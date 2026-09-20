@@ -38,6 +38,9 @@
 | | **测试**：`pytest tests -q`（当前 344 passed, 1 skipped）。加载真实模型的测试要 `skipif` 缺模型；`pytest.ini` 里的 `unit`/`integration` 标记没人用，**按目录选** | `pytest.ini` | `pytest -m unit` 会选中 0 个测试 |
 | **不要用 pytest 的 `tmp_path`**：受限/沙箱环境下它建在系统临时目录里、且被 `chmod 0o700`，写入会被拒（本项目实测 19 个 error 全部来自这里） | `tests/` | 需要临时目录时用仓库内的 scratch（见 `tests/unit/test_dsh_router.py` 的 `work` fixture） |
 | **跨进程的「当前这句话」走 `runtime/utterance.json`**：MCP 子进程读它来判定说话人分级 | `winvoice/tools/utterance.py` | 不读它 → guest 能通过 DSH 读写文件（见 1.1） |
+| **`explorer.exe` 是 Windows 外壳，不是「一个应用」**：桌面、任务栏、开始菜单、文件夹窗口全是它。`taskkill /f /im explorer.exe` 会干掉整个 GUI —— 2026-09-20 实测：用户说「关闭文件资源管理器」，桌面直接消失 | `winvoice/tools/builtin.py`（explorer 分支 + `PROTECTED_PROCESSES`）、`winvoice/tools/_explorer.py`、`tests/unit/test_close_app_safety.py` | 「关文件夹窗口」变成「关掉整个桌面」。而且**验证器还会判它成功**，因为后置条件被写成了「explorer.exe 不存在」 |
+| **默认优雅关闭；`/f` 必须由用户显式要求**：`taskkill /f` 跳过应用自己的「是否保存？」提示 | `builtin.close_app` 的 `force` 参数、`intent/rules.py` 的强制词识别 | 「关闭记事本」会静默丢掉未保存的内容，用户毫无机会拦 |
+| **验证器只能核对「你叫它核对的那个条件」**：后置条件写错，它就会为错误的目标准确盖章 | `winvoice/tools/verifier.py`：explorer 改查「文件夹窗口数 = 0」，而不是「进程是否消失」 | 把「桌面没了」判为「操作成功」 |
 
 ---
 
@@ -233,5 +236,7 @@
 | 2026-09-19 | 下线 原 §1.1「成功结果永远不会被念出来」、原 §2.3「查时间」、原 §2.4「查天气」。实现：`_spoken_success`（成功也念中文 `message`，可朗读 + ≤80 字规则统一放在 `winvoice/contracts/speech.py`）+ `ToolName.GET_TIME`/`GET_WEATHER` + `winvoice/tools/weather.py`（wttr.in，async + 整体 deadline，中文兜底，内置 WWO 码中文表）。同批同步 README / deployment / spec。原 1.2–1.4 与 2.5–2.7 已重编号为 1.1–1.3 与 2.3–2.5；新缺口写入第 0 节（成功也必须给 `message`、handler 可为 async）、1.1（新工具已声明 guest 但暂不生效）、2.4（`search_web` 只解决了一半）与第 3 节（天气数据源单一）。顺带修掉一个仓库陷阱：`.gitignore` 里未锚定的 `tools/` 连 `winvoice/tools/` 一起忽略，新增模块会静默进不了提交（已改为 `/tools/`）。 |
 | 2026-09-19 | 实测报障修复（用户现场日志）：①「用浏览器搜索天气」被天气工具抢走，并把「览器搜索」当地名发给 wttr.in（500）→ 规则层改为三段优先级：**带路径参数的意图** > **显式搜索词**（`用浏览器/搜索/搜一下/百度/google/search`，拉丁词不得紧跟 `.`/`/`/`\`）> 表内顺序（`查一下/查询` 仍是弱触发词）；查询取「最后一个动词之后」的文本（`google 搜索天气` → 天气）；句子里的地名查不到时改用 `weather.city` 重查一次，网络类失败不换城市。②「打开谷歌浏览器」失败却报成功：`chrome.exe`/`msedge.exe`/`Code.exe` 都不在 `PATH`，改为 `resolve_app_command`（`App Paths` 注册表 →（`code` 用别名 `Code.exe`）→ `PATH`）按真实路径启动、去掉 shell、找不到就如实说；`close_app` 同样不再谎报（128/「找不到」→「好像没有在运行」，其余非 0（如 Access denied）→「我没能关掉…」，URI 目标→「我关不掉…」）；`search_web` 也不再把 `webbrowser.open()` 的 `False` 当成成功。③ query 改为 `quote()` 编码。新增 `tests/unit/test_app_launch.py`、`tests/unit/test_web_search.py`，并更新两个把旧缺陷当契约的旧测试。第 0 节、第 3 节、2.4、spec §5/§6.1、README、deployment 排障表已同步。 |
 
+
+我再加一条：触发以后说没事了就接下来都不要操作了，回退到等待语音触发的状态
 > 删除条目时请**只删条目**，并把同一次提交里同步过的文档（README / deployment / spec）
 > 写进提交信息，方便回溯「哪次提交让它从这份文件里消失」。

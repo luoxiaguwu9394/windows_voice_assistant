@@ -218,10 +218,23 @@ class OpenAppVerifier(Verifier):
 
 
 class CloseAppVerifier(Verifier):
-    """A closed application is no longer a running process."""
+    """
+    A closed application is no longer a running process — except Explorer.
+
+    For `explorer.exe` the postcondition used to be "the process is gone", and
+    that was wrong in a dangerous way: forcing the shell down *satisfies* it, so
+    the verifier certified 「your desktop is gone」 as a success. Explorer's goal
+    is that its **folder windows** are closed, which is what is checked instead.
+    A verifier can only confirm the condition it was told to look for, so the
+    condition has to be the user's goal and not the mechanism's side effect.
+    """
 
     def verify(self, args, execution_result, before, probe):
         image = _expected_image(str(args.get("app", "")))
+
+        if image == "explorer.exe":
+            return self._verify_explorer(probe)
+
         if image is None:
             return VerificationResult(
                 status=VerificationStatus.NOT_VERIFIABLE,
@@ -249,6 +262,41 @@ class CloseAppVerifier(Verifier):
             status=VerificationStatus.FAILED,
             reason=f"{image} is still running",
             checks=tuple(checks),
+            retryable=True,
+        )
+
+    def _verify_explorer(self, probe) -> VerificationResult:
+        """Explorer's goal is "no folder windows open", never "the shell is gone"."""
+        counter = getattr(probe, "explorer_window_count", None)
+        if not callable(counter):
+            return VerificationResult(
+                status=VerificationStatus.NOT_VERIFIABLE,
+                reason="folder-window count is not observable on this host",
+                checks=(VerificationCheck("window_count_observable", False),),
+            )
+
+        remaining = counter()
+        if remaining is None:
+            return VerificationResult(
+                status=VerificationStatus.NOT_VERIFIABLE,
+                reason="folder-window count could not be read",
+                checks=(VerificationCheck("window_count_observable", False),),
+            )
+
+        checks = (
+            VerificationCheck("window_count_observable", True),
+            VerificationCheck("no_folder_windows", remaining == 0, f"remaining={remaining}"),
+        )
+        if remaining == 0:
+            return VerificationResult(
+                status=VerificationStatus.VERIFIED,
+                reason="no folder windows are open",
+                checks=checks,
+            )
+        return VerificationResult(
+            status=VerificationStatus.FAILED,
+            reason=f"{remaining} folder window(s) still open",
+            checks=checks,
             retryable=True,
         )
 

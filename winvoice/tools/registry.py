@@ -6,8 +6,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 from winvoice.contracts import ToolName
@@ -135,8 +134,25 @@ class ToolRegistry:
 
         self.register(ToolSpec(
             name=ToolName.CLOSE_APP,
-            description="Close an application",
-            schema=ToolSchema(properties={"app": {"type": "string"}}, required=["app"]),
+            description=(
+                "Close an application, or close the open File Explorer folder windows. "
+                "Closing is graceful by default, so the application can ask about unsaved "
+                "work. Set force=true ONLY when the user explicitly asks to force it "
+                "(强制关闭/强行关闭) — forcing discards unsaved changes without asking."
+            ),
+            schema=ToolSchema(
+                properties={
+                    "app": {"type": "string"},
+                    "force": {
+                        "type": "boolean",
+                        "description": (
+                            "Force the close, skipping the application's own save prompt. "
+                            "Only true when the user explicitly asked to force it."
+                        ),
+                    },
+                },
+                required=["app"],
+            ),
             handler=close_app,
             destructive=False,
             guest_allowed=True,

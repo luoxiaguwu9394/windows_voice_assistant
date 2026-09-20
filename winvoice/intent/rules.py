@@ -323,6 +323,11 @@ def _extract_args(intent: IntentName, text: str) -> dict:
         value = after_verb(r"关闭|退出|close|quit|exit")
         if value:
             args["app"] = value
+        # Forcing a close skips the application's own "save changes?" prompt, so
+        # it only happens when the sentence actually says to force it. 「关闭
+        # 记事本」 closes gracefully; 「强制关闭记事本」 does not.
+        if re.search(r"强制|强行|硬关|用强|\bforce", text, re.IGNORECASE):
+            args["force"] = True
 
     elif intent == IntentName.SET_VOLUME:
         target = _volume_target(text)

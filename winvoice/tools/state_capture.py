@@ -123,5 +123,18 @@ class WindowsProbe:
 
         return read_volume_percent()
 
+    def explorer_window_count(self) -> Optional[int]:
+        """
+        Open File Explorer folder windows, or None when that cannot be read.
+
+        Separate from `running_processes` because `explorer.exe` being alive says
+        nothing about whether any folder window is open — it is alive whenever
+        the desktop is. The verifier for 「关闭文件资源管理器」 needs this count,
+        not the process list.
+        """
+        from ._explorer import count_windows
+
+        return count_windows()
+
 
 __all__ = ["PathState", "SystemProbe", "WindowsProbe"]

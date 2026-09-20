@@ -32,8 +32,33 @@ from urllib.parse import quote
 from winvoice.contracts import has_latin
 from winvoice.logging import get_logger
 from ._coreaudio import build_set_script
+from ._explorer import close_windows as close_explorer_windows
 
 logger = get_logger(__name__)
+
+# How long a graceful `taskkill` may take before we assume the application is
+# waiting for the user (its own "save changes?" prompt). A bare timeout here
+# would read as a fault when nothing is actually wrong.
+CLOSE_TIMEOUT_S = 12.0
+
+# Processes that must never be force-killed, whatever the request says.
+# `explorer.exe` is the one that has actually bitten this project: it is the
+# Windows shell, so `taskkill /f /im explorer.exe` removes the desktop, taskbar
+# and Start menu. It is listed here as a backstop *as well as* being routed to
+# the window-closing path above, because the allowlist is data and someone will
+# eventually add a shell-adjacent name to it.
+PROTECTED_PROCESSES = {
+    "explorer.exe",
+    "winlogon.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "services.exe",
+    "lsass.exe",
+    "smss.exe",
+    "dwm.exe",
+    "sihost.exe",
+    "ctfmon.exe",
+}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -260,8 +285,24 @@ def open_app(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def close_app(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Close an application from the allowlist, by Chinese or English name."""
+    """
+    Close an application from the allowlist, by Chinese or English name.
+
+    Two rules keep this from doing something the user did not ask for:
+
+    * **Graceful by default.** `taskkill` is run *without* `/f`, so the
+      application gets the chance to ask about unsaved work. `/f` skips that
+      prompt and silently discards it, so it is only used when the request
+      explicitly asked to force the close (`force: true`).
+    * **The shell is not an application.** `explorer.exe` carries the desktop,
+      taskbar and Start menu as well as the folder windows, so forcing it down
+      takes the whole GUI with it. 「关闭文件资源管理器」 means "close the folder
+      windows", and that is done through Explorer's own automation object
+      instead — see `_explorer.py`. No code path here passes `explorer.exe` to
+      `taskkill`.
+    """
     spoken = str(args.get("app", ""))
+    force = bool(args.get("force", False))
     app = resolve_app(spoken)
     if app is None:
         logger.info("close_app_rejected", app=spoken, allowed=list(ALLOWED_APPS))
@@ -272,39 +313,88 @@ def close_app(args: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     exe = ALLOWED_APPS[app]
+
+    # ── the shell: close its windows, never its process ───────────
+    if app == "explorer":
+        remaining, error = close_explorer_windows()
+        if remaining is None:
+            logger.warning("close_explorer_failed", error=error)
+            return {
+                "success": False,
+                "error": error or "explorer automation unavailable",
+                "message": "我没能关掉资源管理器的窗口。",
+            }
+        if remaining == 0:
+            return {
+                "success": True,
+                "message": "已经关上资源管理器的窗口了。",
+                "windows_remaining": 0,
+                "force_requested": force,
+            }
+        return {
+            "success": False,
+            "error": f"{remaining} explorer window(s) still open",
+            "message": f"还有{remaining}个资源管理器窗口没关上。",
+            "windows_remaining": remaining,
+        }
+
+    # ── a process we must never force down ────────────────────────
+    if exe.lower() in PROTECTED_PROCESSES:
+        logger.warning("close_app_protected_process", app=app, exe=exe, force=force)
+        return {
+            "success": False,
+            "error": f"{exe} is a protected system process and is never killed",
+            "message": f"{APP_SPEECH[app]}是系统进程，我不能关掉它。",
+        }
+
+    if not exe.lower().endswith(".exe"):
+        # URI targets ("ms-settings:") are not processes; there is nothing
+        # to kill, and 「已经关闭」 would be a claim about something that
+        # never happened.
+        logger.info("close_app_unsupported_target", app=app, target=exe)
+        return {
+            "success": False,
+            "error": f"{app} has no process to kill ({exe})",
+            "message": f"我关不掉{APP_SPEECH[app]}。",
+        }
+
+    command = ["taskkill"]
+    if force:
+        command.append("/f")
+    command += ["/im", exe]
+
     try:
-        if not exe.lower().endswith(".exe"):
-            # URI targets ("ms-settings:") are not processes; there is nothing
-            # to kill, and 「已经关闭」 would be a claim about something that
-            # never happened.
-            logger.info("close_app_unsupported_target", app=app, target=exe)
-            return {
-                "success": False,
-                "error": f"{app} has no process to kill ({exe})",
-                "message": f"我关不掉{APP_SPEECH[app]}。",
-            }
-
-        proc = subprocess.run(["taskkill", "/f", "/im", exe], capture_output=True, text=True)
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()
-            # 128 is taskkill's "no process matches"; anything else (access
-            # denied, a driver process, a sandbox) is a different story and
-            # must not be reported as 「没有在运行」.
-            not_running = proc.returncode == 128 or "not found" in detail.lower() or "找不到" in detail
-            logger.info("close_app_failed", app=app, returncode=proc.returncode)
-            return {
-                "success": False,
-                "error": detail[:400] or f"taskkill exit {proc.returncode}",
-                "message": (
-                    f"{APP_SPEECH[app]}好像没有在运行。"
-                    if not_running
-                    else f"我没能关掉{APP_SPEECH[app]}。"
-                ),
-            }
-        return {"success": True, "message": f"已经关闭{APP_SPEECH[app]}了。"}
-
-    except Exception as e:
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=CLOSE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        # A graceful close on an app with unsaved work waits for the user to
+        # answer the application's own prompt. Saying so is more useful than a
+        # bare "timed out": from the user's side, nothing is wrong.
+        logger.info("close_app_awaiting_user", app=app)
+        return {
+            "success": False,
+            "error": f"taskkill did not return within {CLOSE_TIMEOUT_S:.0f}s",
+            "message": f"{APP_SPEECH[app]}好像在等你确认，可能有没保存的内容。",
+        }
+    except OSError as e:
         return {"success": False, "error": str(e), "message": f"关闭{APP_SPEECH[app]}的时候出错了。"}
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        # 128 is taskkill's "no process matches"; anything else (access
+        # denied, a driver process, a sandbox) is a different story and
+        # must not be reported as 「没有在运行」.
+        not_running = proc.returncode == 128 or "not found" in detail.lower() or "找不到" in detail
+        logger.info("close_app_failed", app=app, returncode=proc.returncode, force=force)
+        return {
+            "success": False,
+            "error": detail[:400] or f"taskkill exit {proc.returncode}",
+            "message": (
+                f"{APP_SPEECH[app]}好像没有在运行。"
+                if not_running
+                else f"我没能关掉{APP_SPEECH[app]}。"
+            ),
+        }
+    return {"success": True, "message": f"已经关闭{APP_SPEECH[app]}了。"}
 
 
 # ──────────────────────────────────────────────────────────────

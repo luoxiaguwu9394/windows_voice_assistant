@@ -109,5 +109,10 @@ def test_close_app_takes_the_chinese_name_too(monkeypatch) -> None:
     result = builtin.close_app({"app": "计算器"})
 
     assert result["success"] is True, result
-    assert killed and killed[0][:3] == ["taskkill", "/f", "/im"]
-    assert killed[0][3] == "calc.exe"
+    # The Chinese name must reach the right executable. `/f` is deliberately NOT
+    # asserted here: a plain 「关闭计算器」 now closes gracefully so the
+    # application can ask about unsaved work, and forcing is opt-in
+    # (`tests/unit/test_close_app_safety.py` owns that contract).
+    assert killed and killed[0][0] == "taskkill"
+    assert killed[0][-2:] == ["/im", "calc.exe"]
+    assert "/f" not in killed[0], f"a plain close force-killed: {killed[0]}"

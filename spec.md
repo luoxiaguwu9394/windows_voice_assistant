@@ -224,7 +224,7 @@ and no 2 s deadline beyond the client's 60 s HTTP timeout.
 | Tool | Arguments | Destructive | Guest |
 |------|-----------|-------------|-------|
 | `open_app` 🔶 | `app: str` — allowlisted id or Chinese name, fuzzy-matched (`记事本`, `notepad`, `Notpa` all resolve) | ❌ | Non-sensitive only ⛔ |
-| `close_app` 🔶 | `app: str` — as above | ❌ | Non-sensitive only ⛔ |
+| `close_app` 🔶 | `app: str` — as above; `force: bool` optional, force only on an explicit 「强制关闭」 request | ❌ | Non-sensitive only ⛔ |
 | `set_volume` 🔶 | `delta: int` (relative) **or** `level: int` 0–100 (absolute); at least one required | ❌ | ✅ |
 | `media_control` | `action: Enum[play,pause,next,prev]` | ❌ | ✅ |
 | `search_web` 🔶 | `query: str` — percent-encoded; opens the default browser immediately, no confirmation | ❌ | ✅ |
@@ -260,6 +260,30 @@ connect and read separately, so it is not a bound on the whole exchange).
 `WeatherSummary.speech()`, which maps the numeric WWO code to Chinese itself — `wttr.in`
 returns English descriptions even with `lang=zh` (verified against Beijing/Lhasa/Sanya/
 Mohe, 2026-09-19).
+
+#### Closing an application ✅
+
+Two rules, both added after a live incident (2026-09-20) in which
+「关闭文件资源管理器」 ran `taskkill /f /im explorer.exe` and removed the desktop:
+
+- **`explorer.exe` is the Windows shell, not an application.** The desktop, taskbar,
+  Start menu and every folder window are that one process. The Explorer branch of
+  `close_app` therefore closes the open folder *windows* through
+  `Shell.Application`'s automation object (`winvoice/tools/_explorer.py`) and never
+  builds a `taskkill` command for it. Measured on this machine:
+  `Windows()` reports only folder windows (the shell is not a member), so `Quit()`
+  on each of them cannot reach the desktop.
+- **`explorer.exe` is on `PROTECTED_PROCESSES`** alongside the other session
+  processes, as a second, independent defence: the allowlist is data, and one day
+  someone will add a shell-adjacent name to it.
+
+**Force is opt-in.** `close_app` runs `taskkill` *without* `/f` unless the request
+carries `force: true`, which the rule layer sets only for an explicit 「强制/强行/硬关」
+and the tool schema tells the agent to set only when the user asked. `/f` skips the
+application's own "save changes?" prompt, so a plain 「关闭记事本」 must not use it.
+A graceful close on dirty state blocks until the user answers that prompt, which is
+reported as 「…好像在等你确认，可能有没保存的内容。」 rather than as a timeout fault.
+
 
 ### 6.2 Destructive Action Flow ⛔
 1. Double confirmation (voice + UI toast)

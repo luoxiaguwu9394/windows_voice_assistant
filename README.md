@@ -374,6 +374,21 @@ system tools. If neither knows the program, the assistant says
 「我没找到…的安装位置。」 instead of pretending it opened something. `打开浏览器`
 opens Chrome; say `搜索…` to open a search instead.
 
+**Closing is graceful by default.** 「关闭记事本」 lets Notepad ask about unsaved
+work — it does not silently discard it. Say 「**强制**关闭记事本」 to skip that
+prompt; forcing is only used when you ask for it explicitly. If the application is
+waiting for you to answer its own prompt, the assistant says so
+(「…好像在等你确认，可能有没保存的内容。」) rather than claiming a failure.
+
+**`资源管理器` closes folder windows, not your desktop.** This one deserves its own
+sentence, because getting it wrong is dramatic. `explorer.exe` is the Windows
+*shell* — the desktop, taskbar, Start menu and every folder window are that one
+process. 「关闭文件资源管理器」 therefore closes the open folder windows through
+Explorer's own automation object and never touches the process; `explorer.exe` is
+on a protected list that is never force-killed, whatever the request says. (Before
+this was fixed the assistant ran `taskkill /f /im explorer.exe`, which removed the
+desktop.)
+
 The weather answer is a single sentence about today (the current condition plus
 the day's high and low). The city comes from the sentence when you name one;
 otherwise it is `weather.city` from the config — and if the name is not a place
@@ -562,7 +577,7 @@ The LLM cannot generate shell commands. It can only invoke the tools below. All 
 | Tool | Arguments | Destructive | Guest |
 |---|---|---|---|
 | `open_app` | `app: str` — id or Chinese name, fuzzy-matched | ❌ | Non-sensitive only |
-| `close_app` | `app: str` — as above | ❌ | Non-sensitive only |
+| `close_app` | `app: str` — as above; `force: bool` optional | ❌ | Non-sensitive only |
 | `set_volume` | `delta: int` (relative) **or** `level: int` 0–100 (absolute) | ❌ | ✅ |
 | `media_control` | `action: Enum[play, pause, next, prev]` | ❌ | ✅ |
 | `search_web` | `query: str` | ❌ | ✅ |
@@ -641,6 +656,8 @@ The following are **not yet decided**. They are documented here so they aren't s
 | Agent turn blocks barge-in | While the agent is thinking, the wake word is queued rather than acted on: the pipeline awaits the turn, exactly as it already did for the ~1s intent classifier, but an agent turn lasts longer. Audio is not lost (the deque holds ~200s) — only interruption is delayed |
 | Verification covers 5 of 10 tools | `get_time`, `get_weather`, `read_file`, `search_web` and `media_control` change nothing observable, so they have no verifier and therefore no escalation signal |
 | `search_web` is immediate | It opens the browser the moment the intent is classified — no confirmation. Only an explicit search verb reaches it (「搜索/搜一下/百度/google」), so the misrouted *question* that used to pop a browser is gone, but any explicit 「搜索 X」 still opens a window unasked. The query is percent-encoded |
+| Force-close is opt-in | `taskkill /f` skips the application's own save prompt, so it is only used for an explicit 「强制关闭 X」. A plain 「关闭 X」 waits for the app to decide, which means it can appear to hang while the app asks you to save |
+| No window-level app control | There is no tool for "minimise/close *this window*" of an arbitrary app. Explorer is the only case with window-level handling, precisely because killing its process destroys the desktop; other apps are closed as a whole |
 | Speech is Chinese-only | The TTS lexicon contains no Latin entries and digits are expanded by `number.fst`/`date.fst`/`phone.fst`. Text handed to TTS must be spoken Chinese; English words are dropped silently (`OOV ... Ignore it!`) |
 | Guest tier partly enforced | Tool calls now carry the speaker tier and `tools.guest_denied` is applied, so a guest cannot read/write/run. Two gaps remain: `open_app`/`close_app` still treat every app as non-sensitive (there is no sensitive-app list — see Open decisions), and a guest can still trigger the *cloud* tier if `dsh.cloud.guest_allowed` is flipped on |
 | Half-duplex | ASR input is paused during TTS; only the wake word can interrupt |
