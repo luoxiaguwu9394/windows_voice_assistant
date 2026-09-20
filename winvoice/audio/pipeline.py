@@ -26,8 +26,10 @@ import numpy as np
 
 from winvoice.config import get_config
 from winvoice.contracts import (
+    IntentName,
     IntentResult,
     MAX_SPEECH_CHARS,
+    SpeakerTier,
     SystemState,
     SystemStateName,
     ToolCall,
@@ -35,6 +37,7 @@ from winvoice.contracts import (
     TtsRequest,
     clip_for_speech,
     has_latin,
+    sanitize_for_tts,
 )
 from winvoice.logging import clear_trace_context, get_logger, set_trace_context
 from .asr import AsrEngine, AsrResult, create_asr_engine
@@ -110,8 +113,9 @@ class AudioPipeline:
         self.kws_during_tts = bool(cfg.get("audio.kws_during_tts", True))
 
         # Wiring (optional collaborators)
-        self._intent_router = None
-        self._tool_executor = None
+        self._intent_router: Any = None
+        self._tool_executor: Any = None
+        self._dsh_router: Any = None
 
         # Runtime
         self._state = PipelineState.IDLE
@@ -136,6 +140,20 @@ class AudioPipeline:
 
     def set_tool_executor(self, executor) -> None:
         self._tool_executor = executor
+
+    def set_dsh_router(self, router) -> None:
+        """
+        Attach the DeepSeek Harness agent for requests the rule tier cannot serve.
+
+        Optional on purpose: with no router attached the pipeline behaves exactly
+        as it did before DSH existed, which keeps `--stub-audio` and every
+        existing integration test meaningful.
+        """
+        self._dsh_router = router
+
+    @property
+    def dsh_enabled(self) -> bool:
+        return bool(self._dsh_router is not None and getattr(self._dsh_router, "enabled", False))
 
     # ── state ──────────────────────────────────────────────────
 
@@ -292,9 +310,111 @@ class AudioPipeline:
             if self.on_intent:
                 await _maybe_await(self.on_intent(intent))
 
-        await self._run_tools(intent)
+        # Two tiers, one of which handles every request: the rule tier answers
+        # the deterministic high-frequency commands itself, and the agent handles
+        # everything the rules declined. When the agent is configured, it *is* the
+        # model layer — `routes_to_agent` is what stops the legacy classifier from
+        # also running and producing a second, competing answer.
+        if self._routes_to_agent(intent):
+            await self._run_agent(asr.text, context)
+        else:
+            await self._run_tools(intent)
+
         self._set_state(PipelineState.TTS_PLAYING)
         await self._play_tts()
+
+    @staticmethod
+    def _speaker_tier(context: PipelineContext) -> str:
+        """
+        The speaker tier as the plain string the tool layer validates against.
+
+        `PipelineContext.sv_result` is the audio engine's own result type, whose
+        `tier` has been both a bare string and a `SpeakerTier` member at
+        different points in this project's life, so both shapes are accepted
+        rather than assumed.
+        """
+        result = context.sv_result
+        if result is None:
+            return "full"
+        tier = getattr(result, "tier", "full")
+        return str(getattr(tier, "value", tier) or "full")
+
+    def _routes_to_agent(self, intent: Optional[IntentResult]) -> bool:
+        """
+        True when this utterance should go to the agent instead of the tools.
+
+        A rule match is never overridden: `match_rules` returning a result means
+        the request is one of the ten things the assistant answers
+        deterministically, and 「音量调大 20」 must not acquire a model's latency.
+        Everything else — an `unknown` intent from a rule miss — is the agent's.
+        """
+        if not self.dsh_enabled:
+            return False
+        return intent is None or intent.intent == IntentName.UNKNOWN
+
+    async def _run_agent(self, text: str, context: PipelineContext) -> None:
+        """Let the agent answer, and speak what it says it did."""
+        tier = self._speaker_tier(context)
+
+        try:
+            outcome = await self._dsh_router.route(
+                text, trace_id=context.trace_id, tier=tier
+            )
+        except Exception as e:
+            # The pipeline must survive one failed agent task (new_way.md §15).
+            logger.error("dsh_route_failed", error=str(e), error_type=type(e).__name__)
+            context.tts_text = "抱歉，处理这个请求的时候出错了。"
+            return
+
+        if outcome.resolved:
+            spoken = sanitize_for_tts(outcome.response)
+            if spoken:
+                context.tts_text = spoken
+                return
+            # The agent answered, but nothing in the answer could be spoken: it
+            # was all English, or all formatting. Saying 「好了」 here would be
+            # claiming a result nobody can verify.
+            logger.warning(
+                "dsh_response_unspeakable",
+                source=outcome.source,
+                response_len=len(outcome.response or ""),
+            )
+            context.tts_text = "我完成了操作，但是结果说不清楚，请看屏幕。"
+            return
+
+        logger.info(
+            "dsh_unresolved",
+            source=outcome.source,
+            reason=outcome.failure,
+            escalation_reason=outcome.escalation_reason,
+        )
+        context.tts_text = self._agent_failure_reply(outcome)
+
+    @staticmethod
+    def _agent_failure_reply(outcome) -> str:
+        """
+        What to say when the agent could not finish.
+
+        Deliberately not 「好的，已为您完成。」 — the whole point of the
+        verification layer is that a failure is reported as one (new_way.md §15:
+        「"I couldn't open VS Code because it wasn't found" — not "Done."」).
+
+        Only a **failed** step's sentence is eligible. A multi-step turn can have
+        succeeded at step one and failed at step two, and speaking the first
+        step's 「已经打开记事本了。」 would announce success for the request that
+        did not complete — the exact lie this layer exists to prevent.
+        """
+        assessment = getattr(outcome, "assessment", None)
+        if assessment is not None:
+            for activity in assessment.tool_activity:
+                if activity.speak and (activity.verification_failed or activity.success is False):
+                    return clip_for_speech(activity.speak)
+
+        if outcome.failure in ("dsh_disabled",):
+            return "抱歉，这个请求我还没有实现。"
+        if outcome.failure and str(outcome.failure).startswith("dsh_"):
+            return "我现在联系不上负责执行的程序，请稍后再试。"
+        return "抱歉，这个操作没有成功。"
 
     async def _run_tools(self, intent: Optional[IntentResult]) -> None:
         context = self._context
@@ -346,8 +466,29 @@ class AudioPipeline:
                 tool=tool,
                 args=intent.args,
                 requires_confirmation=destructive,
+                # The tier has to be on the call, not only in the agent path:
+                # `ToolExecutor.execute` validates against it, and a rule-matched
+                # command from a guest is exactly the case that used to be
+                # checked as `full` (`UNIMPLEMENTED.md` §1.1).
+                tier=self._context_tier(),
             )
         ]
+
+    def _context_tier(self) -> SpeakerTier:
+        """The current utterance's speaker tier, as the enum the contracts use."""
+        context = self._context
+        if context is None or context.sv_result is None:
+            return SpeakerTier.FULL
+        try:
+            return SpeakerTier(getattr(context.sv_result, "tier", "full"))
+        except ValueError:
+            # An unrecognised tier must not become `full` by accident; the tool
+            # layer would then validate a stranger's call as the owner's.
+            logger.warning(
+                "unrecognised_speaker_tier",
+                tier=str(getattr(context.sv_result, "tier", None)),
+            )
+            return SpeakerTier.REJECTED
 
     # ── speech ─────────────────────────────────────────────────
 

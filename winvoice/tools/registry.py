@@ -12,6 +12,8 @@ from typing import Any, Callable, Dict, List, Optional, Set
 from pydantic import BaseModel, Field
 from winvoice.contracts import ToolName
 
+from .verifier import Verifier, default_verifiers
+
 
 # ──────────────────────────────────────────────────────────────
 # Irreversible Operation Patterns
@@ -81,6 +83,10 @@ class ToolSpec:
     guest_allowed: bool = True
     requires_confirmation: bool = False
     modified_paths: List[str] = field(default_factory=list)  # for snapshot
+    # Checks the tool's postcondition against real machine state after the
+    # handler returns (see `verifier.py`). None means the tool changes nothing
+    # observable — a query, a media keypress — so there is nothing to check.
+    verifier: Optional["Verifier"] = None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -111,6 +117,11 @@ class ToolRegistry:
         # reason to change is an external provider.
         from .weather import get_weather
 
+        # One lookup table, so every spec below is written once: a tool that
+        # declares `destructive` or `guest_allowed` in one place and is verified
+        # in another is how the two drift apart.
+        verifiers = default_verifiers()
+
         self.register(ToolSpec(
             name=ToolName.OPEN_APP,
             description="Open an application",
@@ -119,6 +130,7 @@ class ToolRegistry:
             destructive=False,
             guest_allowed=True,  # filtered by sensitive list
             requires_confirmation=False,
+            verifier=verifiers.get(ToolName.OPEN_APP.value),
         ))
 
         self.register(ToolSpec(
@@ -129,6 +141,7 @@ class ToolRegistry:
             destructive=False,
             guest_allowed=True,
             requires_confirmation=False,
+            verifier=verifiers.get(ToolName.CLOSE_APP.value),
         ))
 
         self.register(ToolSpec(
@@ -149,6 +162,7 @@ class ToolRegistry:
             destructive=False,
             guest_allowed=True,
             requires_confirmation=False,
+            verifier=verifiers.get(ToolName.SET_VOLUME.value),
         ))
 
         self.register(ToolSpec(
@@ -190,6 +204,7 @@ class ToolRegistry:
             guest_allowed=False,
             requires_confirmation=True,
             modified_paths=["{args.path}"],  # template for snapshot
+            verifier=verifiers.get(ToolName.WRITE_FILE.value),
         ))
 
         self.register(ToolSpec(
@@ -201,6 +216,7 @@ class ToolRegistry:
             guest_allowed=False,
             requires_confirmation=True,
             modified_paths=["{args.path}"],
+            verifier=verifiers.get(ToolName.RUN_SCRIPT.value),
         ))
 
         # ── read-only queries ──────────────────────────────────

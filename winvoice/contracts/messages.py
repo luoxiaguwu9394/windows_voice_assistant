@@ -182,6 +182,11 @@ class ToolCall(BaseModel):
     args: Dict[str, Any]
     requires_confirmation: bool = False
     modified_paths: List[str] = Field(default_factory=list)  # for snapshot
+    # Who is asking. Carried on the call rather than passed alongside it because
+    # the tier has to survive the hop into the tool executor *and* the hop into
+    # the MCP server that DeepSeek Harness talks to; a parameter threaded
+    # through callbacks would have been dropped at the second one.
+    tier: SpeakerTier = SpeakerTier.FULL
 
 
 class ToolResult(BaseModel):
@@ -201,6 +206,11 @@ class ToolResult(BaseModel):
     error: Optional[str] = None
     message: Optional[str] = None
     snapshot_id: Optional[str] = None
+    # What the machine showed, when a verifier was able to look (see
+    # `winvoice/tools/verifier.py`). Deliberately separate from `success`:
+    # `success` is the tool's honest claim and is what the user hears, while
+    # this decides whether the task is unresolved and worth escalating.
+    verification: Optional[Dict[str, Any]] = None
 
 
 # ──────────────────────────────────────────────────────────────

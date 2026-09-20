@@ -16,6 +16,8 @@ Repository: https://github.com/luoxiaguwu9394/windows_voice_assistant
 - **Local TTS**: sherpa-onnx VITS (Chinese, icefall aishell3, 174 speakers) with a separate guest voice
 - **Dual LLM backends**: local Ollama and any OpenAI-compatible remote API, routed by a fixed escalation chain
 - **Three-tier intent routing**: rules → local small model → cloud, balancing latency and accuracy
+- **Optional DeepSeek Harness agent**: when enabled, requests no rule answers are planned and executed by a DSH agent that reaches this project's tool registry over MCP
+- **Result verification**: each side-effecting tool's postcondition is checked against real machine state (process running? file on disk?), so a claimed success is never taken at its word
 - **Tool allowlist**: the LLM can only invoke registered tools; it cannot generate shell commands
 - **Destructive action protection**: double confirmation plus file-level snapshot rollback
 - **Half-duplex with limited barge-in**: KWS stays active during TTS playback; the wake word can interrupt
@@ -46,6 +48,9 @@ Microphone
 │  ② Intent classifier → local small model  │
 │  ③ Cloud LLM         → low confidence or  │
 │                        allowlist miss     │
+│                                           │
+│  (with the DSH agent enabled, ②/③ are     │
+│   replaced by the agent — see above)      │
 └──────────────────┬──────────────────────┘
                    │ structured command
                    ▼
@@ -53,6 +58,8 @@ Microphone
 │ Execution process (tool allowlist)        │
 │  Non-destructive → execute directly       │
 │  Destructive     → confirm + snapshot     │
+│  Every side effect → verify against the   │
+│                      machine afterwards   │
 └──────────────────┬──────────────────────┘
                    │
                    ▼
@@ -69,6 +76,115 @@ Microphone
 | Execution | pyautogui / pywin32, serialized queue |
 
 Processes communicate via `multiprocessing.Queue` or ZeroMQ. The split exists to bypass the GIL, isolate crashes, and keep audio scheduling stable.
+
+---
+
+## Agent layer (optional): DeepSeek Harness
+
+Off by default. With `dsh.enabled: true` the assistant has exactly two tiers, and
+one of them serves every request:
+
+```
+Speech → ASR → Rule matching
+                   │
+        ┌──────────┴───────────┐
+   rule matched            no rule matched
+        │                       │
+   direct tool call        DSH agent  ── planning, tool calling, reply
+        │                       │
+        │              tools via MCP (mcp__winvoice__*)
+        │                       │
+        └───────────┬───────────┘
+                    ▼
+             tool result → Verifier
+                    │
+            verified ─┴─ machine disagrees
+                    │              │
+                 speak        local retry → Cloud DSH
+```
+
+A rule match is **never** overridden — 「音量调大 20」 must not acquire a model's
+latency. Everything else goes to the agent.
+
+### The tool system does not change
+
+DSH runs its agent loop in Node, so it reaches this project's tools over **MCP**
+(`winvoice/mcp_server.py`). That server is a thin adapter: it builds the *same*
+`ToolCall` the in-process pipeline builds and hands it to the *same*
+`ToolExecutor`. There is exactly one implementation of the allowlist, the
+speaker tiers, the snapshot/rollback logic and the verifiers — the constraint
+`new_way.md` calls out, and the reason the original "generate a TypeScript plugin
+per tool" plan was dropped (see `docs/dsh_integration_design.md` §1a).
+
+Tools therefore appear to the model as `mcp__winvoice__open_app`, and a call is
+refused by exactly the same code that refuses it when the rules path invokes it.
+
+### Verification: the machine decides, not the model
+
+Every tool whose postcondition is observable — `open_app`, `close_app`,
+`set_volume`, `write_file`, `run_script` — is checked against real machine state
+after it runs:
+
+| Tool | What is actually checked |
+|---|---|
+| `open_app` | the resolved `.exe` is in the process list (polled for ~1s) |
+| `close_app` | the process is *gone* |
+| `write_file` | the file exists, is a regular file, and its bytes match |
+| `set_volume` | the Core Audio endpoint reads back the requested level (±3) |
+| `run_script` | the process exit status |
+
+The verdict is one of `verified` / `failed` / `uncertain` / `not_verifiable`, and
+it is **not** allowed to rewrite what the tool said. `close_app` on something
+that is not running reports failure with 「好像没有在运行。」 — a true and useful
+sentence — while the postcondition ("not running") genuinely holds, which is
+`verified`, which means *do not escalate*. Only an observed mismatch escalates.
+
+`uncertain` and `not_verifiable` never escalate either: "this layer cannot
+observe it" is not evidence of failure, and escalating on it would send every web
+search to the cloud.
+
+### Escalation is programmatic
+
+Escalation to the cloud tier happens on: an observed state mismatch, a turn that
+ended abnormally (`error`, `max-tokens`), an empty answer, or a backend that
+would not start. It does **not** happen because the model sounded unsure — a
+small model that hallucinates success is just as fluent when it hallucinates
+certainty. The cloud agent is handed what the local attempt did, so it continues
+rather than starting over.
+
+### Configuration
+
+```yaml
+dsh:
+  enabled: true
+  escalation_enabled: true
+  max_local_attempts: 2
+  local:
+    enabled: true
+    provider: deepseek-official
+    model: qwen2.5-3b-instruct
+    base_url: http://localhost:8080/v1
+    request_timeout_s: 90
+  cloud:
+    enabled: false
+    api_key: ${DEEPSEEK_API_KEY}
+  bridge:
+    server_name: winvoice        # tools appear as mcp__winvoice__<tool>
+```
+
+Full setup (the optional `.pylibs` dependencies and the bridge bundle) is in
+[`deployment.md`](deployment.md) §2.4.
+
+> **Speaker tier reaches the agent.** Tools now run in a process DSH spawns, so
+> the tier travels through the in-flight utterance record
+> (`winvoice/tools/utterance.py`); without it, DSH would be a way *around* the
+> permission model rather than a user of it. The cloud tier is gated on the same
+> tier (`dsh.cloud.guest_allowed`, default off).
+>
+> **The agent also has DSH's own tools.** The default `sdk` profile ships DSH's
+> built-in filesystem/shell tools beside the MCP bridge, so `mcp__winvoice__*`
+> goes through the allowlist but those do not. `dsh.local.profile: sdk-minimal`
+> would close that; see `docs/dsh_integration_design.md`.
 
 ---
 
@@ -456,10 +572,20 @@ The LLM cannot generate shell commands. It can only invoke the tools below. All 
 | `get_time` | — | ❌ | ✅ |
 | `get_weather` | `city: str` (optional; defaults to `weather.city`) | ❌ | ✅ |
 
+**Speaker tiers are enforced at the tool layer.** `guest` may not read, write or
+run anything (`tools.guest_denied`), and `rejected` may run nothing at all. The
+tier is carried on the `ToolCall` and, for calls arriving from the agent, through
+the in-flight utterance record — so enabling DSH does not widen anyone's access.
+
 **Destructive flow**: double confirmation → snapshot target files → execute.
 **Not yet wired**: the confirmation round trip does not exist, so `write_file`
 and `run_script` currently refuse every request instead of executing — see
 [Known limitations](#known-limitations).
+
+**Result verification**: the five tools with an observable postcondition are
+checked against the machine after they run (see
+[Agent layer](#agent-layer-optional-deepseek-harness)). The verdict decides
+retry/escalation; it never rewrites the tool's own message.
 
 **Snapshot**: only backs up target files declared by the tool as modified, stored under `snapshots/{timestamp}/`. Registry changes, software uninstalls, and system-level modifications are not covered.
 
@@ -511,9 +637,12 @@ The following are **not yet decided**. They are documented here so they aren't s
 | Weather needs the internet | `get_weather` queries `wttr.in` (no API key) with a `weather.timeout_s` deadline covering the whole request (5 s by default, and the answer is silent until it arrives). Offline or timed out it says 「暂时查不到天气。」; `weather.enabled: false` disables it entirely. Conditions come from the tool's own Chinese table because `lang=zh` returns English descriptions |
 | No directory listing | There is no `list_dir` tool; "what is in this folder" cannot be answered |
 | Confirmation not wired | `write_file` and `run_script` are registered but the double-confirmation round trip is not implemented, so every call is refused |
+| Agent needs the bridge installed | The optional DSH tier only has tools after `python scripts/install_dsh_bridge.py --install`; without it the agent can chat but cannot act (`deployment.md` §2.4) |
+| Agent turn blocks barge-in | While the agent is thinking, the wake word is queued rather than acted on: the pipeline awaits the turn, exactly as it already did for the ~1s intent classifier, but an agent turn lasts longer. Audio is not lost (the deque holds ~200s) — only interruption is delayed |
+| Verification covers 5 of 10 tools | `get_time`, `get_weather`, `read_file`, `search_web` and `media_control` change nothing observable, so they have no verifier and therefore no escalation signal |
 | `search_web` is immediate | It opens the browser the moment the intent is classified — no confirmation. Only an explicit search verb reaches it (「搜索/搜一下/百度/google」), so the misrouted *question* that used to pop a browser is gone, but any explicit 「搜索 X」 still opens a window unasked. The query is percent-encoded |
 | Speech is Chinese-only | The TTS lexicon contains no Latin entries and digits are expanded by `number.fst`/`date.fst`/`phone.fst`. Text handed to TTS must be spoken Chinese; English words are dropped silently (`OOV ... Ignore it!`) |
-| Guest tier not enforced | The `guest_denied` config is declared but no caller applies it; tool calls are validated as `full` |
+| Guest tier partly enforced | Tool calls now carry the speaker tier and `tools.guest_denied` is applied, so a guest cannot read/write/run. Two gaps remain: `open_app`/`close_app` still treat every app as non-sensitive (there is no sensitive-app list — see Open decisions), and a guest can still trigger the *cloud* tier if `dsh.cloud.guest_allowed` is flipped on |
 | Half-duplex | ASR input is paused during TTS; only the wake word can interrupt |
 | Snapshot scope | File-level only; registry, uninstall, and system changes are not covered |
 | Context | Session-scoped, cleared on sleep; no cross-session memory |

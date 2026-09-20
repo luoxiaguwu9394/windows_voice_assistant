@@ -110,6 +110,69 @@ tools:
     - "write_file"
     - "run_script"
   confirm_required: true       # Require double confirmation for destructive tools
+  # Check each tool's postcondition against real machine state after it runs
+  # (open_app -> is the process there? close_app -> is it gone? write_file -> is
+  # the content on disk?). A tool's own "success" is a claim; this is evidence,
+  # and it is what decides whether a failed turn is escalated to the cloud.
+  verification_enabled: true
+  # Where the audio process publishes the in-flight speaker tier. The MCP server
+  # that DeepSeek Harness calls tools through runs in a different process, and
+  # this file is the only channel that survives that hop — without it a guest
+  # could reach read_file/write_file/run_script through the agent.
+  utterance_file: "runtime/utterance.json"
+
+# ──────────────────────────────────────────────────────────────
+# DeepSeek Harness — the agent layer (see docs/dsh_integration_design.md)
+#
+# Off by default. When `dsh.local.enabled` is true, requests that no rule
+# answers are handed to the agent, which plans, calls tools and composes the
+# spoken reply. The tools themselves are unchanged: DSH reaches this project's
+# registry over MCP (winvoice/mcp_server.py), so the allowlist, snapshots,
+# permission tiers and verifiers all still apply.
+#
+# Requires: .pylibs (mcp, deepseek-harness-sdk, deepseek-harness-runtime-bin)
+# and the bridge bundle — run `python scripts/install_dsh_bridge.py --install`.
+# ──────────────────────────────────────────────────────────────
+dsh:
+  enabled: false               # master switch; also requires dsh.local.enabled
+  escalation_enabled: true     # allow Local -> Cloud when the machine disagrees
+  max_local_attempts: 2        # 2 = one retry for a `retryable` verification failure
+
+  local:
+    enabled: false
+    dsh_home: "runtime/dsh_home"   # this project's own DSH home; ~/.dsh is not used
+    profile: "sdk"
+    provider: "deepseek-official"  # must be a provider the chosen profile registers
+    model: ""                      # e.g. qwen2.5-3b-instruct behind your llama-server
+    reasoning_effort: ""
+    max_tokens: 49152
+    base_url: ""                   # e.g. http://localhost:8080/v1
+    api_key: ""
+    initialize_timeout_s: 60
+    request_timeout_s: 90          # a wedged turn must not hold the microphone
+
+  cloud:
+    enabled: false
+    dsh_home: "runtime/dsh_home"
+    profile: "sdk"
+    provider: "deepseek-official"
+    model: "deepseek-v4-flash"
+    reasoning_effort: ""
+    max_tokens: 49152
+    base_url: ""                   # empty = the provider's own endpoint
+    api_key: "${DEEPSEEK_API_KEY}"
+    initialize_timeout_s: 60
+    request_timeout_s: 90
+    guest_allowed: false           # guests cannot reach the cloud tier
+
+  bridge:
+    server_name: "winvoice"        # tools appear to the model as mcp__winvoice__<tool>
+    tool_timeout_ms: 120000
+    bundle_dir: "runtime/dsh_bridge"
+    # NOTE: the MCP server reads `tools.utterance_file` (above), not a key here.
+    # One path, one owner: two independent keys for the file the guest check
+    # travels on is a way to fail that check open, silently.
+
 
 weather:
   enabled: true                # false → 「天气查询没有打开。」 (no request is made)

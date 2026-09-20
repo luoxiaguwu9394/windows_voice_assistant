@@ -34,6 +34,7 @@ class VoiceAssistant:
         self.audio_stream = None
         self.intent_router = None
         self.tool_executor = None
+        self.dsh_router = None
         self._running = False
 
     # ── lifecycle ──────────────────────────────────────────────
@@ -49,6 +50,11 @@ class VoiceAssistant:
         self.intent_router = create_intent_router()
         self.tool_executor = create_tool_executor()
 
+        # The agent is optional and failure-tolerant: a broken DSH install must
+        # not stop the assistant from starting, because the rule tier and the
+        # tools still work without it.
+        self.dsh_router = self._create_dsh_router()
+
         self.pipeline = AudioPipeline(
             on_state_change=self._on_state_change,
             on_intent=self._on_intent,
@@ -58,6 +64,8 @@ class VoiceAssistant:
         )
         self.pipeline.set_intent_router(self.intent_router)
         self.pipeline.set_tool_executor(self.tool_executor)
+        if self.dsh_router is not None:
+            self.pipeline.set_dsh_router(self.dsh_router)
 
         await self.pipeline.initialize()
         logger.info("engines_ready", stub=self.use_stub)
@@ -67,6 +75,43 @@ class VoiceAssistant:
             logger.info("microphone_open")
 
         logger.info("voice_assistant_initialized", config=self.config_path, stub=self.use_stub)
+
+    def _create_dsh_router(self):
+        """
+        Build the agent router, or None when DSH is not configured.
+
+        `winvoice.dsh` is imported lazily so that a deployment without the
+        optional dependencies never touches the module that reaches for them.
+        """
+        try:
+            from winvoice.dsh import DSHRouter, load_settings
+
+            settings = load_settings()
+        except Exception as e:
+            logger.warning("dsh_settings_unavailable", error=str(e))
+            return None
+
+        if not settings.enabled or not settings.local.enabled:
+            logger.info("dsh_not_enabled")
+            return None
+
+        router = DSHRouter(settings)
+        logger.info(
+            "dsh_enabled",
+            model=settings.local.model or None,
+            provider=settings.local.provider,
+            escalation=settings.escalation_enabled and settings.cloud.enabled,
+            max_local_attempts=settings.max_local_attempts,
+        )
+        return router
+
+    async def shutdown(self) -> None:
+        """Release the agent's subprocess (it is not reaped by the GC)."""
+        if self.dsh_router is not None:
+            try:
+                await self.dsh_router.close()
+            except Exception as e:
+                logger.warning("dsh_shutdown_failed", error=str(e))
 
     async def run(self) -> None:
         self._running = True
@@ -200,7 +245,10 @@ async def main() -> int:
         return 1
 
     print("Assistant is listening. Say the wake word (default: 'assistant'). Ctrl+C to stop.")
-    await assistant.run()
+    try:
+        await assistant.run()
+    finally:
+        await assistant.shutdown()
     return 0
 
 

@@ -15,6 +15,9 @@ drift apart into a half-checked contract.
 
 from __future__ import annotations
 
+import re
+import string
+
 # `TtsEngine.synthesize` synthesises the whole utterance before it yields its
 # first chunk, so everything before the first audio is dead air. A message
 # written for the speaker is meant to be one short sentence.
@@ -44,4 +47,49 @@ def clip_for_speech(text: str, limit: int = MAX_SPEECH_CHARS) -> str:
     return head
 
 
-__all__ = ["MAX_SPEECH_CHARS", "clip_for_speech", "has_latin"]
+# Everything an answer from a language model routinely contains that the lexicon
+# cannot say, or that would be read aloud as punctuation soup.
+_MARKDOWN_FENCE = re.compile(r"```.*?```", re.DOTALL)
+_MARKDOWN_INLINE = re.compile(r"`([^`]*)`")
+_MARKDOWN_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_MARKDOWN_HEADING = re.compile(r"^\s{0,3}#{1,6}\s*", re.MULTILINE)
+_MARKDOWN_BULLET = re.compile(r"^\s{0,3}(?:[-*+]|\d+[.)])\s+", re.MULTILINE)
+_LATIN_WORD = re.compile(r"[A-Za-z]+(?:['’\-][A-Za-z]+)*")
+_WHITESPACE = re.compile(r"\s+")
+# Every ASCII punctuation character, from `string.punctuation`. Dropping the set
+# wholesale (rather than listing the marks that came to mind) is what makes
+# 「Done!」 reduce to nothing instead of to a stray `!` the lexicon cannot say.
+_ASCII_PUNCTUATION = re.compile("[" + re.escape(string.punctuation) + "]+")
+
+
+def sanitize_for_tts(text: str, limit: int = MAX_SPEECH_CHARS) -> str:
+    """
+    Reduce a model's answer to something the Chinese TTS can actually say.
+
+    Every spoken string used to be authored by a tool, which knew the rules;
+    since DeepSeek Harness composes the final reply, that is no longer true. The
+    agent is instructed to answer in plain Chinese, and this is the safety net
+    for when it does not — a markdown list of file paths read aloud is not a
+    degraded answer, it is 80 characters of holes.
+
+    Latin words are dropped rather than transliterated (there is nothing to
+    transliterate them *with*), digits survive because `number.fst` expands
+    them, and an answer that is nothing but dropped words returns `""` so the
+    caller can fall back to an honest generic sentence instead of silence.
+    """
+    if not text:
+        return ""
+
+    cleaned = _MARKDOWN_FENCE.sub(" ", text)
+    cleaned = _MARKDOWN_LINK.sub(r"\1", cleaned)
+    cleaned = _MARKDOWN_INLINE.sub(r"\1", cleaned)
+    cleaned = _MARKDOWN_HEADING.sub("", cleaned)
+    cleaned = _MARKDOWN_BULLET.sub("", cleaned)
+    cleaned = _LATIN_WORD.sub(" ", cleaned)
+    cleaned = _ASCII_PUNCTUATION.sub(" ", cleaned)
+    cleaned = _WHITESPACE.sub(" ", cleaned).strip()
+
+    return clip_for_speech(cleaned, limit)
+
+
+__all__ = ["MAX_SPEECH_CHARS", "clip_for_speech", "has_latin", "sanitize_for_tts"]

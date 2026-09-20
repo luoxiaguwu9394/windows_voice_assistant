@@ -189,6 +189,73 @@ pip install onnxruntime-openvino==1.18.0
 
 ---
 
+### 2.4 安装 DeepSeek Harness 桥接（可选：让 DSH 做 Agent 层）
+
+> **默认关闭。** 不装这一节，助手照常运行（规则层 + 10 个工具）。装上之后，
+> 规则层没有命中的请求会交给 DSH Agent 来规划、调用工具并组织回答。
+
+DSH 的 Agent 循环跑在 Node 里，它通过 **MCP** 调用本项目的工具
+（`winvoice/mcp_server.py`）。工具的实现、白名单、权限分级、快照和验证器全都
+不变 —— MCP 只是一条协议，不是第二套工具系统。
+
+**1) 装可选依赖**（约 90 MB，装在仓库内的 `.pylibs/`，不影响全局环境：
+
+```powershell
+cd C:\Users\<you>\Desktop\windows_voice_assistant
+
+python -m pip install --target .pylibs --upgrade mcp deepseek-harness-sdk deepseek-harness-runtime-bin
+```
+
+> `deepseek-harness-runtime-bin` 是官方自带的 DSH 运行时（~72 MB）。
+> 也可以用系统已装的 `dsh`，但 SDK 需要的是可执行文件，而 npm 的 `dsh.cmd`
+> 是批处理外壳、不能直接 CreateProcess，所以这里用官方运行时最省事。
+>
+> 这些包**不放进 `requirements.txt`**：不启用 DSH 的人不该为了说「打开记事本」
+> 而装一个 Node 运行时包装器。`winvoice/_vendor.py` 会把 `.pylibs/` 追加到
+> `sys.path`（**追加**，不前置 —— 它有自己的一份 pydantic/anyio，覆盖掉主环境
+> 的版本会引入比它解决的问题更糟的 bug）。
+
+**2) 安装桥接 bundle**（生成 + 装进本项目的 DSH home）：
+
+```powershell
+python scripts/install_dsh_bridge.py --install
+# 期望最后两行：
+#   [OK] bridge installed. Restart the assistant to pick it up.
+#   [OK] mcp-winvoice is present in the composed configuration
+```
+
+**3) 打开配置**（`config/config.yaml`）：
+
+```yaml
+dsh:
+  enabled: true
+  local:
+    enabled: true
+    provider: "deepseek-official"   # 必须是所选 profile 注册过的 provider
+    model: "qwen2.5-3b-instruct"    # 与你的本地端点一致
+    base_url: "http://localhost:8080/v1"
+    api_key: "ollama"               # llama-server 忽略这个值
+    request_timeout_s: 90
+```
+
+**4) 重启助手。** 启动日志里应出现：
+
+```
+dsh_enabled  model=qwen2.5-3b-instruct provider=deepseek-official escalation=False max_local_attempts=2
+```
+
+> **为什么需要 bundle，而不能直接改配置？**
+> DSH 的插件树由「补丁层」组成，而带 `id` 的补丁条目是**覆盖**已存在的行。
+> 所以最直观的写法 `- id: mcp-winvoice / name: ...` 会在启动时报
+> `patch: entry "mcp-winvoice" not found`。新增行必须用 `insert:` 包一层，
+> 而补丁层本身（含 `--patch`）不能新增行 —— 必须由一个 profile bundle 提供。
+> 细节见 `winvoice/dsh/bridge.py` 的注释。
+>
+> bundle 是**生成**的（不是提交进仓库的），因为它写死了仓库绝对路径和 Python
+> 解释器路径；提交一份必然是「只在生成它的那台机器上正确」。
+
+---
+
 ## 3️⃣ 项目代码与 Python 环境
 
 ### 3.1 克隆仓库
@@ -574,7 +641,7 @@ python scripts/check_llm.py
 
 ```powershell
 python -m pytest tests/ -q
-# 期望: 274 passed, 1 skipped
+# 期望: 344 passed, 1 skipped
 ```
 
 > 沙箱/受限权限环境下 `tmp_path` 与家目录写入会被拒，表现为若干
@@ -642,6 +709,8 @@ python -m winvoice
 | 查看可用模型 | `python scripts/download_models.py --list` |
 | 运行类型检查 | `mypy winvoice` |
 | 代码格式化 | `ruff check --fix winvoice` |
+| 装/刷新 DSH 桥接 | `python scripts/install_dsh_bridge.py --install` |
+| 检查桥接是否生效 | `python scripts/install_dsh_bridge.py --verify` |
 
 ---
 
@@ -668,6 +737,15 @@ python -m winvoice
 | 「用浏览器搜索天气」没开浏览器 / 「查一下天气」却开了浏览器 | 规则层按触发词分流：`搜索/搜一下/百度/google/search` 属**显式搜索**，优先于一切话题（开浏览器）；`查一下/查询` 是弱触发词，由话题决定（问天气）。改 `_EXPLICIT_SEARCH` / `_WEAK_SEARCH` 后跑 `pytest tests/unit/test_weather_speech.py tests/unit/test_web_search.py` |
 | 音量「调高」「调低」方向不对 | 方向词已覆盖 `调高/调低/调大/调小/减小/降低/小声/小一点/down/lower…`；绝对量走 `level`（0–100），相对量走 `delta`，两者不可混用 |
 | 写文件/跑脚本永远提示需要确认 | 确认回路尚未实现（`CONFIRMATION_REQUIRED`），见 README「Known limitations」 |
+| 启动日志出现 `dsh_not_enabled` | 正常：`dsh.enabled` 或 `dsh.local.enabled` 为 `false`（默认都是 false）。要启用见 §2.4 |
+| 说了复杂指令却回「抱歉，这个请求我还没有实现。」 | 规则层没命中、而 DSH 没启用：此时没有模型层可以接。开 `dsh.enabled` + `dsh.local.enabled`，或让说法落到 10 个工具之一 |
+| `dsh_settings_unavailable` / `ModuleNotFoundError: deepseek_harness` | 可选依赖没装。`python -m pip install --target .pylibs --upgrade mcp deepseek-harness-sdk deepseek-harness-runtime-bin` |
+| Agent 完全不知道有工具（只会聊天） | 桥接 bundle 没装或没进 profile：跑 `python scripts/install_dsh_bridge.py --verify`。它应输出 `[OK] mcp-winvoice is present in the composed configuration` |
+| `patch: entry "mcp-winvoice" not found` | 有人手写了补丁行而没用 `insert:` 包一层。删掉手写的那份，改用 `scripts/install_dsh_bridge.py` 生成 |
+| `dsh_escalating` 后仍失败 | 本地与云端都失败。看日志里的 `escalation_reason`：`verification_failed` 表示机器状态与目标不符（最常见是程序没真的起来）；`dsh_unavailable` 表示运行时没起来 |
+| 云端那一层从不触发 | `dsh.cloud.enabled` 与 `dsh.escalation_enabled` 都要为 `true`，且说话人分级必须是 `full`（guest 不能走云端） |
+| 说「关闭 X」回「我没能关掉…」而不是「好像没有在运行」 | `taskkill` 的退出码不是 128、输出里也没有「找不到」。这通常是**权限**问题（进程以管理员身份运行），不是「没在运行」—— 两种情况都如实回答，不谎报成功 |
+| 工具说成功了但 DSH 仍升级到云端 | 这是**验证器**在起作用：`verification.status == failed` 表示机器状态与目标不符。日志里搜 `tool_verified` 看是哪一项 check 没过（例如 `process_running`） |
 | 问「现在几点了」回「这个请求我还没有实现」 | 该意图没有映射到工具。检查 `AudioPipeline._intent_to_tool_calls` 里有 `get_time`，且 `ToolName.GET_TIME` 已注册（`pytest tests/unit/test_time_speech.py`） |
 | 天气一直回「暂时查不到天气」 | 1) 有没有网：`python -c "import httpx;print(httpx.get('https://wttr.in/Beijing?format=j1&timeout=5').status_code)"` 2) `weather.enabled` 是否为 `true` 3) `weather.timeout_s` 太小（默认 5 s）。句子里说的地名 wttr.in 认不出时（它会返回 500），会自动改用 `weather.city` 再查一次；只有**网络**类失败才会直接回这句兜底 |
 | 天气念成英文 / 缺一半字 | 天气描述必须走内置中文对照表：wttr.in 即使带 `lang=zh` 也只返回英文（`weatherDesc` 与 `lang_zh` 均为英文，已实测）。若出现新的 `weatherCode`，在 `winvoice/tools/weather.py` 的 `WEATHER_CODE_ZH` 补中文，并用 `pytest tests/unit/test_speech_is_pronounceable.py -k weather` 验证这些字在 TTS 词表里 |
@@ -695,15 +773,24 @@ python -m winvoice
 │   ├── sv/profiles/me.json                  # 声纹档案（注册后生成）
 │   └── llm/qwen2.5-3b-instruct-q4_k_m.gguf
 ├── tools/                                   # 本地解压的 llama.cpp（gitignore）
+├── .pylibs/                                 # DSH 可选依赖（gitignore，见 §2.4）
+├── runtime/                                 # DSH bridge/DSH home/在途话语记录（gitignore）
+│   ├── dsh_bridge/                          #   生成的桥接 bundle（scripts/install_dsh_bridge.py）
+│   ├── dsh_home/                            #   本项目自己的 DSH home（不动 ~/.dsh）
+│   └── utterance.json                       #   当前这句话的说话人分级（供 MCP 子进程读）
 ├── logs/                                    # 结构化日志（每日轮转）
 ├── snapshots/                               # 破坏性操作快照
 ├── scripts/
 │   ├── download_models.py                   # 下载模型
 │   ├── smoke_test_models.py                 # 引擎冒烟测试（真实模型）
 │   ├── check_llm.py                         # LLM 层检查
+│   ├── install_dsh_bridge.py                # 生成并安装 DSH 桥接 bundle
 │   └── verify_install.py                    # 依赖检查
 └── winvoice/                                # 源码包
+    ├── mcp_server.py                        # 把工具注册表暴露给 DSH（MCP stdio）
+    ├── dsh/                                 # DSH 客户端、升级策略、配置、桥接 bundle
     ├── contracts/speech.py                  # 可朗读规则（中文、≤80 字）
+    ├── tools/verifier.py                    # 验证器：用机器状态核对工具结果
     └── tools/weather.py                     # 天气工具 + WWO 码中文对照表
 ```
 
@@ -713,12 +800,13 @@ python -m winvoice
 
 - [ ] `python -m winvoice --check` → `Startup check PASSED`（5 个引擎全部加载）
 - [ ] `python scripts/smoke_test_models.py` → `18/18 passed`
-- [ ] `python -m pytest tests/ -q` → `274 passed, 1 skipped`
+- [ ] `python -m pytest tests/ -q` → `344 passed, 1 skipped`
 - [ ] `llama-server` 在 8080 端口监听，`main: server is listening on http://127.0.0.1:8080`
 - [ ] `python scripts/check_llm.py` → `9/9 intents matched`，`grammar-constrained decoding: ACTIVE`
 - [ ] `python -m winvoice` 启动 → `microphone_open` + `pipeline_started`
 - [ ] `python -m winvoice.enroll --speaker me --samples 8` → 按 8 条引导词念完，生成 `models/sv/profiles/me.json`，`--check` 显示 `enrolled=['me']`
 - [ ] 说 `assistant` / `小助手` → 唤醒 → 指令执行 → TTS 中文回复
+- [ ] （可选，启用 DSH 时）`python scripts/install_dsh_bridge.py --verify` → `[OK] mcp-winvoice is present in the composed configuration`，且启动日志有 `dsh_enabled`
 
 ---
 

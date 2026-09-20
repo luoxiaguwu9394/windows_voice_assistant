@@ -31,6 +31,7 @@ from urllib.parse import quote
 
 from winvoice.contracts import has_latin
 from winvoice.logging import get_logger
+from ._coreaudio import build_set_script
 
 logger = get_logger(__name__)
 
@@ -354,57 +355,10 @@ def set_volume(args: Dict[str, Any]) -> Dict[str, Any]:
         target_expr = f"$current + ({step} / 100.0)"
 
     # `$current` is read either way so the script body stays identical; it is
-    # only part of the target expression in the relative case.
-    script = f"""
-$ErrorActionPreference = 'Stop'
-Add-Type -TypeDefinition @'
-using System.Runtime.InteropServices;
-[Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IAudioEndpointVolume {{
-  int NotImpl1();
-  int NotImpl2();
-  int GetChannelCount(out uint c);
-  int SetMasterVolumeLevel(float level, ref System.Guid ctx);
-  int SetMasterVolumeLevelScalar(float level, ref System.Guid ctx);
-  int GetMasterVolumeLevel(out float level);
-  int GetMasterVolumeLevelScalar(out float level);
-}}
-[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IMMDevice {{
-  int Activate(ref System.Guid id, int clsCtx, System.IntPtr activationParams, [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.IUnknown)] out object iface);
-}}
-[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IMMDeviceEnumerator {{
-  int NotImpl1();
-  int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice endpoint);
-}}
-[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumeratorComObject {{ }}
-public class Audio {{
-  public static void SetVolumeScalar(float level) {{
-    var enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
-    IMMDevice dev; enumerator.GetDefaultAudioEndpoint(0, 1, out dev);
-    var guid = typeof(IAudioEndpointVolume).GUID;
-    object o; dev.Activate(ref guid, 23, System.IntPtr.Zero, out o);
-    var vol = (IAudioEndpointVolume)o;
-    var ctx = System.Guid.Empty;
-    vol.SetMasterVolumeLevelScalar(level, ref ctx);
-  }}
-  public static float GetVolumeScalar() {{
-    var enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
-    IMMDevice dev; enumerator.GetDefaultAudioEndpoint(0, 1, out dev);
-    var guid = typeof(IAudioEndpointVolume).GUID;
-    object o; dev.Activate(ref guid, 23, System.IntPtr.Zero, out o);
-    var vol = (IAudioEndpointVolume)o;
-    float level; vol.GetMasterVolumeLevelScalar(out level);
-    return level;
-  }}
-}}
-'@
-$current = [Audio]::GetVolumeScalar()
-$target = [Math]::Max(0.0, [Math]::Min(1.0, {target_expr}))
-[Audio]::SetVolumeScalar($target)
-Write-Output ([int]($target * 100))
-"""
+    # only part of the target expression in the relative case. The COM interop
+    # itself lives in `_coreaudio.py`, shared with the verifier that reads the
+    # level back — two copies of those GUIDs is exactly the pairing that drifts.
+    script = build_set_script(target_expr)
     try:
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],

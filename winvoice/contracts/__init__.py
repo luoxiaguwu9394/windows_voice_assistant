@@ -8,7 +8,7 @@ happened to author the sentence.
 """
 
 from .messages import *
-from .speech import MAX_SPEECH_CHARS, clip_for_speech, has_latin
+from .speech import MAX_SPEECH_CHARS, clip_for_speech, has_latin, sanitize_for_tts
 
 __all__ = [
     "AudioFrame",
@@ -28,4 +28,5 @@ __all__ = [
     "MAX_SPEECH_CHARS",
     "clip_for_speech",
     "has_latin",
+    "sanitize_for_tts",
 ]

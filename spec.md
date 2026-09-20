@@ -128,13 +128,22 @@ detected for the user to break in.
 | `T_low ≤ s < T_high` | Guest | Local queries, media control, non-sensitive apps, **no cloud, no file/write/script** |
 | `< T_low` | Rejected | None |
 
-⛔ **The Guest column is aspirational.** `tools.guest_denied` is declared in config but
-nothing reads it: `ToolExecutor.execute()` validates every call as `full` (there is a
-`# For now, assume full tier` placeholder where the tier should be passed in), and
-`AudioPipeline._intent_to_tool_calls()` does not filter by tier either. Tiers today
-only (a) abort the utterance on `rejected`, (b) gate the cloud tier, (c) pick the TTS
-voice. A `guest` speaker can therefore still call `read_file` / `write_file` /
-`run_script`.
+✅ **The tier now reaches the tool layer.** It is carried on `ToolCall.tier` and
+applied by `ToolExecutor.execute` → `ToolRegistry.validate_call(tier=…)`, which
+has always understood tiers and previously never received one. A `guest` cannot
+call `read_file` / `write_file` / `run_script`; `rejected` cannot call anything;
+and the read-only queries (`get_time`, `get_weather`) remain available to a guest,
+as their `guest_allowed=True` registration always claimed.
+
+🔶 Two gaps remain, both in the README's Known limitations: there is still no
+sensitive-app list, so a guest may open any allowlisted app; and a guest can reach
+the cloud tier if `dsh.cloud.guest_allowed` is turned on.
+
+🔶 **The tier crosses a process boundary.** Because the DSH agent runs tools in a
+process DSH spawns, the audio process publishes the in-flight tier to
+`runtime/utterance.json` (`winvoice/tools/utterance.py`) and the MCP server reads
+it per call. Without it, enabling the agent would have bypassed the permission
+model instead of using it.
 
 ### 4.3 Adaptive Update ✅
 - Enabled by default: `update_weight: 0.05` on successful verification
@@ -271,6 +280,7 @@ and `clear_pending_confirmation()` exist with no caller in the voice path.
 - Registry, software uninstall, system config changes **never allowed**
 
 ### 6.4 Speech contract for tool output 🔶
+
 The TTS model is Chinese-only: `vits-icefall-zh-aishell3`'s lexicon contains **zero
 Latin entries**, so sherpa-onnx drops every English word it is asked to say
 (`lexicon.cc: OOV ... Ignore it!`). A tool error containing English therefore produced
@@ -306,9 +316,115 @@ Two guards apply to anything on its way to the speaker, both from
 message against the model's real `lexicon.txt` (and the whole 60-entry weather condition
 table with it). Anything new that reaches the speaker must respect this contract.
 
+### 6.5 Result verification ✅
+
+A tool's `success` is a *claim*; `winvoice/tools/verifier.py` supplies the
+evidence. After a tool with an observable postcondition runs, its verifier reads
+the machine:
+
+| Tool | Checks |
+|---|---|
+| `open_app` | the resolved `.exe` appears in `tasklist` (polled, ~1 s budget) |
+| `close_app` | the process is absent |
+| `write_file` | exists · is a regular file · bytes match what was requested |
+| `set_volume` | the Core Audio endpoint reads back the target (±3 points) |
+| `run_script` | the process exit status |
+
+`VerificationStatus` is one of `verified` / `failed` / `uncertain` /
+`not_verifiable`, and the verdict is returned on `ToolResult.verification`.
+
+✅ **Verification does not rewrite `success`.** `close_app` on a program that is
+not running reports failure with 「好像没有在运行。」 — true and useful — while the
+postcondition ("not running") genuinely holds, i.e. `verified`. Overwriting
+`success` from the verdict would have turned that honest refusal into the false
+claim 「已经关闭了」. The tool's message is what the user hears; the verdict is
+what decides whether the task is unresolved.
+
+✅ **Only an observed mismatch escalates.** `unresolved()` is true for `failed`
+alone. `uncertain` and `not_verifiable` mean "this layer cannot observe it", not
+"it did not work", so escalating on them would send every web search and media
+keypress to the cloud. A failure with *no* verdict (an allowlisted-app refusal,
+the unimplemented confirmation gate) is deterministic — the cloud model would be
+refused identically — so it does not escalate either.
+
+The five query/observation-free tools (`get_time`, `get_weather`, `read_file`,
+`search_web`, `media_control`) deliberately have **no** verifier: a verifier for
+them could only ever answer "nothing to check" while adding tokens to every tool
+result the model reads.
+
+`tests/unit/test_verifier.py` pins these rules against a scripted machine
+(`SystemProbe`), because launching Chrome inside a test suite is not an option and
+"the process exists on the dev machine" is not an assertion.
+
 ---
 
 ## 7. LLM Backends
+
+### 7.0 Agent layer: DeepSeek Harness (optional) 🔶
+
+Added after the sections below were written. It does not delete them: the
+classifier/cloud path in §7.1–§7.3 remains as the *fallback* used when the agent
+is disabled, which is the default.
+
+With `dsh.enabled` + `dsh.local.enabled`, the assistant has two tiers and one of
+them answers every request:
+
+```
+rule matched       → direct tool call (unchanged, zero model latency)
+no rule matched    → DSH agent → tools via MCP → verifier → spoken reply
+                     (on an observed mismatch or abnormal turn end → Cloud DSH)
+```
+
+✅ **A rule match is never overridden** (`AudioPipeline._routes_to_agent`): 「音量调大
+20」 must not acquire a model's latency. Only `intent == unknown` — a rule miss —
+goes to the agent.
+
+✅ **One tool system.** The agent runs in Node, so it reaches this project's tools
+over **MCP**: `winvoice/mcp_server.py` (stdio JSON-RPC) builds the *same*
+`ToolCall` and calls the *same* `ToolExecutor`, mounted into DSH by a generated
+profile bundle (`winvoice/dsh/bridge.py` + `scripts/install_dsh_bridge.py`). Tools
+appear to the model as `mcp__winvoice__<tool>`. The allowlist, tiers, snapshots and
+verifiers therefore have exactly one implementation.
+
+🔶 The tool *list* is not tier-filtered, by design: filtering it would churn the
+prompt prefix between an owner's and a guest's turn and, since DSH only re-syncs an
+MCP server's tools on a `list_changed` notification, would leave the agent holding
+a stale list. The tier is enforced at `tools/call` instead.
+
+✅ **Escalation is programmatic** (`winvoice/dsh/validation.py`). The local model is
+never asked whether it is confident. Escalation fires on an observed verification
+mismatch, a `turn/end` whose reason is not `completed`, an empty final response, or
+a backend that would not start; a retryable mismatch gets one local retry first
+(`dsh.max_local_attempts`). The cloud agent receives a brief of what the local
+attempt did (`build_escalation_context`) so it continues rather than starting over.
+
+🔶 **Tool-result parsing is tolerant by design.** The extractor walks the event tree
+for JSON carrying a `success` key — the shape *this project's* MCP server authors
+(`render_tool_result`) — rather than hard-coding a pre-release event envelope. A
+parser pinned to a guessed envelope would silently stop detecting failures, which
+is the worst possible failure mode for a safety check.
+
+✅ **The agent's reply is sanitised before speech** (`sanitize_for_tts`): markdown,
+code fences, Latin words and ASCII punctuation are removed, digits and Chinese
+survive, and an answer with nothing speakable left yields `""` so the pipeline says
+something honest instead of a sentence of holes. `ToolResult.message` — authored by
+the tool, which knows the lexicon rules — is relayed verbatim in preference.
+
+⛔ **Known gap.** The agent turn is awaited, so the wake word is queued rather than
+acted on while the agent thinks (audio is not lost — the deque holds ~200 s — only
+barge-in is delayed). The same was already true of the ~1 s classifier call; an
+agent turn is simply longer. Tracked in `UNIMPLEMENTED.md`.
+
+🔶 **The agent also has DSH's own tools.** The `sdk` profile ships DSH's built-in
+filesystem and shell tools next to the MCP bridge, so "the allowlist is the only
+route to the machine" holds for `mcp__winvoice__*` but not for those. Selecting
+`sdk-minimal` would close it; see `docs/dsh_integration_design.md` and
+`UNIMPLEMENTED.md` §3.
+
+🔶 **Escalation conditions are narrower than `new_way.md` lists** — deliberately.
+See the design document's §1a for the reasoning: an unobservable action and a
+deterministic refusal both escalate to nothing, because the cloud model meets the
+same wall.
 
 ### 7.1 Local (llama.cpp `llama-server`) 🔶
 - **Transport**: OpenAI-compatible `/v1/chat/completions` on `http://localhost:8080/v1`
@@ -433,7 +549,7 @@ Full schema in README. Key points:
 🔶 **Markers are declared but barely used.** `pytest.ini` registers `unit`,
 `integration` and `manual`, but only `tests/e2e/test_e2e.py` carries a marker
 (`manual`). `pytest -m unit` therefore selects **nothing** — select by directory or
-file instead. The suite today is **274 passed, 1 skipped**; the skip is
+file instead. The suite today is **344 passed, 1 skipped**; the skip is
 `test_core.py`'s LLM probe, which skips itself when `llama-server` is not reachable.
 Tests that load a real engine `skipif` when the model is absent.
 
@@ -487,13 +603,20 @@ windows_voice_assistant/
 ├── winvoice/
 │   ├── contracts/             # Pydantic message models (schema_version=1)
 │   │                          # speech.py: what the Chinese TTS can pronounce (§6.4)
+│   │                          #            + sanitize_for_tts for agent answers
 │   ├── audio/                 # kws, vad, asr, sv, tts, stream, pipeline, _common
 │   ├── llm/                   # local + remote clients, GBNF grammar, router
+│   ├── dsh/                   # DeepSeek Harness: client, escalation, config, bundle
 │   ├── intent/                # rules, classifier, router
 │   ├── tools/                 # registry, builtin handlers, executor, snapshot
+│   │                          # verifier.py: check a tool against the machine (§6.5)
+│   │                          # state_capture.py: the SystemProbe seam
+│   │                          # utterance.py: in-flight tier across processes (§4.2)
 │   │                          # weather.py: the one network-backed tool, with its
 │   │                          # own WWO → Chinese condition table
+│   ├── mcp_server.py          # the tool registry, as DSH sees it (§7.0)
 │   ├── enroll/                # speaker enrollment CLI (+ guided prompts)
+│   ├── _vendor.py             # puts optional .pylibs deps on sys.path
 │   ├── config.py              # ConfigManager + watchdog file watcher
 │   ├── logging.py             # structlog setup (see the §10 defects)
 │   ├── context.py
@@ -540,7 +663,8 @@ in Chinese) — answer questions rather than acting on the machine.
 | Item | Where it would live |
 |---|---|
 | Confirmation round trip (blocks `write_file` / `run_script`) | `ToolExecutor` + pipeline |
-| Guest-tier permission enforcement | `ToolExecutor.execute` tier argument |
+| Sensitive-app list for the Guest tier (the tier itself is now enforced) | `ALLOWED_APPS` + `ToolRegistry` |
+| Barge-in while the agent is thinking (an awaited turn queues the wake word) | `AudioPipeline` state machine |
 | Question answering / chat, directory listing | new intent + tools |
 | A weather provider with an API key (wttr.in is keyless but rate-limited, and untranslated) | `winvoice/tools/weather.py` |
 | Hot-reload fan-out to running engines | config watcher → engines |
@@ -560,7 +684,7 @@ in Chinese) — answer questions rather than acting on the machine.
 ### Verified numbers (2026-09-19, this machine)
 | Metric | Value |
 |---|---|
-| Test suite | 274 passed, 1 skipped |
+| Test suite | 344 passed, 1 skipped |
 | Local LLM latency | 0.8–1.1 s per intent classification |
 | ASR latency | 40–50 ms per VAD segment |
 | TTS synthesis | 100–300 ms, 8 kHz |
