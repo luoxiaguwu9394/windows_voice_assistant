@@ -217,3 +217,63 @@ class TestInvalidProfileIsRefused:
 
         assert result is not None
         assert result.tier == "full"
+
+
+# ── adaptive updates: only a full verdict may teach the profile ─────────────
+
+
+def _guest_embedding(anchor):
+    """A vector at cosine 0.58 to the anchor — inside the guest band."""
+    rng = np.random.default_rng(7)
+    noise = rng.normal(size=anchor.shape).astype(np.float32)
+    noise = noise - float(noise @ anchor) * anchor
+    noise = noise / np.linalg.norm(noise)
+    return 0.58 * anchor + 0.815 * noise
+
+
+def test_a_guest_verdict_does_not_teach_the_profile(tmp_path):
+    """
+    Guest-graded audio is by definition NOT the owner (below threshold_high);
+    letting it EMA-drift the profile pulled it toward whoever spoke most —
+    live report 2026-09-27: another household member ended up graded `full`.
+    """
+    engine = make_engine(tmp_path)
+    engine._ready = True
+    anchor = unit_vectors(1)[0]
+    profile = SpeakerProfile(
+        speaker_id="me",
+        embeddings=[anchor.copy()],
+        threshold_high=0.95,
+        threshold_low=0.50,
+    )
+    engine._profiles["me"] = profile
+    engine.compute_embedding = lambda _frames: _guest_embedding(anchor)
+
+    result = engine.verify(anchor, "me")
+
+    assert result.tier == "guest", result.tier
+    assert np.array_equal(profile.embeddings[0], anchor), "a guest verdict moved the profile"
+
+
+def test_a_full_verdict_still_teaches_the_profile(tmp_path):
+    """The drift tracking exists for the owner's verified speech — keep it."""
+    engine = make_engine(tmp_path)
+    engine._ready = True
+    anchor = unit_vectors(1)[0]
+    profile = SpeakerProfile(
+        speaker_id="me",
+        embeddings=[anchor.copy()],
+        threshold_high=0.95,
+        threshold_low=0.50,
+    )
+    engine._profiles["me"] = profile
+
+    noise = np.random.default_rng(11).normal(size=anchor.shape).astype(np.float32)
+    drifted_toward_owner = 0.995 * anchor + 0.1 * noise
+    drifted_toward_owner = drifted_toward_owner / np.linalg.norm(drifted_toward_owner)
+    engine.compute_embedding = lambda _frames: drifted_toward_owner
+
+    result = engine.verify(anchor, "me")
+
+    assert result.tier == "full", result.tier
+    assert not np.allclose(profile.embeddings[0], anchor), "full verdict stopped teaching"

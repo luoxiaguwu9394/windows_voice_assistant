@@ -492,6 +492,14 @@ same wall.
   to `response_format: json_object` and a `local_llm_grammar_rejected` warning
 - 🔶 Ollama is *not* required: it works only as an alternative OpenAI-compatible
   endpoint, but the project's docs, models and scripts all assume llama.cpp.
+- ✅ **Server lifecycle is managed** (2026-09-27, `winvoice/llm/server.py`): at startup the
+  assistant probes `{base_url}/health` — a running server is **reused** (and never
+  terminated, even at shutdown), an absent one is spawned from
+  `llm.local.server_binary` + `llm.local.model_file` (output to `logs/llama-server.log`,
+  no window) and awaited up to `llm.local.start_timeout_s`. Spawn failure is a logged
+  warning, never fatal: the rule tier and deterministic small talk keep working and the
+  model-backed paths say so out loud. `llm.local.auto_start: false` restores the manual
+  two-terminal deployment.
 - ✅ **Free-form generation** (`LocalLlmBackend.generate`, 2026-09-27): the same
   transport without grammar, JSON or the classifier system prompt — plain text in,
   plain text out. It backs `IntentName.ASK` only; the question path carries **no
@@ -609,8 +617,15 @@ Full schema in README. Key points:
 - 🔶 **Only the KWS entry pins a real SHA256** (`68447f4f…`); every other entry has
   `sha256: None`, and the script prints `(no pinned SHA256 - skipping verification)`.
   The `--list` output marks each model `sha256` or `no-hash`.
-- ⛔ Startup integrity check (`size+mtime` quick check → full SHA256 → `models/.corrupt/`
-  + "Auto-repair" dialog) is **not implemented**; only the download path verifies.
+- 🔶 **Local seal + startup verification** (2026-09-27, `winvoice/integrity.py`):
+  `download_models.py --seal` fingerprints every file under `models/` (SHA256+size, minus
+  enrollment profiles and the KWS keyword cache — runtime data that is *supposed* to
+  change) into `models/integrity.json`; startup does a size-only pass and
+  `python -m winvoice --check` hashes everything, listing failures and exiting non-zero.
+  Enforcement is report-only (no `.corrupt/` renaming — that would pull files from under
+  a running assistant). 🔶 This is **trust-on-first-use**: it catches later corruption and
+  truncation, not a bad download that was sealed as-is — official archive hashes for the
+  other 10 MANIFEST entries still require re-downloading them.
 
 ---
 
@@ -675,7 +690,11 @@ skips if it is missing).
 - Password/phrase fallback mechanism
 - Snapshot scope extension (registry exports?)
 - Acceptance criteria (wake rate, false-wake rate, E2E latency)
-- Packaging (Inno Setup), auto-update, crash reporting, offline docs — **deferred per user**
+- ~~Packaging (Inno Setup), auto-update, crash reporting, offline docs — **deferred per user**~~
+  → **Decided 2026-09-27**: distribution is the one-click setup wizard
+  (`installer/`, ADR `docs/adr/0001`); auto-update exists as
+  "discover release → download → re-run installer" (no silent background
+  updates). Still open: code signing, crash reporting, offline docs.
 
 ---
 
@@ -688,8 +707,8 @@ windows_voice_assistant/
 ├── config/
 │   └── config.yaml
 ├── docs/
+│   ├── adr/                   # 0001-installer-wizard-architecture.md
 │   └── agents/                # issue-tracker.md, domain.md
-│                              # (docs/adr/ is referenced by AGENTS.md but not created yet)
 ├── grammar.gbnf               # reference copy; the live grammar is in winvoice/llm/grammar.py
 ├── run.ps1
 ├── scripts/
@@ -768,6 +787,16 @@ deterministic greetings, ask-first `search_web` (`tools.search_web_confirm`), an
 `IntentName.DISMISS` 「没事了」 fallback to waiting, and `system_power`
 (关机/重启/睡眠/休眠/锁屏/注销 — confirmation-gated, owner-only).
 
+Added 2026-09-27 (distribution, `installer/` + `docs/adr/0001`): the one-click setup
+wizard `WinVoice-Setup-<version>.exe` — embedded Python 3.12 runtime payload with all
+dependencies and llama.cpp preinstalled (the app source tree is shipped un-frozen so
+the CWD/`__file__` path-resolution rules hold unchanged), online model download with
+resume/proxy/mirror, audio device probes through the real playback route logic, config
+rendered from `config/config.template.yaml` (wake words editable in the wizard),
+optional DSH bridge and cloud keys, speaker enrollment, `--check` gate, shortcuts and
+an install marker; re-running upgrades/repairs in place and the wizard discovers newer
+releases.
+
 ### Not implemented
 > `UNIMPLEMENTED.md` is the working backlog for these: it carries the per-item constraints,
 > code anchors and acceptance criteria. Keep the two lists in step.
@@ -777,9 +806,9 @@ deterministic greetings, ask-first `search_web` (`tools.search_web_confirm`), an
 | Sensitive-app list for the Guest tier (the tier itself is now enforced) | `ALLOWED_APPS` + `ToolRegistry` |
 | A weather provider with an API key (wttr.in is keyless but rate-limited, and untranslated) | `winvoice/tools/weather.py` |
 | Hot-reload fan-out to running engines | config watcher → engines |
-| Prometheus metrics, disk quota, model integrity check, anchor check | §10, §9.2 |
+| Prometheus metrics, disk quota, anchor check | §10, §9.2 (model integrity ✅ sealed 2026-09-27) |
 | Password/phrase fallback, threshold-tuning UI, PySide6 UI | §4.3, §4.4, §14 |
-| `docs/adr/` | AGENTS.md references it |
+| Code signing for the setup exe, silent background auto-update | `installer/` |
 
 ### Known defects
 | Defect | Impact |
@@ -793,7 +822,7 @@ deterministic greetings, ask-first `search_web` (`tools.search_web_confirm`), an
 ### Verified numbers (2026-09-19, this machine)
 | Metric | Value |
 |---|---|
-| Test suite | 344 passed, 1 skipped (2026-09-19); 561 passed, 1 skipped (2026-09-27) |
+| Test suite | 344 passed, 1 skipped (2026-09-19); 627 passed, 1 skipped (2026-09-27) |
 | Local LLM latency | 0.8–1.1 s per intent classification |
 | ASR latency | 40–50 ms per VAD segment |
 | TTS synthesis | 100–300 ms, 8 kHz (the 8 kHz VITS) |

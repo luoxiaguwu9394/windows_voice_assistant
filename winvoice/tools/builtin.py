@@ -609,9 +609,60 @@ def search_web(args: Dict[str, Any]) -> Dict[str, Any]:
 # File Operations
 # ──────────────────────────────────────────────────────────────
 
+# Spoken folder words → the real folders under the user directory. 「帮我在桌面
+# 建一个txt」 used to produce the literal relative path 桌面\新建.txt, which —
+# with the assistant's working directory inside the home directory — slipped
+# through the confinement check and would have written into a *folder named
+# 桌面 inside the repo* (live report 2026-09-27). Only the first path segment
+# is mapped; the confinement check in each handler still applies afterwards.
+_FOLDER_ALIASES = {
+    "桌面": "Desktop",
+    "desktop": "Desktop",
+    "下载": "Downloads",
+    "downloads": "Downloads",
+    "文档": "Documents",
+    "我的文档": "Documents",
+    "documents": "Documents",
+    "图片": "Pictures",
+    "照片": "Pictures",
+    "pictures": "Pictures",
+    "音乐": "Music",
+    "music": "Music",
+    "视频": "Videos",
+    "videos": "Videos",
+}
+
+
+def resolve_user_path(raw: Any) -> Path:
+    """
+    A spoken path as a real path under the user directory.
+
+    A leading folder word (「桌面」「下载」…) is replaced with the actual folder
+    (`Path.home()/Desktop` …), because that is what the speaker means and a
+    bare relative path would otherwise resolve against the assistant's working
+    directory. Everything else — absolute paths, deeper relative paths — comes
+    through unchanged; the confinement check in each handler still applies
+    after this.
+    """
+    text = str(raw or "").strip().strip("\"'")
+    if not text:
+        return Path.home()
+    parts = [part for part in Path(text).parts if part not in ("", ".", "/")]
+    if parts:
+        target = _FOLDER_ALIASES.get(parts[0]) or _FOLDER_ALIASES.get(parts[0].lower())
+        if target is not None:
+            base = Path.home() / target
+            rest = [part for part in parts[1:] if part != "\\"]
+            return base / Path(*rest) if rest else base
+    # No folder word: behave like the old code — a relative path resolves
+    # against the working directory (the repo lives inside the home directory,
+    # so the confinement check keeps accepting it).
+    return Path(text).expanduser().resolve()
+
+
 def read_file(args: Dict[str, Any]) -> Dict[str, Any]:
     """Read a text file."""
-    path = Path(args.get("path", "")).resolve()
+    path = resolve_user_path(args.get("path", ""))
     try:
         # Security: only allow under user directory
         user_dir = Path.home()
@@ -662,7 +713,7 @@ def list_dir(args: Dict[str, Any]) -> Dict[str, Any]:
     raw = str(args.get("path") or "").strip()
     user_dir = Path.home()
     try:
-        target = (Path(raw).expanduser() if raw else user_dir).resolve()
+        target = resolve_user_path(raw) if raw else user_dir
         target.relative_to(user_dir)
     except ValueError:
         return {
@@ -707,14 +758,32 @@ def list_dir(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def write_file(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Write content to a file."""
-    path = Path(args.get("path", "")).resolve()
-    content = args.get("content", "")
+    """
+    Write content to a file — or create an empty one when none was dictated.
+
+    「帮我在桌面建立一个txt文件」 names no content, and that request means
+    exactly what Windows' 新建文本文档 means: an empty file. So `content` is
+    optional. The one dangerous combination — no content **and** an existing
+    file — is refused instead of silently truncating it: a confirmation
+    question cannot distinguish 「create it」 from 「wipe it」, so the tool
+    asks for the content rather than guessing.
+    """
+    path = resolve_user_path(args.get("path", ""))
+    has_content = "content" in args and args.get("content") is not None
+    content = str(args.get("content")) if has_content else ""
 
     try:
         # Security: only allow under user directory
         user_dir = Path.home()
         path.relative_to(user_dir)
+
+        if not has_content and path.exists():
+            logger.info("write_file_overwrite_refused", path=str(path))
+            return {
+                "success": False,
+                "error": "target exists and no content was dictated",
+                "message": "这个文件已经存在，请说清楚要写入什么内容。",
+            }
 
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")

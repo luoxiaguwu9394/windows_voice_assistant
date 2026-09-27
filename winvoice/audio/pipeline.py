@@ -67,6 +67,12 @@ ASK_SYSTEM_PROMPT = (
     "不知道答案就直说不知道。"
 )
 
+# How long the microphone ignores the room after a confirmation question
+# finishes playing: its echo tail would otherwise be transcribed as (and
+# voiceprinted as) the beginning of the answer, mixing the TTS voice into the
+# owner's embedding.
+_CONFIRM_ECHO_GUARD_S = 0.4
+
 # The spoken protocol for the confirmation loop. A question is asked out loud,
 # so the answer must not need the wake word — the words to listen for are
 # stated in the question itself.
@@ -113,6 +119,14 @@ class _PendingConfirmation:
 
     call: ToolCall
     deadline: float
+    #: When the question finished being spoken (monotonic) — the microphone
+    #: ignores this much echo-decay before VAD is fed, so the tail of the
+    #: question does not get transcribed as (and voiceprinted as) the answer.
+    opened_at: float = 0.0
+    #: One retries allowance when the voiceprint came back `rejected` — a
+    #: transient misread of a short utterance, not an authenticated other
+    #: speaker. A second rejection ends the flow.
+    retries: int = 0
 
 
 @dataclass
@@ -432,6 +446,10 @@ class AudioPipeline:
             self._pending_confirmation = None
             await self._abort_utterance()
             return
+        if time.monotonic() < pending.opened_at + _CONFIRM_ECHO_GUARD_S:
+            # The question just finished playing; whatever the mic hears right
+            # now is its echo, not an answer. Feed VAD only after the decay.
+            return
         await self._tick_vad(chunk)
 
     async def _tick_vad(self, chunk: bytes) -> None:
@@ -459,7 +477,7 @@ class AudioPipeline:
             return
 
         if self._pending_confirmation is not None:
-            await self._resolve_confirmation(result)
+            await self._resolve_confirmation(result, segment)
             return
 
         self._context.asr_text = result.text
@@ -871,6 +889,7 @@ class AudioPipeline:
         self._pending_confirmation = _PendingConfirmation(
             call=call,
             deadline=time.monotonic() + timeout_s,
+            opened_at=time.monotonic(),
         )
         logger.info(
             "confirmation_armed",
@@ -889,7 +908,10 @@ class AudioPipeline:
         确认 or 取消 — is spelled out in the question, because the answer has
         to be recognisable from speech alone.
         """
-        tail = "确认请说确认，取消请说取消。"
+        # 「确认执行」 is deliberately longer than a bare 确认: the
+        # voiceprint grades the answer, and a two-syllable utterance embeds
+        # far worse than a four-syllable one (live bug 2026-09-27).
+        tail = "确认请说确认执行，取消请说取消。"
         if call.tool == ToolName.WRITE_FILE:
             return f"我将要写入一个文件，{tail}"
         if call.tool == ToolName.RUN_SCRIPT:
@@ -909,23 +931,36 @@ class AudioPipeline:
             return f"你要我打开浏览器搜索吗？{tail}"
         return f"这个操作需要你的确认，{tail}"
 
-    def _current_speaker_tier(self) -> str:
+    def _current_speaker_tier(self, samples=None) -> Optional[str]:
         """
         The tier of whoever is speaking *right now*, as a plain string.
 
         Confirmation answers arrive without a wake word, so this runs its own
-        verification over the recent audio rather than reusing the requesting
-        utterance's result — that reuse is exactly the hole a second voice
-        would walk through.
+        verification rather than reusing the requesting utterance's result —
+        that reuse is exactly the hole a second voice would walk through.
+
+        `samples` is the VAD segment's **speech-only** audio. Verifying the
+        rolling microphone window instead was the live bug (2026-09-27): by
+        the time a short 「确认」 ends its segment, that window holds mostly
+        the trailing silence the VAD required plus a possible speaker echo,
+        the embedding degrades, and the owner dropped into the guest band —
+        every confirmation refused. Verify what was said, not what the room
+        last heard. None means the engine could not judge the audio at all —
+        the caller treats that as a retryable misread, never as a pass. The
+        verification is a gate, not a lesson: it never EMA-drifts the profile
+        (that drift poisoned `me.json` until the owner scored 0.32 against
+        their own voice — live bug 2026-09-27).
         """
+        frames = samples if samples is not None else list(self._recent)
         if getattr(self.sv, "enabled", True):
-            sv_result = self.sv.verify(list(self._recent))
+            sv_result = self.sv.verify(frames, adaptive=False)
             if sv_result is not None:
                 tier = getattr(sv_result, "tier", "full")
                 return str(getattr(tier, "value", tier))
+            return None  # unjudgeable audio — the caller retries, fail-closed
         return "full"
 
-    async def _resolve_confirmation(self, asr: AsrResult) -> None:
+    async def _resolve_confirmation(self, asr: AsrResult, segment: VadSegment) -> None:
         """
         Act on the answer to a confirmation question.
 
@@ -948,13 +983,31 @@ class AudioPipeline:
             await self._abort_utterance()
             return
 
-        tier = self._current_speaker_tier()
-        if tier != str(getattr(call.tier, "value", call.tier)):
+        # Verify the spoken answer itself (speech-only VAD audio) — see
+        # `_current_speaker_tier` for why the rolling window downgraded the
+        # owner's short 确认 to guest.
+        tier = self._current_speaker_tier(segment.samples)
+        pending_tier = str(getattr(call.tier, "value", call.tier))
+
+        if tier in (None, "rejected") and pending.retries < 1:
+            # Not judgeable, or below every band: read as a misread of a short
+            # utterance rather than an impostor — ask once more with the
+            # request still armed. A genuine guest just fails again and the
+            # flow dies with the TTL; nobody is promoted by a retry.
+            pending.retries += 1
+            logger.info(
+                "confirmation_retry", tool=call.tool.value, tier=tier,
+                speaker=pending_tier,
+            )
+            await self._speak_line("没有听清，请再说一遍确认。", back_to_confirming=True)
+            return
+
+        if tier != pending_tier:
             self._pending_confirmation = None
             logger.info(
                 "confirmation_speaker_mismatch",
                 tool=call.tool.value,
-                pending_tier=str(getattr(call.tier, "value", call.tier)),
+                pending_tier=pending_tier,
                 speaker_tier=tier,
             )
             await self._speak_line("这个操作需要刚才说话的人来确认，先不做了。")
@@ -981,7 +1034,7 @@ class AudioPipeline:
         logger.info(
             "confirmation_superseded", tool=call.tool.value, text=text
         )
-        await self._reroute_utterance(asr)
+        await self._reroute_utterance(asr, segment)
 
     async def _execute_confirmed(self, call: ToolCall) -> ToolResult:
         """Replay the parked call with `confirmed=True` — same call, same args."""
@@ -1018,25 +1071,36 @@ class AudioPipeline:
             message="这个操作没法执行。",
         )
 
-    async def _speak_line(self, text: str) -> None:
-        """Speak one short line and go back to listening (no wake word needed)."""
+    async def _speak_line(self, text: str, *, back_to_confirming: bool = False) -> None:
+        """
+        Speak one short line and go back to listening (no wake word needed).
+
+        With `back_to_confirming` the pending confirmation survives the line
+        (「没有听清，请再说一遍确认。」) and the microphone returns to the
+        confirming state instead of dropping the request.
+        """
         trace_id = getattr(self._context, "trace_id", "") or uuid.uuid4().hex[:16]
         context = PipelineContext(trace_id=trace_id, tts_text=text)
         self._set_state(PipelineState.TTS_PLAYING)
         await self._speak(context)
+        if back_to_confirming and self._pending_confirmation is not None:
+            self.vad.reset()
+            self._set_state(PipelineState.CONFIRMING)
+            return
         await self._abort_utterance()
 
-    async def _reroute_utterance(self, asr: AsrResult) -> None:
+    async def _reroute_utterance(self, asr: AsrResult, segment: VadSegment) -> None:
         """
         Handle an utterance that killed a pending confirmation as a fresh one.
 
-        Fresh trace, fresh speaker check: the previous context belonged to the
+        Fresh trace, fresh speaker check over the spoken audio (same reasoning
+        as the confirmation tier check): the previous context belonged to the
         confirmed request, and a topic change is a new turn in every respect.
         A rejected speaker ends the flow instead of getting their words routed.
         """
         sv_result = None
         if getattr(self.sv, "enabled", True):
-            sv_result = self.sv.verify(list(self._recent))
+            sv_result = self.sv.verify(segment.samples, adaptive=False)
             if sv_result is not None:
                 tier = getattr(sv_result, "tier", "full")
                 tier = str(getattr(tier, "value", tier))

@@ -178,11 +178,13 @@ def test_tools_list_exposes_the_registry(child: McpChild) -> None:
         "get_weather",
     }
     # The schema the model sees must carry the cross-field rule, or the model
-    # has no way to know `set_volume` accepts `level` *or* `delta`.
-    assert tools["set_volume"]["inputSchema"]["anyOf"] == [
-        {"required": ["level"]},
-        {"required": ["delta"]},
-    ]
+    # has no way to know `set_volume` accepts `level` *or* `delta`. Each
+    # alternative is a complete object schema: llama.cpp (the local agent's
+    # consumer) 400s on a bare `{"required": [...]}` subschema, which used to
+    # kill every local agent turn.
+    any_of = tools["set_volume"]["inputSchema"]["anyOf"]
+    assert [branch["required"] for branch in any_of] == [["level"], ["delta"]]
+    assert all(branch["type"] == "object" and "properties" in branch for branch in any_of)
 
 
 def test_unknown_tool_is_reported_as_an_error(child: McpChild) -> None:

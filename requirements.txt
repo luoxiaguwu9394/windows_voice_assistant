@@ -20,6 +20,12 @@ scipy>=1.13.0
 pywin32>=310
 pyautogui>=1.0.0
 
+# Wake-word keyword compilation (winvoice/audio/kws.py) — runtime-required,
+# previously only mentioned in deployment.md, which is how fresh machines
+# ended up with a working pip install and a KWS that could not start.
+sentencepiece>=0.2.0
+pypinyin>=0.53.0
+
 # UI (optional)
 PySide6>=6.7.0
 

@@ -344,9 +344,16 @@ class SvEngine:
 
     # ── verification ───────────────────────────────────────────
 
-    def verify(self, frames, speaker_id: str = "me") -> Optional[SvResult]:
+    def verify(self, frames, speaker_id: str = "me", adaptive: bool = True) -> Optional[SvResult]:
         """
         Verify audio against an enrolled speaker and return the tier.
+
+        `adaptive=False` gates without teaching: the confirmation answers are
+        graded on short utterances in a different acoustic situation than the
+        enrollment prompts, and letting them EMA-drift the profile dragged it
+        toward silence/echo embeddings until the owner scored 0.32 against
+        their own voice (live bug 2026-09-27). Only the wake path, whose
+        window is speech-rich, has anything to teach.
 
         Fails closed: a profile whose thresholds are inverted or too close
         together yields `rejected` rather than granting access, because the
@@ -383,7 +390,12 @@ class SvEngine:
             tier = "rejected"
 
         inc_request("sv", tier)
-        if self.adaptive_update and tier in ("full", "guest"):
+        # Only a FULL verdict may teach the profile. A guest-graded embedding
+        # is by definition not the owner (below threshold_high); letting it
+        # EMA-drift the profile pulled it toward whoever spoke most — live
+        # report 2026-09-27: another household member ended up scoring `full`
+        # after a day of guest-graded wake-path verifications.
+        if adaptive and self.adaptive_update and tier == "full":
             self._adaptive_update(profile, emb)
 
         result = SvResult(
@@ -508,7 +520,7 @@ class StubSvEngine(SvEngine):
     async def initialize(self) -> None:
         logger.info("stub_sv_initialized")
 
-    def verify(self, frames, speaker_id: str = "me") -> Optional[SvResult]:
+    def verify(self, frames, speaker_id: str = "me", adaptive: bool = True) -> Optional[SvResult]:
         return SvResult(
             speaker_id=speaker_id,
             score=0.95,

@@ -227,8 +227,12 @@ class ToolRegistry:
 
         self.register(ToolSpec(
             name=ToolName.WRITE_FILE,
-            description="Write content to a file",
-            schema=ToolSchema(properties={"path": {"type": "string"}, "content": {"type": "string"}}, required=["path", "content"]),
+            description=(
+                "Write content to a file, or create an empty one when no "
+                "content is given (the 新建文本文档 flow). Refuses to truncate "
+                "an existing file when no content was provided."
+            ),
+            schema=ToolSchema(properties={"path": {"type": "string"}, "content": {"type": "string"}}, required=["path"]),
             handler=write_file,
             destructive=True,
             guest_allowed=False,
@@ -350,9 +354,13 @@ class ToolRegistry:
             except Exception:
                 pass  # file may not exist yet, let handler handle it
 
-        # Check write_file path restriction
+        # Check write_file path restriction (folder aliases resolved the same
+        # way the handler will, so 「桌面\x.txt」 is judged as the Desktop file
+        # it names, not as a CWD-relative lookalike).
         if tool == ToolName.WRITE_FILE and "path" in args:
-            path = Path(args["path"]).resolve()
+            from .builtin import resolve_user_path
+
+            path = resolve_user_path(args["path"])
             user_dir = Path.home()
             try:
                 path.relative_to(user_dir)

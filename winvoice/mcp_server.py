@@ -86,6 +86,14 @@ def to_json_schema(schema: Any) -> Dict[str, Any]:
     `at_least_one` has no JSON-Schema-`required` equivalent — it is the
     cross-field rule `set_volume` needs, because `level` and `delta` are
     alternatives and neither can be required — so it becomes `anyOf`.
+
+    Each alternative is a **complete object schema**, not a bare
+    `{"required": [...]}`: llama.cpp's json-schema converter — the consumer on
+    the local agent's path — answers 400 to the bare form ("Unrecognized
+    schema"), which killed *every* tool-bearing request and therefore every
+    local agent turn, silently, since DSH shipped (live finding 2026-09-27:
+    `dsh_resolved_locally` had never once been logged). Full branches carry
+    the same meaning and convert cleanly.
     """
     out: Dict[str, Any] = {
         "type": schema.type,
@@ -95,7 +103,15 @@ def to_json_schema(schema: Any) -> Dict[str, Any]:
     if schema.required:
         out["required"] = list(schema.required)
     if getattr(schema, "at_least_one", None):
-        out["anyOf"] = [{"required": [key]} for key in schema.at_least_one]
+        out["anyOf"] = [
+            {
+                "type": schema.type,
+                "properties": schema.properties,
+                "required": [key],
+                "additionalProperties": schema.additionalProperties,
+            }
+            for key in schema.at_least_one
+        ]
     return out
 
 

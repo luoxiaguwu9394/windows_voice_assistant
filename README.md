@@ -214,14 +214,27 @@ Full setup (the optional `.pylibs` dependencies and the bridge bundle) is in
 
 > Commands below use PowerShell. The project is under active development; interfaces may change.
 
+### The one-click way: setup wizard (recommended)
+
+Download `WinVoice-Setup-<version>.exe` from the project's Releases page and
+double-click it. The wizard handles everything — embedded Python runtime,
+llama.cpp, model download (resumable, proxy/HF-mirror aware), audio device
+test, config generation, wake-word setup, optional DSH agent layer and cloud
+keys, speaker enrollment, and a full `--check` — then creates the desktop
+shortcut. No Python, no pip, no compiling.
+
+Re-running the same exe detects an existing install and offers upgrade /
+repair (models and config are preserved). Updates are discovered from new
+release assets automatically. Details: `installer/README.md`.
+
 ### Requirements
 
 - Windows 10 / 11
-- Python 3.10+
+- Python 3.10+ (only for the manual path below)
 - (Optional) NVIDIA GPU for local LLM acceleration
 - (Optional) [Ollama](https://ollama.com/) for local LLM
 
-### Install
+### Install (manual)
 
 ```powershell
 git clone https://github.com/luoxiaguwu9394/windows_voice_assistant.git
@@ -346,7 +359,7 @@ Say a wake word, wait for the acknowledgement, then speak one command.
 | | `音量调到百分之十` / `音量调到 50%` (absolute) | |
 | **Apps** | **Web search** | **Files** |
 | `打开记事本` · `打开计算器` · `打开资源管理器` | `搜索今天新闻` · `查一下北京天气` | `读取文件 <path>` · `当前目录下有什么文件` |
-| `关闭记事本` (see the allowlist below) | asks 「你要我搜索…吗？」 first (see below) | `写入文件 <path> 内容 …` · `运行脚本 <path>` (both ask 确认 first, see below) |
+| `关闭记事本` (see the allowlist below) | asks 「你要我搜索…吗？」 first (see below) | `在桌面建立一个txt文件` · `写入文件 <path> 内容 …` · `运行脚本 <path>` (all ask 确认 first, see below) |
 | **Power** (owner only, asks 确认 first) | | |
 | `关机` · `重启` · `睡眠` · `休眠` · `锁屏` · `注销` | | |
 | **Time** | **Weather** | **Questions & small talk** |
@@ -427,6 +440,12 @@ cancellation counts as "changed my mind" — the request is dropped and that
 sentence is handled as a new command. A pending request is bound to the speaker
 who made it: a guest saying 「确认」 cannot release the owner's file write.
 Snapshots are still taken before confirmed writes and restored if the tool fails.
+
+**File creation without dictation.** 「帮我在桌面建立一个txt文件」 creates an
+empty `新建.txt` on your real Desktop — spoken folder words (桌面/下载/文档/图片/
+音乐/视频) are mapped onto the actual folders, and no content means 新建文本文档.
+If the target file already exists and you dictated nothing, the assistant refuses
+(「这个文件已经存在，请说清楚要写入什么内容。」) rather than wiping it.
 
 **Power actions** (`关机`/`重启`/`睡眠`/`休眠`/`锁屏`/`注销`) are owner-only and
 confirmation-gated like writes: the assistant announces the action (「我将要关机，
@@ -683,7 +702,7 @@ The LLM cannot generate shell commands. It can only invoke the tools below. All 
 | `search_web` | `query: str` | ❌ | ✅ |
 | `read_file` | `path: str` (under `C:\Users\<you>\`) | ❌ | ❌ |
 | `list_dir` | `path: str` (optional, same confinement; defaults to the user directory) | ❌ | ❌ |
-| `write_file` | `path: str, content: str` | ✅ | ❌ |
+| `write_file` | `path: str` (folder words understood: 桌面/下载/文档/图片/音乐/视频), `content: str` **optional** — no content creates an empty file (新建文本文档); an existing file is never truncated without dictated content | ✅ | ❌ |
 | `run_script` | `path: str` (`.py` / `.ps1` / `.bat` / `.cmd`) | ✅ | ❌ |
 | `system_power` | `action: Enum[shutdown, restart, sleep, hibernate, lock, signout]` | ❌ | ❌ |
 | `get_time` | — | ❌ | ✅ |
@@ -783,7 +802,7 @@ The following are **not yet decided**. They are documented here so they aren't s
 
 | Limitation | Notes |
 |---|---|
-| Question answering is offline-only and single-turn | Questions route to the local model with no tools; there is no conversation memory, and a question the small model cannot answer gets 「这个问题我现在答不上来。」. It needs the LLM server up — otherwise only the deterministic greetings answer |
+| Question answering is offline-only and single-turn | Questions route to the local model with no tools; there is no conversation memory, and a question the small model cannot answer gets 「这个问题我现在答不上来。」. The assistant starts the LLM server itself (`llm.local.auto_start`, default on) and reuses one you started manually |
 | Weather needs the internet | `get_weather` queries `wttr.in` (no API key) with a `weather.timeout_s` deadline covering the whole request (5 s by default, and the answer is silent until it arrives). Offline or timed out it says 「暂时查不到天气。」; `weather.enabled: false` disables it entirely. Conditions come from the tool's own Chinese table because `lang=zh` returns English descriptions |
 | Agent needs the bridge installed | The optional DSH tier only has tools after `python scripts/install_dsh_bridge.py --install`; without it the agent can chat but cannot act (`deployment.md` §2.4) |
 | The agent's *output* is not streamed | The turn is a task now, so a wake word during planning is acted on immediately (the abandoned turn's reply is dropped). What cannot happen yet is speaking the answer while the model is still writing it: DSH returns the response whole, so the first sound waits for the whole reply plus its first sentence's synthesis |

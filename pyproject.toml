@@ -38,6 +38,8 @@ dependencies = [
     "scipy>=1.13.0",
     "pywin32>=310",
     "pyautogui>=0.9.54",
+    "sentencepiece>=0.2.0",
+    "pypinyin>=0.53.0",
 ]
 
 [project.optional-dependencies]

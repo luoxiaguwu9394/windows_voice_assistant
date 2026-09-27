@@ -86,6 +86,17 @@ llm:
     #   llama-3.2-3b-instruct  (~2.0GB, 新架构)
     confidence_threshold: 0.65             # 小模型阈值略低，依赖 GBNF 保证格式
 
+    # ── llama-server 托管（2026-09-27 起，见 winvoice/llm/server.py）──
+    # true：助手启动时先探测 base_url 的 /health——已在跑就复用（关闭助手时也不
+    # 动它），没在跑才按下面两项拉起并等健康检查通过；服务输出进 logs/llama-server.log。
+    # 拉起失败不致命：规则指令/寒暄照常，问答明说「答不上来」。false = 手动模式。
+    auto_start: true
+    server_binary: "tools/llama-b7376-bin-win-cpu-x64/llama-server.exe"
+    model_file: "models/llm/qwen2.5-3b-instruct-q4_k_m.gguf"
+    server_context: 4096           # llama-server -c（上下文窗口）
+    start_timeout_s: 60            # 模型加载等待上限；超时不杀进程，只如实报告未就绪
+    server_args: []                # 附加命令行参数，例如 ["-ngl", "99"]
+
   ask:
     # 问答/闲聊（「什么是量子力学」「你好」）。规则层命中 ASK 后走这里：
     # 本地模型自由生成、纯文本进出，**没有工具能力**（不会弹浏览器、不会动文件）。

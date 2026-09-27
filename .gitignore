@@ -275,3 +275,12 @@ api_key.txt
 *.credentials.yaml
 credentials.yaml
 .env.local
+
+# Setup wizard build artifacts (installer/build_runtime.py, build_installer.py).
+# All machine-specific and regenerable; _version.py is the build-time version stamp.
+installer/_cache/
+installer/_staging/
+installer/_dist/
+installer/_build/
+installer/payload/
+installer/wizard/core/_version.py

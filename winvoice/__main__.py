@@ -16,7 +16,9 @@ import signal
 from winvoice.audio import AudioPipeline, create_audio_stream, create_speech_player
 from winvoice.config import get_config, reset_config
 from winvoice.contracts import SystemState, ToolCall, ToolResult
+from winvoice.integrity import failures_by_model, verify_sealed_models
 from winvoice.intent.router import create_intent_router
+from winvoice.llm.server import LlamaServerManager
 from winvoice.logging import configure_logging, get_logger
 from winvoice.text import normalize_for_speech, segment_for_speech, speech_text_config
 from winvoice.tools.executor import create_tool_executor
@@ -36,6 +38,7 @@ class VoiceAssistant:
         self.intent_router = None
         self.tool_executor = None
         self.dsh_router = None
+        self.server_manager: LlamaServerManager | None = None
         self._running = False
 
     # ── lifecycle ──────────────────────────────────────────────
@@ -47,6 +50,22 @@ class VoiceAssistant:
         cfg.start_watching()
 
         configure_logging(process_name="main", level="INFO")
+
+        # Integrity quick check (sizes only) before any engine loads a model:
+        # a truncated model should be named *before* it fails to load.
+        report = verify_sealed_models(deep=False)
+        if not report.ok:
+            print("[!] Model integrity check failed - see the model_integrity_failed log entries.")
+
+        # The local model server. Reuses one that is already running; spawns
+        # our own when `llm.local.auto_start` allows and none answers. The
+        # first spawn includes the model load, so this may block for a while
+        # *before* the audio engines initialize — nothing else runs yet.
+        # Stub mode is model-free by definition and never touches the server.
+        self.server_manager = None
+        if not self.use_stub:
+            self.server_manager = LlamaServerManager()
+            self.server_manager.ensure_running()
 
         self.intent_router = create_intent_router()
         self.tool_executor = create_tool_executor()
@@ -113,7 +132,7 @@ class VoiceAssistant:
         return router
 
     async def shutdown(self) -> None:
-        """Release the agent's subprocess and the audio output device."""
+        """Release the agent's subprocess, our llama-server and the audio output device."""
         if self.pipeline is not None:
             try:
                 await self.pipeline.shutdown()
@@ -124,6 +143,9 @@ class VoiceAssistant:
                 await self.dsh_router.close()
             except Exception as e:
                 logger.warning("dsh_shutdown_failed", error=str(e))
+        if self.server_manager is not None:
+            # Only a server WE spawned is terminated; a reused one stays.
+            self.server_manager.shutdown()
 
     async def run(self) -> None:
         self._running = True
@@ -202,54 +224,84 @@ async def run_check(config_path: str, use_stub: bool) -> int:
         print(f"\n[X] Startup check FAILED: {type(e).__name__}: {e}")
         return 1
 
-    pipe = assistant.pipeline
-    rows = [
-        ("KWS  (wake word)", getattr(pipe.kws, "model_dir", None)),
-        ("VAD  (silence)", getattr(pipe.vad, "model_path", None)),
-        ("ASR  (speech->text)", getattr(pipe.asr, "model_path", None)),
-        ("SV   (speaker ID)", getattr(pipe.sv, "model_path", None)),
-        ("TTS  (text->speech)", getattr(getattr(pipe.tts, "model", None), "model_file", None)
-         or getattr(pipe.tts, "model_dir", None)),
-    ]
+    try:
+        pipe = assistant.pipeline
+        rows = [
+            ("KWS  (wake word)", getattr(pipe.kws, "model_dir", None)),
+            ("VAD  (silence)", getattr(pipe.vad, "model_path", None)),
+            ("ASR  (speech->text)", getattr(pipe.asr, "model_path", None)),
+            ("SV   (speaker ID)", getattr(pipe.sv, "model_path", None)),
+            ("TTS  (text->speech)", getattr(getattr(pipe.tts, "model", None), "model_file", None)
+             or getattr(pipe.tts, "model_dir", None)),
+        ]
 
-    print("\n  Engines loaded:")
-    for label, path in rows:
-        print(f"    [OK] {label:<22} {path}")
+        print("\n  Engines loaded:")
+        for label, path in rows:
+            print(f"    [OK] {label:<22} {path}")
 
-    if not use_stub:
-        print("\n  Details:")
-        print(f"    SV embedding dim   : {pipe.sv.embedding_dim}")
-        print(f"    TTS backend        : {getattr(getattr(pipe.tts, 'model', None), 'backend', '?')}")
-        print(f"    TTS sample rate    : {pipe.tts.sample_rate} Hz")
-        print(f"    TTS speakers       : {pipe.tts.num_speakers}")
-        print(f"    ASR mode           : {'streaming' if pipe.asr.streaming else 'sense-voice (offline)'}")
+        if not use_stub:
+            print("\n  Details:")
+            print(f"    SV embedding dim   : {pipe.sv.embedding_dim}")
+            print(f"    TTS backend        : {getattr(getattr(pipe.tts, 'model', None), 'backend', '?')}")
+            print(f"    TTS sample rate    : {pipe.tts.sample_rate} Hz")
+            print(f"    TTS speakers       : {pipe.tts.num_speakers}")
+            print(f"    ASR mode           : {'streaming' if pipe.asr.streaming else 'sense-voice (offline)'}")
 
-    # Segmentation is what decides how the assistant sounds, so the check prints
-    # it: the same information `scripts/show_segmentation.py` gives, for the
-    # configuration that is actually loaded.
-    speech = speech_text_config()
-    sample = "我先把桌面上那份重要的文件保存好，接下来我会把处理结果告诉你。"
-    print("\n  Spoken output (segmentation and pauses):")
-    print(f"    budget             : {speech.max_chars} chars "
-          f"(agent replies {speech.reply_max_chars}), tail silence {speech.tail_silence_ms}ms")
-    print(f"    trim edge silence  : {speech.trim_silence} "
-          f"(ratio {speech.trim_ratio}, guard {speech.trim_guard_ms}ms)")
-    print(f"    seg {sample}")
-    for index, segment in enumerate(segment_for_speech(normalize_for_speech(sample, max_chars=240), speech)):
-        print(f"      {index}: {segment.chars:>3} chars  pause {segment.pause_after_ms:>4}ms  "
-              f"[{segment.kind}] {segment.text}")
+        # The local model server the assistant just ensured is running
+        # (spawned by initialize, or reused from a terminal you started).
+        print("\n  Local LLM server:")
+        server = assistant.server_manager
+        if server is not None and server.is_healthy():
+            print(f"    [OK] llama-server     : {server.server_root} reachable")
+        else:
+            print(f"    [ ] llama-server     : not reachable ({server.server_root if server else 'n/a'}) - "
+                  "rule tier and small talk still work")
 
-    print("\n  Intent rules:")
-    from winvoice.intent.rules import match_rules
+        # Integrity report (deep: every sealed file is hashed here, so a
+        # same-size corruption is caught too).
+        print("\n  Model integrity:")
+        report = verify_sealed_models(deep=True)
+        if not report.sealed:
+            print("    [ ] not sealed - run: python scripts/download_models.py --seal")
+        elif report.ok:
+            print(f"    [OK] {report.checked} files match the seal")
+        else:
+            for _model_dir, fails in failures_by_model(report).items():
+                for failure in fails:
+                    print(f"    [X] {failure['reason']}: models/{failure['path']}")
+            print("    Re-download the listed model(s) or re-seal if the change was intended.")
+            return 1
 
-    for probe in ("打开记事本", "音量调大 20", "播放音乐"):
-        hit = match_rules(probe)
-        print(f"    {probe:<14} -> {hit.intent.value if hit else 'no rule match'}")
+        # Segmentation is what decides how the assistant sounds, so the check prints
+        # it: the same information `scripts/show_segmentation.py` gives, for the
+        # configuration that is actually loaded.
+        speech = speech_text_config()
+        sample = "我先把桌面上那份重要的文件保存好，接下来我会把处理结果告诉你。"
+        print("\n  Spoken output (segmentation and pauses):")
+        print(f"    budget             : {speech.max_chars} chars "
+              f"(agent replies {speech.reply_max_chars}), tail silence {speech.tail_silence_ms}ms")
+        print(f"    trim edge silence  : {speech.trim_silence} "
+              f"(ratio {speech.trim_ratio}, guard {speech.trim_guard_ms}ms)")
+        print(f"    seg {sample}")
+        for index, segment in enumerate(segment_for_speech(normalize_for_speech(sample, max_chars=240), speech)):
+            print(f"      {index}: {segment.chars:>3} chars  pause {segment.pause_after_ms:>4}ms  "
+                  f"[{segment.kind}] {segment.text}")
 
-    print("\n" + "=" * 68)
-    print("[OK] Startup check PASSED - all engines initialize with the current config")
-    print("=" * 68)
-    return 0
+        print("\n  Intent rules:")
+        from winvoice.intent.rules import match_rules
+
+        for probe in ("打开记事本", "音量调大 20", "播放音乐"):
+            hit = match_rules(probe)
+            print(f"    {probe:<14} -> {hit.intent.value if hit else 'no rule match'}")
+
+        print("\n" + "=" * 68)
+        print("[OK] Startup check PASSED - all engines initialize with the current config")
+        print("=" * 68)
+        return 0
+    finally:
+        # Cleans up engines *and* any llama-server this check spawned; a
+        # server you started yourself is reused and left alone.
+        await assistant.shutdown()
 
 
 # ──────────────────────────────────────────────────────────────

@@ -47,13 +47,23 @@ class IntentRouter:
         """
         trace_id = getattr(self, "_current_trace_id", "")
 
-        # Tier 1: Rules
+        # Tier 1: Rules. A WRITE_FILE match with no extracted arguments is
+        # kept only to shield its path from the search hijack — the words
+        # themselves carry no path/content, and returning it would refuse a
+        # request the classifier can fill (「写入文件 桌面x.txt」 was a dead end
+        # while llama-server was up; live report 2026-09-27). Fall through and
+        # let tier 2 argue about it.
         rule_result = match_rules(text)
         if rule_result:
-            rule_result.trace_id = trace_id
-            rule_result.raw_text = text
-            logger.info("intent_rule_matched", intent=rule_result.intent.value, confidence=rule_result.confidence)
-            return rule_result
+            write_without_args = (
+                rule_result.intent == IntentName.WRITE_FILE and not rule_result.args
+            )
+            if not write_without_args:
+                rule_result.trace_id = trace_id
+                rule_result.raw_text = text
+                logger.info("intent_rule_matched", intent=rule_result.intent.value, confidence=rule_result.confidence)
+                return rule_result
+            logger.info("intent_rule_matched_needs_args", intent=rule_result.intent.value)
 
         # Tier 2: Local LLM
         try:

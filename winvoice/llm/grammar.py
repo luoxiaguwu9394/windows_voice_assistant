@@ -50,7 +50,7 @@ INTENT_ARG_SPEC: Dict[IntentName, str] = {
     IntentName.MEDIA_CONTROL: '{"action": "play|pause|next|prev"}',
     IntentName.SEARCH_WEB: '{"query": "<search terms>"}',
     IntentName.READ_FILE: '{"path": "<file path>"}',
-    IntentName.WRITE_FILE: '{"path": "<file path>", "content": "<text>"}',
+    IntentName.WRITE_FILE: '{"path": "<file path>", "content": "<text, optional>"}   (no content → create an empty file)',
     IntentName.RUN_SCRIPT: '{"path": "<script path>"}',
     IntentName.GET_TIME: "{}",
     IntentName.GET_WEATHER: '{"city": "<city name>"} or {}   (empty → the configured city)',

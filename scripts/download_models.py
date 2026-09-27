@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
 import sys
 import tarfile
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -231,6 +233,59 @@ CORE_KEYS = [
 
 _HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
+# Hugging Face endpoints can be redirected to a mirror (e.g. hf-mirror.com for
+# machines that cannot reach huggingface.co directly). Only the scheme+host is
+# rewritten; GitHub release assets are untouched and need a proxy instead.
+HF_URL_PREFIX = "https://huggingface.co"
+HF_ENDPOINT_ENV = "WINVOICE_HF_ENDPOINT"
+
+
+def rewrite_hf_url(url: str, endpoint: Optional[str] = None) -> str:
+    """Point a Hugging Face URL at a mirror endpoint (env or explicit)."""
+    endpoint = (endpoint if endpoint is not None else os.environ.get(HF_ENDPOINT_ENV, "")) or ""
+    endpoint = endpoint.strip().rstrip("/")
+    if not endpoint or not url.startswith(HF_URL_PREFIX):
+        return url
+    return endpoint + url[len(HF_URL_PREFIX):]
+
+
+class ProgressReporter:
+    """
+    Progress output for humans or for a driving process (the setup wizard).
+
+    Machine mode emits tab-separated one-liners on stdout, flushed immediately
+    so the wizard can stream them:
+
+        MODEL\t<key>\t<note>
+        PROGRESS\t<key>\t<done_bytes>\t<total_bytes>
+        RESULT\t<key>\tok|fail\t<detail>
+
+    Human mode keeps the historical prints and adds nothing.
+    """
+
+    def __init__(self, machine: bool = False):
+        self.machine = machine
+        self._last_emit: dict[str, tuple[float, int]] = {}
+
+    def model(self, key: str, note: str) -> None:
+        if self.machine:
+            print(f"MODEL\t{key}\t{note}", flush=True)
+
+    def bytes(self, key: str, done: int, total: int) -> None:
+        if not self.machine:
+            return
+        now = time.monotonic()
+        last_time, last_done = self._last_emit.get(key, (0.0, -1))
+        step = max(total // 100, 1 << 20) if total else 1 << 20
+        if done < total and done - last_done < step and now - last_time < 1.0:
+            return
+        self._last_emit[key] = (now, done)
+        print(f"PROGRESS\t{key}\t{done}\t{total}", flush=True)
+
+    def result(self, key: str, ok: bool, detail: str = "") -> None:
+        if self.machine:
+            print(f"RESULT\t{key}\t{'ok' if ok else 'fail'}\t{detail}", flush=True)
+
 
 # ──────────────────────────────────────────────────────────────
 # Helpers
@@ -262,8 +317,10 @@ def human(n: int) -> str:
 # ──────────────────────────────────────────────────────────────
 
 def download_file(url: str, dest: Path, expected_sha256: Optional[str] = None,
-                  resume: bool = True) -> bool:
+                  resume: bool = True, reporter: Optional[ProgressReporter] = None,
+                  key: str = "") -> bool:
     """Stream a URL to `dest` atomically, with resume and optional SHA256 check."""
+    reporter = reporter or ProgressReporter()
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
 
@@ -284,7 +341,8 @@ def download_file(url: str, dest: Path, expected_sha256: Optional[str] = None,
                 # Range not satisfiable -> already complete, restart clean
                 print("  Server rejected range; restarting download")
                 part.unlink(missing_ok=True)
-                return download_file(url, dest, expected_sha256, resume=False)
+                return download_file(url, dest, expected_sha256, resume=False,
+                                     reporter=reporter, key=key)
 
             r.raise_for_status()
 
@@ -297,10 +355,13 @@ def download_file(url: str, dest: Path, expected_sha256: Optional[str] = None,
                 if resume_from and total:
                     bar.update(resume_from)
                 with open(part, mode) as f:
+                    written = resume_from
                     for chunk in r.iter_content(chunk_size=1 << 16):
                         if chunk:
                             f.write(chunk)
+                            written += len(chunk)
                             bar.update(len(chunk))
+                            reporter.bytes(key, written, total)
 
         # Integrity
         actual = sha256_of(part)
@@ -341,34 +402,43 @@ def extract_archive(archive: Path, out_dir: Path) -> bool:
         return False
 
 
-def download_model(key: str, models_dir: Path, force: bool = False) -> bool:
+def download_model(key: str, models_dir: Path, force: bool = False,
+                   reporter: Optional[ProgressReporter] = None) -> bool:
     """Download (and extract) one manifest entry."""
+    reporter = reporter or ProgressReporter()
     info = MANIFEST[key]
     dest = models_dir / info["dest"]
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"\n>> {key} - {info['note']}")
     print(f"  -> {dest}")
+    reporter.model(key, info["note"])
 
     # Already present?
     if dest.exists() and not force:
         if is_real_hash(info.get("sha256")) and dest.is_file():
             if sha256_of(dest).lower() == info["sha256"].lower():
                 print("  [OK] Already present and SHA256-verified")
+                reporter.result(key, True, "already present")
                 return True
             print("  ! Existing file failed SHA256 - re-downloading")
         else:
             print("  [OK] Already present (use --force to re-download)")
+            reporter.result(key, True, "already present")
             return True
 
-    ok = download_file(info["url"], dest, info.get("sha256"))
+    ok = download_file(rewrite_hf_url(info["url"]), dest, info.get("sha256"),
+                       reporter=reporter, key=key)
     if not ok:
+        reporter.result(key, False, "download failed")
         return False
 
     if info.get("extract"):
         if not extract_archive(dest, dest.parent):
+            reporter.result(key, False, "extraction failed")
             return False
 
+    reporter.result(key, True, "downloaded")
     return True
 
 
@@ -397,14 +467,101 @@ def build_parser() -> argparse.ArgumentParser:
                    help="download all core models (no LLM)")
     p.add_argument("--all-with-llm", action="store_true",
                    help="download all core models + recommended 3B LLM")
+    p.add_argument("--only", default=None, metavar="KEY[,KEY...]",
+                   help="download exactly these comma-separated manifest keys "
+                        "(the setup wizard uses this; implies no group flags)")
     p.add_argument("--force", action="store_true", help="re-download even if present")
+    p.add_argument("--hf-endpoint", default=None, metavar="URL",
+                   help=f"rewrite {HF_URL_PREFIX} URLs to this mirror (default: "
+                        f"env {HF_ENDPOINT_ENV}; GitHub URLs are unaffected)")
+    p.add_argument("--progress-fmt", choices=("human", "machine"), default="human",
+                   help="machine = tab-separated MODEL/PROGRESS/RESULT lines for "
+                        "a driving process (the setup wizard)")
     p.add_argument("--list", action="store_true", help="list manifest entries and exit")
+    p.add_argument("--seal", action="store_true",
+                   help="fingerprint models/ into models/integrity.json for startup "
+                        "integrity checks (no download)")
+    p.add_argument("--model", dest="seal_model", default=None, metavar="KEY",
+                   help="with --seal: (re)seal only this manifest key's directory, "
+                        "keeping the rest of an existing seal")
     return p
+
+
+def _run_seal(args, models_dir: Path) -> int:
+    """`--seal`: fingerprint the local models tree (optionally one entry)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from winvoice.integrity import seal_models
+
+    sub_dir: Path | None = None
+    if args.seal_model:
+        info = MANIFEST.get(args.seal_model)
+        if info is None:
+            known = ", ".join(sorted(MANIFEST))
+            print(f"[X] Unknown model key: {args.seal_model}\n    Known keys: {known}")
+            return 2
+        sub_dir = (models_dir / info["dest"]).parent.relative_to(models_dir)
+
+    scope = f"models/{sub_dir.as_posix()}/" if sub_dir is not None else "models/ (all)"
+    print("=" * 68)
+    print("Windows Voice Assistant - seal model integrity")
+    print(f"Scope  : {scope}")
+    print("This fingerprints the files AS THEY ARE NOW (trust-on-first-use).")
+    print("=" * 68)
+
+    seal_path = seal_models(models_dir, sub_dir=sub_dir)
+    if seal_path is None:
+        print(f"\n[X] Nothing to seal under {models_dir}")
+        return 1
+
+    import json
+
+    payload = json.loads(seal_path.read_text(encoding="utf-8"))
+    print(f"\n[OK] Sealed {len(payload['files'])} files -> {seal_path}")
+    print("     sealed_at: " + str(payload.get("sealed_at")))
+    print("     Startup and `python -m winvoice --check` now verify against this.")
+    return 0
+
+
+def resolve_selection(args: argparse.Namespace) -> list[str]:
+    """Turn the CLI selection flags into an ordered list of manifest keys."""
+    only = (getattr(args, "only", None) or "").strip()
+    if only:
+        keys = [k.strip() for k in only.split(",") if k.strip()]
+        unknown = [k for k in keys if k not in MANIFEST]
+        if unknown:
+            raise SystemExit(
+                f"[X] Unknown model key(s): {', '.join(unknown)}\n"
+                f"    Known keys: {', '.join(sorted(MANIFEST))}"
+            )
+        return [k for k in MANIFEST if k in set(keys)]
+
+    selected: list[str] = []
+    for flag, keys in GROUPS.items():
+        if getattr(args, flag.replace("-", "_").replace(".", "_"), False):
+            selected.extend(keys)
+
+    if args.all_with_llm:
+        return list(CORE_KEYS) + list(GROUPS["llm"])
+    if args.all:
+        return list(CORE_KEYS)
+    if selected:
+        return selected
+
+    print("No selection given - downloading all core models (no LLM).")
+    print("Use --list to see options, --llm to add the local model.\n")
+    return list(CORE_KEYS)
 
 
 def main() -> int:
     args = build_parser().parse_args()
+
+    if args.hf_endpoint:
+        os.environ[HF_ENDPOINT_ENV] = args.hf_endpoint
+    reporter = ProgressReporter(machine=args.progress_fmt == "machine")
     models_dir = Path(args.models_dir).expanduser().resolve()
+
+    if args.seal:
+        return _run_seal(args, models_dir)
 
     if args.list:
         print(f"Manifest ({len(MANIFEST)} entries):\n")
@@ -415,26 +572,11 @@ def main() -> int:
             print(f"      [{flag}, {kind}] {info['note']}")
             print(f"      -> {models_dir / info['dest']}")
         print("\nFlags: " + ", ".join(f"--{k}" for k in GROUPS))
-        print("       --all, --all-with-llm, --force, --list")
+        print("       --all, --all-with-llm, --only, --force, --list")
         return 0
 
-    # Resolve selection
-    selected: list[str] = []
-    for flag, keys in GROUPS.items():
-        if getattr(args, flag.replace("-", "_").replace(".", "_"), False):
-            selected.extend(keys)
-
-    if args.all_with_llm:
-        selected = CORE_KEYS + GROUPS["llm"]
-    elif args.all:
-        selected = list(CORE_KEYS)
-    elif not selected:
-        print("No selection given - downloading all core models (no LLM).")
-        print("Use --list to see options, --llm to add the local model.\n")
-        selected = list(CORE_KEYS)
-
     # De-dupe, keep manifest order
-    selected = [k for k in MANIFEST if k in set(selected)]
+    selected = [k for k in MANIFEST if k in set(resolve_selection(args))]
 
     print("=" * 68)
     print(f"Windows Voice Assistant - model download")
@@ -445,7 +587,7 @@ def main() -> int:
     failed: list[str] = []
     for key in selected:
         try:
-            if not download_model(key, models_dir, force=args.force):
+            if not download_model(key, models_dir, force=args.force, reporter=reporter):
                 failed.append(key)
         except KeyboardInterrupt:
             print("\nInterrupted by user.")

@@ -44,24 +44,52 @@ def find_dsh() -> str | None:
     return shutil.which("dsh")
 
 
-def run_dsh(dsh_bin: str, args: list[str], env: dict[str, str]) -> subprocess.CompletedProcess:
+def bundled_dsh_command() -> list[str] | None:
     """
-    Invoke `dsh`.
+    The dsh CLI via the bundled runtime package, no PATH/npm needed.
+
+    `deepseek-harness-runtime-bin` ships the runtime exe *and* the `dsh`
+    console entry point (`deepseek_harness_runtime:main`). A machine that
+    installed DSH with `pip install --target .pylibs` — the documented manual
+    flow, and what the setup wizard bundles — has no `dsh` on PATH, but this
+    runs the identical command grammar through the identical code.
+    """
+    try:
+        from winvoice import _vendor
+
+        _vendor.ensure("deepseek_harness_runtime")
+        import deepseek_harness_runtime  # noqa: F401
+    except ImportError:
+        return None
+    return [sys.executable, "-c", "from deepseek_harness_runtime import main; main()"]
+
+
+def resolve_dsh_command() -> list[str] | None:
+    """PATH `dsh` first (npm install), then the bundled runtime entry point."""
+    dsh_bin = find_dsh()
+    if dsh_bin:
+        return [dsh_bin]
+    return bundled_dsh_command()
+
+
+def run_dsh(command: list[str], args: list[str], env: dict[str, str]) -> subprocess.CompletedProcess:
+    """
+    Invoke `dsh` with `args` appended.
 
     On Windows `shutil.which("dsh")` resolves to the npm `dsh.cmd` shim, which
     CreateProcess cannot execute directly — it needs a shell. The same reasoning
-    as `winvoice/tools/builtin.py:_launch`, and the same guard.
+    as `winvoice/tools/builtin.py:_launch`, and the same guard. The bundled
+    form ([python, "-c", ...]) is a plain executable list and needs no shell.
     """
-    if os.name == "nt" and Path(dsh_bin).suffix.lower() in (".cmd", ".bat"):
-        command = [os.environ.get("COMSPEC", "cmd.exe"), "/c", dsh_bin, *args]
-    else:
-        command = [dsh_bin, *args]
+    head = command[0]
+    if os.name == "nt" and len(command) == 1 and Path(head).suffix.lower() in (".cmd", ".bat"):
+        command = [os.environ.get("COMSPEC", "cmd.exe"), "/c", head]
     # Explicit UTF-8 with replacement: the console default on this platform is
     # GBK, and `--dump-config` output contains characters outside it, which made
     # a plain `text=True` run die with UnicodeDecodeError *after* a successful
     # install and report the install as failed.
     return subprocess.run(
-        command,
+        [*command, *args],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -99,11 +127,13 @@ def main() -> int:
     print(f"tool server   : {sys.executable} -m winvoice.mcp_server")
     print(f"tools appear  : mcp__{settings.bridge.server_name}__<tool>")
 
-    dsh_bin = find_dsh()
+    dsh_command = resolve_dsh_command()
     install_cmd = ["plugin", "--profile", profile, "add", f"file:{bundle.as_posix()}"]
 
-    if not dsh_bin:
-        print("\n[!] `dsh` is not on PATH. Install DeepSeek Harness first, then re-run with --install.")
+    if not dsh_command:
+        print("\n[!] No dsh runtime available. Either install DeepSeek Harness on PATH"
+              "\n    or add the runtime package to .pylibs:"
+              "\n    python -m pip install --target .pylibs deepseek-harness-runtime-bin")
         print(f"    would run: dsh {' '.join(install_cmd)}")
         return 1 if (args.install or args.verify) else 0
 
@@ -112,7 +142,7 @@ def main() -> int:
 
     if args.install:
         print(f"\n$ dsh {' '.join(install_cmd)}")
-        proc = run_dsh(dsh_bin, install_cmd, env)
+        proc = run_dsh(dsh_command, install_cmd, env)
         tail = (proc.stderr or proc.stdout or "").strip()
         if proc.returncode != 0:
             print(f"[X] install failed (exit {proc.returncode}):\n{tail[-1500:]}")
@@ -122,7 +152,7 @@ def main() -> int:
 
     if args.verify or args.install:
         print(f"\n$ dsh --profile {profile} --dump-config")
-        proc = run_dsh(dsh_bin, ["--profile", profile, "--dump-config"], env)
+        proc = run_dsh(dsh_command, ["--profile", profile, "--dump-config"], env)
         composed = (proc.stdout or "") + (proc.stderr or "")
         if ROW_MARKER in composed:
             print(f"[OK] {ROW_MARKER} is present in the composed configuration")

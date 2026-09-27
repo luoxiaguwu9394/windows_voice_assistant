@@ -112,6 +112,14 @@ REQUIRES_RESTART: Set[str] = {
     "llm.local.base_url",
     "llm.local.api_key",
     "llm.local.model",
+    # llama-server lifecycle: the manager reads these when the assistant
+    # starts (and only spawns from a fresh config), so a change means restart.
+    "llm.local.auto_start",
+    "llm.local.server_binary",
+    "llm.local.model_file",
+    "llm.local.server_context",
+    "llm.local.start_timeout_s",
+    "llm.local.server_args",
     "tts.model",
     "tts.fallback_models",
     "tts.backend",

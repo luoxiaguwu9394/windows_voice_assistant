@@ -29,6 +29,9 @@ CONFIRMATION_REQUIRED = (
     "CONFIRMATION_REQUIRED: Write content to a file. Call again with confirmed=true."
 )
 
+# The spoken answer as the VAD delivered it (speech-only audio).
+_SEGMENT = SimpleNamespace(samples=b"" * 3200, duration_ms=600)
+
 
 class _RecordingTts:
     def __init__(self) -> None:
@@ -135,7 +138,7 @@ async def test_the_pending_call_is_replayed_verbatim() -> None:
     pipe, executor = await _arm_write_confirmation()
     original = pipe._pending_confirmation.call
 
-    await pipe._resolve_confirmation(AsrResult(text="确认", language="zh", confidence=0.9))
+    await pipe._resolve_confirmation(AsrResult(text="确认", language="zh", confidence=0.9), _SEGMENT)
 
     assert len(executor.calls) == 2
     replayed, confirmed = executor.calls[1]
@@ -152,7 +155,7 @@ async def test_the_pending_call_is_replayed_verbatim() -> None:
 async def test_cancel_does_not_execute() -> None:
     pipe, executor = await _arm_write_confirmation()
 
-    await pipe._resolve_confirmation(AsrResult(text="取消", language="zh", confidence=0.9))
+    await pipe._resolve_confirmation(AsrResult(text="取消", language="zh", confidence=0.9), _SEGMENT)
 
     assert len(executor.calls) == 1, "the cancelled call ran anyway"
     assert "先不做了" in pipe.tts.spoken[-1]
@@ -163,7 +166,7 @@ async def test_cancel_does_not_execute() -> None:
 async def test_deny_words_win_over_confirm_words() -> None:
     pipe, executor = await _arm_write_confirmation()
 
-    await pipe._resolve_confirmation(AsrResult(text="不要确认", language="zh", confidence=0.9))
+    await pipe._resolve_confirmation(AsrResult(text="不要确认", language="zh", confidence=0.9), _SEGMENT)
 
     assert len(executor.calls) == 1
 
@@ -179,7 +182,8 @@ async def test_an_unrelated_answer_cancels_and_reroutes() -> None:
     pipe.asr = _FixedAsr("现在几点了")
     pipe.vad = _EmittingVad(b"\x00\x01" * 160)
 
-    # A sentence that is neither 确认 nor 取消, arriving through the real tick.
+    # The echo-decay window has passed; the answer arrives through the real tick.
+    pipe._pending_confirmation.opened_at -= 1
     await pipe._tick(AUDIO_BLOCK)
     await asyncio.sleep(0.05)
     if pipe._turn_task is not None:
@@ -203,14 +207,142 @@ async def test_silence_expires_the_pending_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_confirmer_is_verified_on_the_spoken_segment() -> None:
+    """
+    Live bug (2026-09-27): the owner's short 确认 was graded as **guest** on
+    every attempt. The verifier ran over the rolling microphone window, which
+    at confirmation time holds mostly the VAD's trailing silence (and a
+    possible speaker echo) — the embedding degraded and the owner dropped a
+    tier. The spoken VAD segment is what must be verified.
+    """
+    pipe, _executor = await _arm_write_confirmation()
+    seen = {}
+
+    def fake_verify(frames, speaker_id="me", adaptive=True):
+        seen["frames"] = frames
+        return SimpleNamespace(tier="full", score=0.7)
+
+    pipe.sv = SimpleNamespace(enabled=True, verify=fake_verify)
+
+    await pipe._resolve_confirmation(
+        AsrResult(text="确认", language="zh", confidence=0.9), _SEGMENT
+    )
+
+    assert seen["frames"] is _SEGMENT.samples, "verified the room window, not the speech"
+
+
+@pytest.mark.asyncio
+async def test_a_speech_only_verification_no_longer_downgrades_the_owner() -> None:
+    """Window grading said guest; the spoken segment says full → confirm runs."""
+    pipe, executor = await _arm_write_confirmation()
+
+    def downgrade_windows(frames, speaker_id="me", adaptive=True):
+        if frames is _SEGMENT.samples:
+            return SimpleNamespace(tier="full", score=0.7)
+        return SimpleNamespace(tier="guest", score=0.5)
+
+    pipe.sv = SimpleNamespace(enabled=True, verify=downgrade_windows)
+
+    await pipe._resolve_confirmation(AsrResult(text="确认", language="zh", confidence=0.9), _SEGMENT)
+
+    assert len(executor.calls) == 2 and executor.calls[1][1] is True, "the owner was refused again"
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_voiceprint_asks_once_more_and_keeps_the_request() -> None:
+    """
+    A voiceprint below every band is a misread of a short utterance, not an
+    authenticated impostor: the request stays armed and the assistant asks
+    again (once). A guest simply fails again — nobody is promoted by a retry.
+    """
+    pipe, executor = await _arm_write_confirmation()
+    pipe.sv = SimpleNamespace(
+        enabled=True,
+        verify=lambda frames, adaptive=True: SimpleNamespace(tier="rejected", score=0.3),
+    )
+
+    await pipe._resolve_confirmation(AsrResult(text="确认", language="zh", confidence=0.9), _SEGMENT)
+
+    assert len(executor.calls) == 1, "the call ran on an unverified voice"
+    assert pipe._pending_confirmation is not None, "the request was dropped"
+    assert pipe._pending_confirmation.retries == 1
+    assert "没有听清" in pipe.tts.spoken[-1]
+    assert pipe.state == PipelineState.CONFIRMING
+
+
+@pytest.mark.asyncio
+async def test_a_second_rejection_ends_the_flow() -> None:
+    pipe, executor = await _arm_write_confirmation()
+    pipe.sv = SimpleNamespace(
+        enabled=True,
+        verify=lambda frames, adaptive=True: SimpleNamespace(tier="rejected", score=0.3),
+    )
+
+    await pipe._resolve_confirmation(AsrResult(text="确认", language="zh", confidence=0.9), _SEGMENT)
+    await pipe._resolve_confirmation(AsrResult(text="确认", language="zh", confidence=0.9), _SEGMENT)
+
+    assert pipe._pending_confirmation is None
+    assert len(executor.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_confirmation_verifier_never_teaches_the_profile() -> None:
+    """
+    The EMA drift from gate-only verifications poisoned the profile until the
+    owner scored 0.32 against their own voice: grading a confirmation must
+    never update the enrolled embeddings.
+    """
+    pipe, _executor = await _arm_write_confirmation()
+    kwargs_seen = {}
+
+    def fake_verify(frames, speaker_id="me", adaptive=True):
+        kwargs_seen["adaptive"] = adaptive
+        return SimpleNamespace(tier="full", score=0.7)
+
+    pipe.sv = SimpleNamespace(enabled=True, verify=fake_verify)
+
+    await pipe._resolve_confirmation(AsrResult(text="确认", language="zh", confidence=0.9), _SEGMENT)
+
+    assert kwargs_seen["adaptive"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_mic_ignores_the_echo_window_right_after_the_question() -> None:
+    """
+    The tail of the spoken question reaches the microphone as room echo; if
+    VAD is fed immediately, the echo is transcribed as (and voiceprinted as)
+    the beginning of the answer.
+    """
+    pipe, _executor = await _arm_write_confirmation()
+    fed = []
+
+    class _CountingVad:
+        def accept_waveform(self, chunk):
+            fed.append(chunk)
+            return []
+
+        def reset(self):
+            pass
+
+    pipe.vad = _CountingVad()
+    # opened_at is "now" (just armed) — the echo guard must hold.
+    await pipe._tick(AUDIO_BLOCK)
+    assert fed == [], "VAD was fed during the echo-decay window"
+
+    pipe._pending_confirmation.opened_at -= 1  # decay passed
+    await pipe._tick(AUDIO_BLOCK)
+    assert fed, "VAD never fed after the echo window"
+
+
+@pytest.mark.asyncio
 async def test_a_second_speaker_cannot_confirm() -> None:
     pipe, executor = await _arm_write_confirmation()
     pipe.sv = SimpleNamespace(
         enabled=True,
-        verify=lambda frames: SimpleNamespace(tier="guest", score=0.5),
+        verify=lambda frames, adaptive=True: SimpleNamespace(tier="guest", score=0.5),
     )
 
-    await pipe._resolve_confirmation(AsrResult(text="确认", language="zh", confidence=0.9))
+    await pipe._resolve_confirmation(AsrResult(text="确认", language="zh", confidence=0.9), _SEGMENT)
 
     assert len(executor.calls) == 1, "the call ran for the wrong speaker"
     assert "确认" in pipe.tts.spoken[-1] or "先不做了" in pipe.tts.spoken[-1]
@@ -238,7 +370,7 @@ async def test_an_explicit_search_asks_before_opening_the_browser() -> None:
     assert pipe.state == PipelineState.CONFIRMING
     assert "量子力学" in pipe.tts.spoken[-1]
 
-    await pipe._resolve_confirmation(AsrResult(text="确认", language="zh", confidence=0.9))
+    await pipe._resolve_confirmation(AsrResult(text="确认", language="zh", confidence=0.9), _SEGMENT)
     assert len(executor.calls) == 1 and executor.calls[0][1] is True
 
 

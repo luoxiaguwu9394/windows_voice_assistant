@@ -95,6 +95,14 @@ class ToolExecutor:
         # until now nobody passed one in, so every call was checked as `full`.
         error = self.registry.validate_call(call.tool, call.args, tier=effective_tier)
         if error:
+            # A tier refusal and a schema mistake are different failures and
+            # must not share a sentence: 「这个操作我暂时不能替你做」 said to an
+            # owner whose utterance simply lacked the content argument is a
+            # non-answer (live report 2026-09-27). The spoken line follows the
+            # failure kind; the log keeps the precise reason either way.
+            tier_refusal = (
+                "not allowed for guest tier" in error or error == "Speaker rejected"
+            )
             logger.info(
                 "tool_call_rejected",
                 tool=call.tool.value,
@@ -105,7 +113,11 @@ class ToolExecutor:
                 tool=call.tool,
                 success=False,
                 error=error,
-                message=self._tier_message(effective_tier),
+                message=(
+                    self._tier_message(effective_tier)
+                    if tier_refusal
+                    else "我没听清这个操作的具体要求，请再说一遍。"
+                ),
             )
 
         # Confirmation check
@@ -264,12 +276,17 @@ class ToolExecutor:
         declares; passing the strings through happened to work, but left the
         call permanently untypeable.
         """
+        from .builtin import resolve_user_path
+
         paths: List[Path] = []
         for template in spec.modified_paths:
             # Simple template substitution: {args.key}
             for key, value in args.items():
                 template = template.replace(f"{{args.{key}}}", str(value))
-            paths.append(Path(template))
+            # Resolve the way the handler did: a spoken folder word
+            # (「桌面\x.txt」) must snapshot the real Desktop file, or the
+            # safety net silently guards a file that was never touched.
+            paths.append(Path(resolve_user_path(template)))
         return paths
 
     def get_pending_confirmation(self) -> Optional[ToolCall]:

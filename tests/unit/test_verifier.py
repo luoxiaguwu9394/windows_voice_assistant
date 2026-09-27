@@ -23,6 +23,13 @@ from typing import Dict, Optional, Set
 import pytest
 
 from winvoice.tools.state_capture import PathState
+def path_text(name: str) -> str:
+    # The verifier now resolves paths the way the handler does (backslashes on
+    # Windows), so the FakeProbe keys must be in the resolved form too.
+    from pathlib import Path
+    return str(Path("C:/Users/someone/Desktop") / name)
+
+
 from winvoice.tools.verifier import (
     CloseAppVerifier,
     OpenAppVerifier,
@@ -178,7 +185,7 @@ def test_close_app_fails_when_the_process_survives() -> None:
 # ──────────────────────────────────────────────────────────────
 
 def test_write_file_is_verified_when_content_matches() -> None:
-    path = "C:/Users/someone/Desktop/test.txt"
+    path = path_text("test.txt")
     probe = FakeProbe(files={path: "你好"})
 
     result = WriteFileVerifier().verify(
@@ -191,7 +198,7 @@ def test_write_file_is_verified_when_content_matches() -> None:
 
 def test_write_file_fails_when_content_differs() -> None:
     """「已经写好了。」 is not evidence; the bytes on disk are."""
-    path = "C:/Users/someone/Desktop/test.txt"
+    path = path_text("test.txt")
     probe = FakeProbe(files={path: "别的内容"})
 
     result = WriteFileVerifier().verify(
@@ -208,7 +215,7 @@ def test_write_file_fails_when_the_file_is_missing() -> None:
     probe = FakeProbe(files={})
 
     result = WriteFileVerifier().verify(
-        {"path": "C:/Users/someone/Desktop/gone.txt", "content": "x"},
+        {"path": path_text("gone.txt"), "content": "x"},
         {"success": True},
         None,
         probe,
@@ -219,7 +226,7 @@ def test_write_file_fails_when_the_file_is_missing() -> None:
 
 
 def test_write_file_capture_records_the_previous_state() -> None:
-    path = "C:/Users/someone/Desktop/existing.txt"
+    path = path_text("existing.txt")
     probe = FakeProbe(files={path: "old"})
 
     before = WriteFileVerifier().capture({"path": path}, probe)

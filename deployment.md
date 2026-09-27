@@ -2,11 +2,48 @@
 
 **目标环境**：Windows 10/11 x64 (Intel Core Ultra / 灵耀14 Air 推荐)
 **项目版本**：0.1.0-dev
-**更新时间**：2026-09-19
+**更新时间**：2026-09-27
 
 ---
 
-## 📋 部署清单概览
+## 0️⃣ 推荐路线：安装向导（一键部署）
+
+**从 Releases 下载 `WinVoice-Setup-<版本>.exe`，双击，跟着向导走完即可**，无需
+Python、pip、Git 或编译。向导依次完成：
+
+1. 系统检查 + 按内存推荐本地模型档位（0.5B/1.5B/3B）
+2. 安装位置（默认 `%LOCALAPPDATA%\WinVoice`；需要可写目录，勿装 Program Files）
+3. 网络（HTTP 代理 / Hugging Face 镜像 `hf-mirror.com`，带连通性测试）
+4. 解压内嵌运行时（Python 3.12 + 全部依赖 + llama.cpp b7376，**用户侧零 pip 零编译**）
+5. 模型下载（断点续传；跑完自动 `--seal` 生成 `models/integrity.json`）
+6. 音频设备选择 + 播放/录音实测（用与助手完全相同的播放路由逻辑）
+7. 个性化：默认城市、**唤醒词自定义**（2–12 字，最多 8 个，改词重启即生效）、
+   DSH Agent 开关、云端 key（`REMOTE_API_KEY` / `DEEPSEEK_API_KEY` 自动 `setx`）
+8. DSH 桥接安装（走捆绑运行时，无需 npm/Node）
+9. 声纹注册（可选，可后补）
+10. `python -m winvoice --check` 自检 + 桌面/开始菜单快捷方式 + 可选开机自启
+
+**升级**：重新运行安装器 → 识别已装版本 → 升级/修复（模型与配置保留；载荷不含
+用户数据，重解压天然安全）。**更新发现**：向导启动时自动比对新 Release 资产。
+**唤醒词后补修改**：编辑 `config/config.yaml` 的 `kws.keywords`（每行一条），
+重启助手即可——关键词缓存按内容自动重建。
+
+排障（向导路线）：
+
+| 现象 | 处理 |
+|---|---|
+| 双击 exe 无反应数秒 | onefile 每次启动要解压 ~160MB 载荷，等待即可 |
+| SmartScreen 拦截 | 「更多信息」→「仍要运行」（exe 未签名） |
+| 杀软报毒 | 未签名 PyInstaller 的常见误报；可加白名单。若误报严重换 onedir+zip 分发 |
+| 下载失败/超时 | 网络页配代理或 HF 镜像后重试；下载断点保留，重跑向导接着下 |
+| 路径含中文/空格警告 | 一般可用；遇到异常换纯英文无空格路径 |
+| 注册声纹没声音 | 检查 设置 → 隐私 → 麦克风 权限 |
+
+以下 §1–§8 为**手动部署路线**（开发者 / 需要完全掌控时使用）。
+
+---
+
+## 📋 部署清单概览（手动路线）
 
 | 阶段 | 预计耗时 | 关键产出 |
 |------|----------|----------|
@@ -362,6 +399,11 @@ llm:
     base_url: "http://localhost:8080/v1"    # llama-server 端口
     model: "qwen2.5-3b-instruct"            # 必须与下载的模型名一致
     confidence_threshold: 0.65              # 小模型阈值略低
+    auto_start: true                        # 启动时自动拉起 llama-server（已在跑则复用）
+    server_binary: "tools/llama-b7376-bin-win-cpu-x64/llama-server.exe"
+    model_file: "models/llm/qwen2.5-3b-instruct-q4_k_m.gguf"
+    server_context: 4096                    # llama-server -c
+    start_timeout_s: 60                     # 模型加载等待上限（超时不杀进程，只报告未就绪）
 
 audio:
   input_device: "default"                   # 或指定设备名
@@ -852,6 +894,13 @@ python scripts/calibrate_tts_pauses.py
 | 控制台刷 `OOV ... Ignore it!`（如 `OOV 90.`、`OOV app.`） | sherpa 中文 VITS 的**词表里没有任何拉丁词条**，数字靠 `number.fst` 展开。① 原文含英文 → 说明有工具把英文错误直接送进了 TTS（应走 `ToolResult.message`，中文面向用户，`error` 只进日志）② 数字被丢 → 检查 TTS 模型目录里 `number.fst` / `date.fst` / `phone.fst` 是否存在（引擎会把它们作为 `rule_fsts` 传入） |
 | 说「打开记事本」被拒绝 | 应用名按中文标签/英文 id/近似拼写解析（`记事本`、`notepad`、`Notpa` 都能命中）；不在白名单内的（微信/QQ）仍会拒绝。若要新增，改 `ALLOWED_APPS` + `APP_SPEECH` |
 | 关得掉记事本却关不掉代码编辑器（VS Code） | **已修复（2026-09-27）**：`ALLOWED_APPS["vscode"]` 存的是**启动命令** `code`（App Paths/PATH shim），而 `close_app` 与验证器把它当**进程名**用——不以 `.exe` 结尾直接进「我关不掉」分支。现在新增 `APP_PROCESS_IMAGES`（`vscode` → `Code.exe`）区分启动命令与进程映像，关闭与验证都盯真实进程。回归：`pytest tests/unit/test_close_app_safety.py` |
+| 说「在桌面建立一个txt文件」没有建成 | **已修复（2026-09-27）**：旧链路三处断点——①`content` 必填，而这句话本来就没有内容；②「桌面」没映射到真实桌面文件夹（会写到仓库里名为「桌面」的目录）；③校验失败念的是权限话术「这个操作我暂时不能替你做」。现在：无内容=建空文件（已存在则拒绝不覆盖）、口语文件夹词映射（桌面/下载/文档/图片/音乐/视频）、校验失败明说「没听清具体要求」。验证器与快照同样用映射后的路径。回归：`pytest tests/unit/test_write_file_flow.py` |
+| 本地 agent 回合全部失败（日志 `dsh_local_unresolved reason=turn_ended_error`） | 看 `logs/llama-server.log`：若是 `400 JSON schema conversion failed`，说明 llama.cpp 构建太旧、转换不了某个工具 schema（已修复的根因：`set_volume` 的 anyOf 裸 required 子模式；`mcp_server.to_json_schema` 现渲染完整对象模式）。换新构建或新增工具后复现 → 用 `python -m winvoice --check` 后对 8080 直接 POST 带 tools 的请求复现，看是哪个 schema |
+| 云端升级失败 `MISSING_CREDENTIAL`（日志 `dsh_cloud_failed`） | DEEPSEEK_API_KEY 未持久化：`setx DEEPSEEK_API_KEY "sk-..."` 后重开终端再启动助手，或在 DSH 的 Models 页把 key 写入凭证库（`runtime/dsh_home/.credentials.yaml`）。通路本身（升级触发/适配器/路由）与之无关，勿反复重启排查 |
+| 启动日志出现 `llama_server_failed` / `llama_server_start_timeout` | 自动拉起没成功：看 `logs/llama-server.log` 尾部（8080 已被占用但不健康、模型路径错、内存不足都可能）。服务加载慢只是超时 → 调大 `llm.local.start_timeout_s`。不想自动管理就 `llm.local.auto_start: false` 回手动模式 |
+| 启动日志出现 `model_integrity_failed` | 某个模型文件与封存不符（截断/损坏/被替换），`python -m winvoice --check` 会列出具体文件与原因。重新下载该模型；若变更有意（如自己换了 gguf）→ 重跑 `python scripts/download_models.py --seal`（`--model <key>` 只重封一个）。从未封存 → 日志是 `model_integrity_unsealed`，跑一次 `--seal` 即可 |
+| 其他人被识别成 full（非主人的声音能通过权限） | **修复指引（2026-09-27）**：两个来源——①guest 档核验曾触发自适应更新，档案被 household 常客的声音拖偏（已修：只有 full 判定才允许更新档案）；②主人注册时 `threshold_high` 由最差一对样本决定（min_intra−0.05），一个坏样本会把门槛拖到 ≈0.63，同性别他人即可越过。**重录声纹**（安静环境、距离稳定、语气自然）：`python -m winvoice.enroll --speaker me --samples 8 --force`，看输出的 `threshold HIGH`——≥0.70 为健康；若仍 <0.70，重录一遍。被污染的旧档案已备份为 `models/sv/profiles/me.json.bak-20260927`（已移除漂移嵌入） |
+| 确认时主人被判 guest 甚至 rejected（score 0.3x） | **已修复（2026-09-27，两层根因）**：①核验原来跑在麦克风**滚动窗口**上（大半是判停静音+回声，嵌入退化）；②更隐蔽的是**档案被自适应更新污染**——每次 guest 误判都会把 `me.json` 最新嵌入向垃圾音频 EMA 漂移 5% 并写盘，多次尝试后主人对自己只剩 0.32 分。现在：核验用 **VAD 段 speech-only 音频**、问题播完后**丢弃 0.4 s 回声衰减期**、确认短语改为「确认执行」（更长更稳）、**把关型核验不再修改档案**、rejected 自动重问一次（第二次才作废）。若仍有波动 → 重录声纹 `python -m winvoice.enroll --speaker me --samples 8 --force` |
 | 说「关机」没有反应 / 回「没实现」 | 规则层 `system_power` 触发词：`关机/重启/重新启动/睡眠/休眠/锁屏/锁定屏幕/注销/退出登录`（「怎么关机」是问句，走问答）。执行需主人声纹 + 口头「确认」；关机/重启带 5 秒缓冲（`shutdown /a` 可中止）。日志 `confirmation_armed tool=system_power` |
 | 说「打开谷歌浏览器」回「我没找到…的安装位置」 | 程序既不在 `PATH`、也不在 `App Paths` 注册表里。查 `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe`（Chrome/Edge/VS Code 安装时都会写这个键）；绿色版/免安装版需要手动加进 `PATH`。**这是如实回答**：旧版拿裸名字 `Popen(..., shell=True)` 启动，`chrome.exe` 不在 `PATH` 时 cmd.exe 只打印「不是内部或外部命令」，而工具照样报成功 |
 | 说「关闭记事本」回「好像没有在运行」 | `taskkill` 退出码非 0（128 = 没找到该进程）：现在是如实回答，旧版无论有没有关掉都说「已经关闭」。系统设置是 URI 不是进程，会回「我关不掉系统设置。」 |

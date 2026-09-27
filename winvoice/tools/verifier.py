@@ -313,11 +313,20 @@ class CloseAppVerifier(Verifier):
 class WriteFileVerifier(Verifier):
     """A written file exists, is a regular file, and holds what was asked for."""
 
+    def _path(self, args) -> str:
+        # Same resolution the handler used (「桌面\x.txt」 → the real Desktop
+        # file): verifying the raw spoken path checked a lookalike under the
+        # working directory and failed a write that had succeeded
+        # (live report 2026-09-27).
+        from .builtin import resolve_user_path
+
+        return str(resolve_user_path(args.get("path", "")))
+
     def capture(self, args, probe):
-        return probe.path_state(str(args.get("path", "")))
+        return probe.path_state(self._path(args))
 
     def verify(self, args, execution_result, before, probe):
-        path = str(args.get("path", ""))
+        path = self._path(args)
         expected_content = args.get("content", "")
 
         if not execution_result.get("success"):
