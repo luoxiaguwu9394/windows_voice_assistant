@@ -115,10 +115,11 @@ class ToolExecutor:
                 tool=call.tool,
                 success=False,
                 error=f"CONFIRMATION_REQUIRED: {spec.description}. Call again with confirmed=true.",
-                # The confirmation round trip does not exist yet, so this is
-                # what the user hears every time they ask for a write or a
-                # script: say so plainly instead of reading the English spec.
-                message="这个操作需要你先确认，我还没有实现确认的流程。",
+                # What the *voice* confirmation loop says is composed by the
+                # pipeline (it names the action and the 确认/取消 protocol);
+                # this message is what a caller that cannot ask — the MCP
+                # server, whose agent must report the refusal honestly — sees.
+                message="这个操作需要你先确认，暂时不能执行。",
             )
 
         # Create snapshot for destructive tools

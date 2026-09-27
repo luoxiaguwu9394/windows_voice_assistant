@@ -7,6 +7,17 @@ audio:
   half_duplex: true            # Pause ASR/VAD during TTS playback
   kws_during_tts: true         # Keep KWS active during TTS for barge-in
 
+  # Output (playback). Deliberately separate from `sample_rate`, which is the
+  # microphone's: the speaker is opened once at its own native rate and the TTS
+  # audio is resampled to match. Writing an 8 kHz stream to a 44.1 kHz device
+  # over MME (the old behaviour) handed a telephone-grade signal to the OS mixer.
+  output_device: "default"
+  output_sample_rate: 0        # 0 = 该路由自己的采样率（本机 WASAPI 48000 / MME 44100，
+                               #     同一个扬声器两者不同，向 WASAPI 要 44100 会直接被拒）
+  output_host_api: "auto"      # auto | wasapi | default  (auto = 先 WASAPI 共享，再 auto-convert，最后系统默认)
+  output_prebuffer_ms: 250     # buffered before the first sound, so slow synthesis cannot leave a hole
+  output_blocksize_ms: 20      # one device block; the player writes exactly this
+
 kws:
   # Extracted from sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2
   model: "models/kws/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
@@ -75,6 +86,14 @@ llm:
     #   llama-3.2-3b-instruct  (~2.0GB, 新架构)
     confidence_threshold: 0.65             # 小模型阈值略低，依赖 GBNF 保证格式
 
+  ask:
+    # 问答/闲聊（「什么是量子力学」「你好」）。规则层命中 ASK 后走这里：
+    # 本地模型自由生成、纯文本进出，**没有工具能力**（不会弹浏览器、不会动文件）。
+    enabled: true
+    max_chars: 80               # 生成答案念出来的上限（再过滤拉丁字符/代码符号）
+    max_tokens: 128             # 生成上限；3B CPU 约 10–20 token/s，超时会触发兜底话术
+    timeout_s: 20               # 单次生成超时；超时明确说「答不上来」，不静默、不崩
+
   remote:
     # Off by default: this is a placeholder endpoint. Enable it and fill in a
     # real OpenAI-compatible base_url + API key before switching this to true.
@@ -85,10 +104,80 @@ llm:
     guest_allowed: false        # Guests cannot trigger cloud calls
 
 tts:
-  # Chinese VITS (icefall aishell3, 174 speakers)
-  model: "models/tts/vits-icefall-zh-aishell3"
+  # ── Output audio ─────────────────────────────────────────────
+  # matcha-icefall-zh-baker + the vocos-22khz-univ vocoder: 22 050 Hz.
+  # The old vits-icefall-zh-aishell3 is natively 8 000 Hz (telephone grade) and
+  # stays as the fallback: a machine that has not downloaded the new model keeps
+  # speaking, with a tts_primary_model_missing warning at startup.
+  # Download with:  python scripts/download_models.py --tts
+  model: "models/tts/matcha-icefall-zh-baker"
+  fallback_models:
+    - "models/tts/vits-icefall-zh-aishell3"
+  backend: "auto"              # auto | vits | matcha (auto = read it off the model directory)
+  vocoder: ""                  # empty = vocos-22khz-univ.onnx / hifigan_v*.onnx inside the model dir
   voice: "default"             # default or guest
   guest_voice: "guest"
+  speaker_id: 0                # the owner's speaker id
+  guest_speaker_id: 1          # the guest's (a single-speaker model degrades to 0)
+  # 语速是强杠杆：时长 ∝ 1/speed（Matcha 实测 1.15 → 87 %、1.3 → 77 %；VITS 更陡）。
+  # Matcha 在 1.0 时 ≈193 ms/字，比旧 8 kHz 回退模型（≈277 ms/字）快 45 %——
+  # 换默认模型后用户听感「太快」，0.75 ≈ 250 ms/字（≈4 字/秒）回到自然语速。
+  # 还嫌快用 0.7（≈旧 VITS 语速），嫌慢用 0.8。引擎只在 initialize() 读一次，改完要重启。
+  speed: 0.75
+  # 绝对值，不是相对主人的倍率。单说话人模型下访客只靠语速区分音色，
+  # 所以必须仍比主人的 speed 快：0.9 ≈ 214 ms/字。
+  guest_speed: 0.9
+  # 音高（频率比）。baker 原生中位 F0 = 276 Hz，1.0 = 原声（当前值）。
+  # 调节锚点：0.9 ≈ 248 Hz、0.85 ≈ 235 Hz、0.8 ≈ 221 Hz——觉得偏「童声」往低调，
+  # 觉得偏「中性/沉」往上调。机制：chunk 的采样率标称为模型率 × pitch，播放层重采样
+  # 即整体降调（连共振峰一起降），引擎再用 speed/pitch 补偿语速——speed 管语速、
+  # pitch 管音高，两个旋钮互不影响。同 speed：只在 initialize() 读一次，改完要重启。
+  pitch: 1.0
+  num_threads: 2
+
+  # ── Segmentation and pauses ──────────────────────────────────
+  # These numbers are what the listener hears. The model contributes no pause of
+  # its own: its lexicon has no punctuation entries at all, and sherpa-onnx's
+  # `silence_scale` measured as inert (0.2 and 0.0 produced byte-identical
+  # audio). The playback layer writes each pause below as real silence frames.
+  # Measure a model with:  python scripts/calibrate_tts_pauses.py
+  # Preview a reply with:  python scripts/show_segmentation.py "…"
+  first_chunk_max_chars: 16    # short first chunk → early first sound; the rest synthesises while it plays
+  clause_max_chars: 24         # most characters spoken between two audible pauses (a breath at the comma)
+  chunk_max_chars: 40          # if nothing ends within clause_max_chars, look this far for a boundary
+  chunk_min_chars: 10          # anything shorter is merged back into its neighbour
+  hard_max_chars: 80           # a run with no punctuation at all is only broken past this ceiling
+  reply_max_chars: 240         # an agent's answer (tool one-liners keep the contract's 80)
+  tail_silence_ms: 150         # silence after the last sentence, before the microphone re-opens
+  pause_sentence_ms: 240       # 。
+  pause_question_ms: 280       # ？
+  pause_exclaim_ms: 260        # ！
+  pause_ellipsis_ms: 420       # ……
+  pause_semicolon_ms: 200      # ；
+  pause_comma_ms: 140          # ，
+  pause_enumeration_ms: 100    # 、
+  pause_colon_ms: 180          # ：
+  pause_paragraph_ms: 420      # newline
+  pause_forced_ms: 60          # a cut with no punctuation at all
+  pause_conjunction_ms: 90     # a cut placed before 但是 / 所以 / 然后 …
+
+  # ── Edge-silence trimming ────────────────────────────────────
+  # Every synthesis call carries near-silence at each end (a noise floor, not
+  # digital zeros). Measured: Matcha 60–110 ms per end at a floor of 0.24–1.68 %
+  # of peak; the 8 kHz fallback 80–250 ms at 0.78–1.74 %. Left in, it is added to
+  # every pause in the table above.
+  trim_silence: true
+  trim_ratio: 0.02             # threshold = peak × this — above every measured floor (max 1.74 %),
+                               # ~20× below the quietest onset (~35 %), so it trims every segment alike
+  trim_guard_ms: 30            # audio kept around the detected speech, so onsets are never clipped
+
+  # 句内空隙压缩（实测：Matcha 每次 generate() 会在句中自掏 1–7 个 40–240 ms 的
+  # 静音洞——词表无标点，它看不到逗号，停顿位置随缘）。超过 max_internal_gap_ms 的
+  # 句中静音压回 internal_gap_keep_ms；0 = 关闭。60/30 是「语流连续」档：60 ms 以下
+  # 的自然微停顿（含塞音闭合）保留，70–110 ms 的词间洞压到 30 ms——再大会听出碎片，
+  # 再小会把辅音挤掉。首尾静音仍由上面三项处理。热生效（每回合重读）。
+  max_internal_gap_ms: 60
+  internal_gap_keep_ms: 30
 
 tools:
   whitelist:
@@ -98,18 +187,29 @@ tools:
     - "media_control"
     - "search_web"
     - "read_file"
+    - "list_dir"
     - "write_file"
     - "run_script"
+    - "system_power"
     - "get_time"
     - "get_weather"
   guest_denied:
     - "read_file"
+    - "list_dir"
     - "write_file"
     - "run_script"
+    - "system_power"
   destructive:
     - "write_file"
     - "run_script"
   confirm_required: true       # Require double confirmation for destructive tools
+  # 二次确认回路（语音层）：write_file / run_script / system_power 需要用户说
+  # 「确认」才执行；挂起的调用超过 confirm_timeout_s 秒未确认即作废。下一句
+  # 非确认话同样作废，按新指令处理。
+  confirm_timeout_s: 15
+  # 「搜索 X」先问一句再开浏览器（确认词同样是「确认/取消」）。false = 旧行为，
+  # 显式搜索立刻打开。只作用于语音路径；Agent 经 MCP 调用不受影响。
+  search_web_confirm: true
   # Check each tool's postcondition against real machine state after it runs
   # (open_app -> is the process there? close_app -> is it gone? write_file -> is
   # the content on disk?). A tool's own "success" is a claim; this is evidence,

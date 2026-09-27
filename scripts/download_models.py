@@ -114,9 +114,36 @@ MANIFEST: Dict[str, Dict[str, Any]] = {
         "note": "Streaming Zipformer small bilingual zh-en (2023-02-16), 458 MB",
     },
 
-    # ── TTS: Chinese VITS (icefall aishell3) ──────────────────
-    # Piper zh voices are not published as a single GitHub asset; this VITS
-    # model is the supported alternative for Chinese TTS in sherpa-onnx.
+    # ── TTS: Chinese Matcha (22.05 kHz) — the default ─────────
+    # 8 000 Hz was the ceiling of the old VITS model; this one is 22 050 Hz and
+    # faster to synthesise (upstream RTF 0.54 @ 2 threads). It needs its vocoder
+    # from the separate `vocoder-models` release, hence the second entry below —
+    # a Matcha acoustic model alone cannot make sound, and the engine falls back
+    # to `vits-zh` (8 kHz) rather than refusing to start.
+    "tts/matcha-zh-baker": {
+        "url": (
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/"
+            "matcha-icefall-zh-baker.tar.bz2"
+        ),
+        "dest": "tts/matcha-icefall-zh-baker.tar.bz2",
+        "extract": True,
+        "sha256": None,
+        "note": "Matcha Chinese (icefall baker, 1 female speaker, 22.05 kHz), 72 MB",
+    },
+    "tts/vocos-22khz": {
+        "url": (
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/vocoder-models/"
+            "vocos-22khz-univ.onnx"
+        ),
+        "dest": "tts/matcha-icefall-zh-baker/vocos-22khz-univ.onnx",
+        "extract": False,
+        "sha256": None,
+        "note": "Vocos 22.05 kHz universal vocoder (required by the Matcha model), 51 MB",
+    },
+
+    # ── TTS: Chinese VITS (icefall aishell3) — fallback ───────
+    # Natively 8 000 Hz. Kept as `tts.fallback_models`, so a machine that has not
+    # downloaded the Matcha model still speaks.
     "tts/vits-zh": {
         "url": (
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/"
@@ -125,7 +152,7 @@ MANIFEST: Dict[str, Dict[str, Any]] = {
         "dest": "tts/vits-icefall-zh-aishell3.tar.bz2",
         "extract": True,
         "sha256": None,
-        "note": "VITS Chinese (icefall aishell3), 31.6 MB",
+        "note": "VITS Chinese (icefall aishell3, 174 speakers, 8 kHz) - fallback, 31.6 MB",
     },
 
     # ── Speaker Verification: CAM++ (3D-Speaker) ──────────────
@@ -181,7 +208,10 @@ GROUPS = {
     "kws": ["kws/zipformer-zh-en"],
     "vad": ["vad/silero"],
     "asr": ["asr/sense-voice", "asr/zipformer"],
-    "tts": ["tts/vits-zh"],
+    # The default model plus its vocoder and the (8 kHz) fallback: `--tts` has to
+    # leave the machine in a working state, not in a state that falls back.
+    "tts": ["tts/matcha-zh-baker", "tts/vocos-22khz", "tts/vits-zh"],
+    "tts-fallback": ["tts/vits-zh"],
     "sv": ["sv/campplus"],
     "llm": ["llm/qwen2.5-3b-instruct"],
     "llm-1.5b": ["llm/qwen2.5-1.5b-instruct"],
@@ -193,6 +223,8 @@ CORE_KEYS = [
     "vad/silero",
     "asr/sense-voice",
     "asr/zipformer",
+    "tts/matcha-zh-baker",
+    "tts/vocos-22khz",
     "tts/vits-zh",
     "sv/campplus",
 ]

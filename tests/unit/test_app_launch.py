@@ -34,6 +34,7 @@ from winvoice.tools.builtin import (
     close_app,
     open_app,
     resolve_app_command,
+    _is_console_app,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -271,3 +272,63 @@ def test_every_new_app_message_the_handlers_produce_is_pronounceable(monkeypatch
         missing = sorted({c for c in text if c.isalpha() and not c.isascii() and c not in lexicon})
         assert not missing, f"{missing} are not in the lexicon: {text!r}"
         assert len(text) <= 80, f"too long to speak comfortably: {text!r}"
+
+
+# ── console apps must get a console of their own (live report 2026-09-27) ──
+
+
+def _new_console_flag() -> int:
+    return getattr(builtin.subprocess, "CREATE_NEW_CONSOLE", 0)
+
+
+def test_a_console_app_is_launched_into_its_own_console(monkeypatch):
+    """
+    「打开命令提示符」 must open a NEW window.
+
+    The launcher used `Popen([cmd.exe])` with no console flag, so the console-
+    subsystem child inherited the assistant's own console: its banner was
+    printed into the assistant's window (visible in the live log) and it sat
+    there sharing stdin — no new window, the console "refreshed in place".
+    """
+    fake = _RecordingSubprocess()
+    monkeypatch.setattr(builtin.subprocess, "Popen", fake.Popen)
+
+    result = open_app({"app": "命令提示符"})
+
+    assert result["success"] is True, result
+    name, args, kwargs = fake.calls[0]
+    assert name == "Popen"
+    assert kwargs.get("creationflags") == _new_console_flag() != 0, kwargs
+
+
+def test_powershell_gets_its_own_console_too(monkeypatch):
+    fake = _RecordingSubprocess()
+    monkeypatch.setattr(builtin.subprocess, "Popen", fake.Popen)
+
+    open_app({"app": "命令行窗口"})
+
+    assert fake.calls[0][2].get("creationflags") == _new_console_flag() != 0
+
+
+def test_a_gui_app_gets_no_console_flag(monkeypatch):
+    """CREATE_NEW_CONSOLE is only for console-subsystem programs; GUI is inert anyway."""
+    fake = _RecordingSubprocess()
+    monkeypatch.setattr(builtin.subprocess, "Popen", fake.Popen)
+
+    open_app({"app": "记事本"})
+
+    assert "creationflags" not in fake.calls[0][2], fake.calls[0][2]
+
+
+@pytest.mark.skipif(
+    not Path(r"C:\Windows\System32\cmd.exe").exists(),
+    reason="real Windows binaries are the test fixtures",
+)
+def test_the_subsystem_probe_reads_real_binaries():
+    """cmd/powershell are console-subsystem (3); notepad is GUI (2)."""
+    assert _is_console_app(r"C:\Windows\System32\cmd.exe") is True
+    assert _is_console_app(r"C:\Windows\System32\notepad.exe") is False
+
+
+def test_an_unreadable_binary_is_treated_as_gui():
+    assert _is_console_app("Q:/definitely/not/there.exe") is False

@@ -194,8 +194,20 @@ filling happen in code (`AudioPipeline._intent_to_tool_calls`).
 
 🔶 Lines ①-③ can all miss. The router then returns `intent=unknown`, and since
 `unknown` has no tool mapping, the spoken reply is
-「抱歉，这个请求我还没有实现。」 There is no chat/QA fallback: the assistant routes
-commands and answers time and weather, it does not answer questions.
+「抱歉，这个请求我还没有实现。」
+
+✅ **Questions and small talk** (2026-09-27): the rule tier recognises questions
+and greetings and returns `IntentName.ASK`, which the pipeline intercepts
+*before* the agent — the answering model must never get tool capability. Small
+talk (`你好`/`谢谢`/`再见`) replies deterministically with no model at all; a real
+question goes to the local model's free-form completion (`LocalLlmBackend.generate`
+— deliberately not the intent-classification `complete()`), and the answer is
+reduced to spoken Chinese by `sanitize_for_tts` with the `llm.ask.max_chars`
+budget. Unreachable/slow model → an honest 「这个问题我现在答不上来。」, never a
+fallthrough to the agent. ✅ `IntentName.DISMISS` (「没事了」/「算了」/「退下」) is the
+rule layer's **last** pattern: a bare dismissal acknowledges with 「好的。」 and
+returns to waiting for the wake word, while 「算了，打开记事本」 still opens
+Notepad.
 
 The rule layer resolves conflicts in three tiers, because the interesting cases
 collide: (1) intents whose argument is a literal path (`run_script`, `read_file`,
@@ -205,7 +217,10 @@ must not become a browser search for 「py」; (2) an explicit search request
 path separator) — it names the tool it wants, so it outranks the topic, which is what
 「用浏览器搜索天气」 needs; (3) everything else in declaration order, so
 `get_weather`/`get_time` sit above the *weak* search verbs (`查一下`/`查询`):
-「查一下天气」 is a question this assistant can answer and must not open a browser.
+「查一下天气」 is a question this assistant can answer and must not open a browser;
+`list_dir` sits above `ask` (「目录下有什么文件」 is a command, not a question), and
+`dismiss` is **last** (「算了」 alone means cancel, 「算了，打开记事本」 still means
+open).
 The extracted query is everything after the **last** verb, so 「google 搜索天气」
 searches for 「天气」 rather than for the verb fragment 「搜索天气」.
 
@@ -227,12 +242,14 @@ and no 2 s deadline beyond the client's 60 s HTTP timeout.
 | `close_app` 🔶 | `app: str` — as above; `force: bool` optional, force only on an explicit 「强制关闭」 request | ❌ | Non-sensitive only ⛔ |
 | `set_volume` 🔶 | `delta: int` (relative) **or** `level: int` 0–100 (absolute); at least one required | ❌ | ✅ |
 | `media_control` | `action: Enum[play,pause,next,prev]` | ❌ | ✅ |
-| `search_web` 🔶 | `query: str` — percent-encoded; opens the default browser immediately, no confirmation | ❌ | ✅ |
+| `search_web` 🔶 | `query: str` — percent-encoded; the voice path asks 「你要我搜索…吗？」 first (`tools.search_web_confirm`), the agent's MCP path opens directly | ❌ | ✅ |
 | `read_file` 🔶 | `path: str` (must resolve under `C:\Users\<you>\`, ≤10 MB, UTF-8) | ❌ | ❌ |
+| `list_dir` | `path: str` optional (same confinement; default = the user directory). Answers count plus a few pronounceable names — Latin-bearing names are counted but never spoken | ❌ | ❌ |
 | `write_file` | `path: str, content: str` | ✅ | ❌ |
 | `run_script` 🔶 | `path: str` with suffix `.py` / `.ps1` / `.bat` / `.cmd` (under `C:\Users\<you>\`) | ✅ | ❌ |
+| `system_power` | `action: Enum[shutdown, restart, sleep, hibernate, lock, signout]` — fire-and-forget (`Popen`), shutdown/restart carry a 5 s buffer (`shutdown /a` aborts). Requires the spoken confirmation; guest-denied; the agent's MCP path can never supply the confirmation, so no model tier can power the machine down | ❌ | ❌ |
 | `get_time` | — (no arguments) | ❌ | ✅ |
-| `get_weather` | `city: str` optional — the rule layer fills it when the sentence names a city (`北京的天气` → `北京`), otherwise `weather.city` from the config | ❌ | ✅ |
+| `get_weather` | `city: str` optional — the rule layer fills it when the sentence names a city (`北京的天气` → `北京`, the spoken 「明天佛山**的**天气」 included), otherwise `weather.city` from the config; `day: int` optional (absent/0 = 今天, 1 = 明天, 2 = 后天 — the forecast entry, with a short payload honestly relabelling itself) | ❌ | ✅ |
 
 The 9 allowlisted apps and their spoken Chinese names live in
 `winvoice/tools/builtin.py` (`ALLOWED_APPS` / `APP_SPEECH`). Adding an app means adding
@@ -285,18 +302,29 @@ A graceful close on dirty state blocks until the user answers that prompt, which
 reported as 「…好像在等你确认，可能有没保存的内容。」 rather than as a timeout fault.
 
 
-### 6.2 Destructive Action Flow ⛔
-1. Double confirmation (voice + UI toast)
+### 6.2 Destructive Action Flow 🔶
+1. Spoken confirmation (voice; a UI toast would need the unbuilt UI)
 2. Snapshot target files (declared in `modified_paths: string[]`)
 3. Execute
 4. On failure → auto-restore from snapshot
 
-⛔ **Steps 1 and 2 are only half-built.** The snapshot half works
-(`ToolExecutor.execute` snapshots `modified_paths` for destructive tools and restores on
-failure), but the confirmation round trip does not exist: `execute()` is always called
-with `confirmed=False`, so `write_file` and `run_script` return
-`CONFIRMATION_REQUIRED: ...` and **never run**. `ToolExecutor.get_pending_confirmation()`
-and `clear_pending_confirmation()` exist with no caller in the voice path.
+✅ **The voice confirmation round trip exists** (2026-09-27, `UNIMPLEMENTED.md` §2.3/§2.4).
+When `execute()` refuses with `CONFIRMATION_REQUIRED`, or when the rule tier asks for an
+explicit web search and `tools.search_web_confirm` is true, the pipeline arms a
+`_PendingConfirmation` (the exact `ToolCall`, its tier and trace, plus a
+`tools.confirm_timeout_s` deadline), speaks the question (「我将要写入一个文件，确认请说
+确认，取消请说取消。」) and enters the new `PipelineState.CONFIRMING` — where the
+microphone feeds VAD/ASR **without a wake word**, because the user is answering a
+question. 「确认」 (deny words win over confirm words) replays the *same* call with
+`confirmed=True` — never a re-parse, which could change the arguments after the yes.
+「取消」 drops it; any other sentence cancels it and is rerouted as a fresh utterance
+(fresh trace, fresh speaker check); silence expires it; a different speaker cannot
+confirm (`confirmation_speaker_mismatch`); and any pipeline abort drops the pending call
+so it cannot ambush a later utterance.
+
+🔶 **Still voice-path only**: the agent's own tool calls arrive through the MCP server in
+a *different process*, whose CONFIRMATION_REQUIRED remains an honest deterministic
+refusal (it cannot hold a conversation with the user). A UI toast remains unbuilt.
 
 ### 6.3 Irreversible Operation Blocklist ✅
 - `run_script` content scanned for `IRREVERSIBLE_PATTERNS` (reg add/delete, msiexec /uninstall, etc.) → reject + audit log
@@ -331,10 +359,12 @@ Two guards apply to anything on its way to the speaker, both from
   warning) and the generic sentence is used instead. English in `message` is a bug in the
   tool, and cleaning it would leave a sentence full of holes;
 - the joined text is clipped to `MAX_SPEECH_CHARS = 80` — at the last sentence boundary
-  past the midpoint when there is one, otherwise at the limit — because
-  `TtsEngine.synthesize` synthesises the whole utterance before it yields its first
-  chunk: length is dead air. With several results each gets an equal share of the
-  budget, so one long message cannot clip the others away.
+  past the midpoint when there is one, otherwise at the limit. With several results each
+  gets an equal share of the budget, so one long message cannot clip the others away.
+  ✅ **Revised 2026-09-26**: the 80-character limit is a *contract* limit for tool
+  messages, no longer a latency workaround — the engine speaks sentence by sentence
+  now, so an agent's answer is budgeted at `tts.reply_max_chars` (240) instead
+  (`context.speech_budget`).
 
 `tests/unit/test_speech_is_pronounceable.py` checks every handler's success *and* failure
 message against the model's real `lexicon.txt` (and the whole 60-entry weather condition
@@ -368,13 +398,14 @@ what decides whether the task is unresolved.
 alone. `uncertain` and `not_verifiable` mean "this layer cannot observe it", not
 "it did not work", so escalating on them would send every web search and media
 keypress to the cloud. A failure with *no* verdict (an allowlisted-app refusal,
-the unimplemented confirmation gate) is deterministic — the cloud model would be
+an unresolved confirmation gate on the agent's side) is deterministic — the cloud model would be
 refused identically — so it does not escalate either.
 
-The five query/observation-free tools (`get_time`, `get_weather`, `read_file`,
-`search_web`, `media_control`) deliberately have **no** verifier: a verifier for
-them could only ever answer "nothing to check" while adding tokens to every tool
-result the model reads.
+The seven tools without a machine-checkable postcondition (`get_time`, `get_weather`,
+`read_file`, `list_dir`, `search_web`, `media_control`, `system_power`) deliberately have
+**no** verifier: a verifier for them could only ever answer "nothing to check" while
+adding tokens to every tool result the model reads (a power action is fire-and-forget —
+sleep may degrade to hibernate, and nothing observable remains to poll).
 
 `tests/unit/test_verifier.py` pins these rules against a scripted machine
 (`SystemProbe`), because launching Chrome inside a test suite is not an option and
@@ -461,6 +492,12 @@ same wall.
   to `response_format: json_object` and a `local_llm_grammar_rejected` warning
 - 🔶 Ollama is *not* required: it works only as an alternative OpenAI-compatible
   endpoint, but the project's docs, models and scripts all assume llama.cpp.
+- ✅ **Free-form generation** (`LocalLlmBackend.generate`, 2026-09-27): the same
+  transport without grammar, JSON or the classifier system prompt — plain text in,
+  plain text out. It backs `IntentName.ASK` only; the question path carries **no
+  tool capability** by construction (the method cannot call anything), which is the
+  hard constraint of §5. `llm.ask.*` (enabled / max_chars / max_tokens / timeout_s)
+  tune it hot.
 
 ### 7.2 Remote (OpenAI-compatible) ✅
 - Enabled via `llm.remote.enabled: true` (default **false**)
@@ -478,20 +515,62 @@ if local_unavailable or local_confidence < threshold:
 
 ---
 
-## 8. TTS 🔶
+## 8. TTS ✅
 
-| Engine | Model | Voice | Sample rate |
-|--------|-------|-------|-------------|
-| sherpa-onnx VITS | `vits-icefall-zh-aishell3` (174 speakers) | `default` (Full), `guest` (Guest) | **8 kHz** |
+### 8.1 Pipeline
 
-- 🔶 Not Piper, and not Kokoro. The Chinese icefall aishell3 VITS model is natively
-  8 kHz — the telephone-grade output is expected, not a misconfiguration.
-- **Lexicon**: Chinese-only (`lexicon.txt`, 66 377 entries, **no Latin entries**).
+```
+context.tts_text (tool one-liner ≤80 chars | agent answer ≤ reply_max_chars)
+   ↓ normalize      winvoice/text/normalize.py     markdown out, units spoken, marks that mean a pause kept
+   ↓ segment        winvoice/text/segment.py       cut at sentence ends / clauses / conjunctions, with refusals
+   ↓ chunk                                          first piece ≤ first_chunk_max_chars, later pieces ≤ clause_max_chars
+   ↓ synthesize     winvoice/audio/tts.py          one generate() per piece, on a worker thread, edges trimmed
+   ↓ buffer+play    winvoice/audio/playback.py     one device stream, pauses written as real silence, abort() on barge-in
+```
+
+Each stage exists because of a measurement, not a preference — `scripts/calibrate_tts_pauses.py`
+is the instrument and its output is quoted in `deployment.md` §9.5:
+
+| Measured | Consequence |
+|---|---|
+| The lexicon holds **no punctuation entries** (both models), and `silence_scale` 0.2 vs 0.0 produced byte-identical audio | the model contributes no pause, so pauses are data (`SpeechSegment.pause_after_ms`) written by the player |
+| Every `generate()` begins/ends with a noise floor at 0.24–1.74 % of peak (Matcha 60–110 ms per end, the 8 kHz VITS 80–250 ms) | trimming is an RMS-envelope operation (`trim_edge_silence`) with a threshold (2 %) above every measured floor, never a per-sample threshold |
+| Speech runs at 176–239 ms per character (Matcha) / 262–315 (8 kHz VITS) | the reply budget is a *duration* decision: 240 chars ≈ 46–60 s |
+| Natural intra-sentence pauses are 40–190 ms | the comma pause (140 ms) is set inside that band rather than guessed |
+
+### 8.2 Engines
+
+| Backend | Model | Voice | Sample rate |
+|---------|-------|-------|-------------|
+| sherpa-onnx Matcha (default) | `matcha-icefall-zh-baker` + `vocos-22khz-univ.onnx` | 1 speaker; a guest is the same voice at `guest_speed` | **22 050 Hz** |
+| sherpa-onnx VITS (fallback) | `vits-icefall-zh-aishell3` (174 speakers) | `default` (Full), `guest` (Guest) | 8 000 Hz |
+
+- ✅ Not Piper, and not Kokoro. The 8 kHz model is still shipped as
+  `tts.fallback_models`, so a machine that has not downloaded the Matcha model
+  keeps speaking — with a `tts_primary_model_missing` warning instead of a
+  refusal to start (a Matcha model whose vocoder is missing falls back the same
+  way).
+- **Lexicon**: Chinese-only in both models (`lexicon.txt`, **no Latin entries**).
   English words are dropped at synthesis time; see §6.4 for the speech contract.
 - **Text normalisation**: `number.fst`, `date.fst`, `phone.fst` are passed as
   `rule_fsts`, which is what makes digits and dates speakable at all. Without them
   「调到90」 is synthesised as 「调到」 — the number silently disappears.
-- **Interruptible**: see §3 barge-in.
+- **Interruptible**: see §3 barge-in. `interrupt()` stops at the next chunk
+  boundary and no new segment is started; the player aborts the device buffer
+  separately, so the sound stops immediately even though the `generate()` already
+  running on the worker thread cannot be cancelled from outside sherpa-onnx.
+
+### 8.3 Budgets
+
+| Reply | Budget | Where |
+|---|---|---|
+| Tool one-liner (`ToolResult.message`) | 80 chars (`MAX_SPEECH_CHARS`) | `contracts/speech.py` |
+| Agent answer | 240 chars (`tts.reply_max_chars`) | `pipeline._run_agent` → `context.speech_budget` |
+
+The 80-character contract limit for tool messages stays: a tool's sentence is
+meant to be one short readout. What changed is that length no longer *is* dead
+air — the first sentence is spoken while the rest is still being synthesised — so
+the agent's answer gets a budget of its own.
 
 ---
 
@@ -505,7 +584,8 @@ Full schema in README. Key points:
   unused feature cannot stop the assistant from booting.
 - Hot-reloadable fields (`HOT_RELOADABLE` in `winvoice/config.py`):
   - `llm.local.confidence_threshold`
-  - `tools.whitelist`
+  - `llm.ask.enabled` / `llm.ask.max_chars` / `llm.ask.max_tokens` / `llm.ask.timeout_s`
+  - `tools.whitelist`, `tools.confirm_timeout_s`, `tools.search_web_confirm`
   - `tts.voice`
   - `kws.threshold` (requires Audio restart → logged warning)
   - `weather.enabled` / `weather.city` / `weather.timeout_s` — `get_weather` reads them
@@ -661,8 +741,8 @@ The entry point is `winvoice/__main__.py`, not `main.py`.
 3. ✅ LLM integration: text → reply → TTS
 4. ✅ Execution layer: the non-destructive tools
 5. 🔶 Cloud routing — implemented but disabled by default, never exercised end to end
-6. 🔶 Speaker verification: enrollment, tiers, adaptive update — **confirmation and
-   snapshot are only half-built** (§6.2)
+6. 🔶 Speaker verification: enrollment, tiers, adaptive update — the **voice
+   confirmation loop is built** (§6.2) and snapshotting works; a UI toast is the missing half
 7. ⛔ Guest mode + voice switching — the guest *voice* works, the guest *permissions* do not
 8. ⛔ PySide6 UI — not started; everything is a CLI
 
@@ -673,12 +753,20 @@ The entry point is `winvoice/__main__.py`, not `main.py`.
 ### Implemented
 Voice pipeline (KWS → SV → VAD → ASR → intent → tools → TTS), half-duplex with
 barge-in, bilingual wake words, speaker enrollment with guided prompts and threshold
-derivation, three-tier intent routing (rules → local LLM → cloud), 10-tool allowlist with
+derivation, three-tier intent routing (rules → local LLM → cloud), 12-tool allowlist with
 schema validation, destructive-tool snapshotting, JSON-Lines logging with trace IDs,
 stub-engine mode for development. Spoken replies carry successful results too
 (`ToolResult.message`), and the two query tools — `get_time` (spoken 12-hour clock with a
 period word) and `get_weather` (one Chinese sentence about today, from `wttr.in`, offline
 in Chinese) — answer questions rather than acting on the machine.
+
+Added 2026-09-27 (`UNIMPLEMENTED.md` §2.1–§2.4 + the 「没事了」 request): the spoken
+confirmation loop with `PipelineState.CONFIRMING` (§6.2), `list_dir` (count plus
+pronounceable names, home-directory confined, guest-denied), question answering /
+small talk via `IntentName.ASK` with the tool-free `LocalLlmBackend.generate` path and
+deterministic greetings, ask-first `search_web` (`tools.search_web_confirm`), and the
+`IntentName.DISMISS` 「没事了」 fallback to waiting, and `system_power`
+(关机/重启/睡眠/休眠/锁屏/注销 — confirmation-gated, owner-only).
 
 ### Not implemented
 > `UNIMPLEMENTED.md` is the working backlog for these: it carries the per-item constraints,
@@ -686,10 +774,7 @@ in Chinese) — answer questions rather than acting on the machine.
 
 | Item | Where it would live |
 |---|---|
-| Confirmation round trip (blocks `write_file` / `run_script`) | `ToolExecutor` + pipeline |
 | Sensitive-app list for the Guest tier (the tier itself is now enforced) | `ALLOWED_APPS` + `ToolRegistry` |
-| Barge-in while the agent is thinking (an awaited turn queues the wake word) | `AudioPipeline` state machine |
-| Question answering / chat, directory listing | new intent + tools |
 | A weather provider with an API key (wttr.in is keyless but rate-limited, and untranslated) | `winvoice/tools/weather.py` |
 | Hot-reload fan-out to running engines | config watcher → engines |
 | Prometheus metrics, disk quota, model integrity check, anchor check | §10, §9.2 |
@@ -701,20 +786,43 @@ in Chinese) — answer questions rather than acting on the machine.
 |---|---|
 | Structured log events go to stdout, not `logs/main.jsonl` (§10.1) | file log is useless for diagnosis |
 | `process` field always contains the log level (§10.2) | any tooling keyed on it is wrong |
-| `search_web` opens the browser immediately, unconfirmed (§6.1) | a misrouted question pops a browser window |
-| Failures anywhere in the tick loop are swallowed by `except Exception` + `error=str(e)` (no traceback) | silent breakage — two bugs in this spec's history were only found by reading code |
-| TTS is 8 kHz and Chinese-only (§8) | English in any spoken string is dropped |
+| Tick-loop failures are logged with `error=str(e)` only — ✅ **fixed 2026-09-26** for the message half (`exc_info` + `error_type`, and background turns log `turn_failed`); per-state counting is still missing | tracebacks are no longer lost, but "the same error is repeating" is still invisible |
+| TTS speech is Chinese-only (§8) | English in any spoken string is dropped |
+| A guest's voice is the owner's voice at a different pace (single-speaker Matcha model) | the tier is not audible as a different voice (§8.2) |
 
 ### Verified numbers (2026-09-19, this machine)
 | Metric | Value |
 |---|---|
-| Test suite | 344 passed, 1 skipped |
+| Test suite | 344 passed, 1 skipped (2026-09-19); 561 passed, 1 skipped (2026-09-27) |
 | Local LLM latency | 0.8–1.1 s per intent classification |
 | ASR latency | 40–50 ms per VAD segment |
-| TTS synthesis | 100–300 ms, 8 kHz |
+| TTS synthesis | 100–300 ms, 8 kHz (the 8 kHz VITS) |
 | KWS on the model's own reference wavs | English 2/2, Chinese 5/7 at threshold 0.25 |
 | `get_time` | < 1 ms (no I/O) |
 | `get_weather` (wttr.in) | ~1–2 s (measured 1.8 s for Beijing); the whole exchange is capped by `weather.timeout_s` (5 s), and a timeout says 「暂时查不到天气。」 |
+
+### Verified numbers (2026-09-26, this machine)
+
+Both models, since the default changed. The 8 kHz figures are the fallback model,
+measured before the switch; the Matcha figures are the new default.
+
+| Metric | Matcha (22.05 kHz, default) | VITS aishell3 (8 kHz, fallback) |
+|---|---|---|
+| Test suite | 489 passed, 1 skipped (plus the 19 documented `tmp_path` sandbox errors) | — |
+| First audio, 46-character reply | **248 ms** | 289 ms |
+| Per-segment synthesis | 196–247 ms per 14–17 character segment | 262–324 ms |
+| Speech rate | **176–239 ms per char at speed 1.0; ≈ 250 ms/char at the configured 0.75** (240 chars ≈ 60 s) | 262–315 ms per char at 1.0 (≈ 60 s); ≈ 369 ms/char at 0.75 (≈ 90 s) |
+| Edge silence per `generate()` | lead 60–90 ms, tail 60–110 ms | lead 0–120 ms, tail 180–210 ms |
+| Noise floor | 0.24–1.68 % of peak | 0.78–1.74 % of peak |
+| Trimmed per segment | 72–98 ms | 172–279 ms |
+| Natural pauses inside one sentence | 40–190 ms | 40–230 ms |
+| Internal gaps per `generate()` | 1–7 of 40–240 ms, placed by the model (no punctuation in the lexicon) — collapsed to ≤30 ms by `tts.max_internal_gap_ms` (60) | — |
+| Voice pitch | median F0 **276 Hz** (p10–p90 196–345) as generated — adult-female band is 180–230 Hz, which is why the raw voice reads child-like; `tts.pitch` 0.8 lands at ≈221 Hz | — |
+| `tts.pitch` mechanism | chunks claim `model_rate × pitch` (the player's resample shifts every frequency component by exactly that ratio), `generate()` runs at `speed / pitch` so tempo is untouched. Default is **1.0** (the model's own voice; 0.8–0.9 were tried and reverted as too low) — sherpa's `speed` measured pitch-preserving (log-f spectra of 1.0 vs 0.75 align at ratio 1.000) | — |
+| Per-chunk resample artifact | resampling each 100 ms chunk independently left amplitude steps of **20–50 % of peak** at every seam (scipy's `resample_poly` edge transient; a 250 ms character carried 2–3 of them) — fixed by converting each segment in **one** call in the player; post-fix residual ≈ int16 quantization floor (0.02 % of peak) | — |
+| `tts.speed` effect | 1.15 → 87 %, 1.3 → 77 % | 1.15 → 81 %, 1.3 → 66 % (a stronger lever than on Matcha) |
+| Audible comma pause (trimmed tail + table + trimmed lead) | **200 ms** (naive concatenation gave ~320–470 ms) | 200 ms |
+| Output stream | **48 000 Hz via WASAPI shared**, opened once (MME reports the same speakers as 44 100 Hz; it is only the fallback route) | — |
 
 ---
 

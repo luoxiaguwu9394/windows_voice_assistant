@@ -54,6 +54,10 @@ INTENT_ARG_SPEC: Dict[IntentName, str] = {
     IntentName.RUN_SCRIPT: '{"path": "<script path>"}',
     IntentName.GET_TIME: "{}",
     IntentName.GET_WEATHER: '{"city": "<city name>"} or {}   (empty → the configured city)',
+    IntentName.LIST_DIR: '{"path": "<folder path, optional>"}   (empty → the user directory)',
+    IntentName.ASK: '{}   (the question is the utterance itself; never call tools for it)',
+    IntentName.DISMISS: "{}   (user said 没事了/算了 — acknowledge and stop)",
+    IntentName.SYSTEM_POWER: '{"action": "shutdown|restart|sleep|hibernate|lock|signout"}',
 }
 
 # Synonym -> canonical key. Models (especially small ones) invent names.

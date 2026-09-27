@@ -170,8 +170,10 @@ def test_tools_list_exposes_the_registry(child: McpChild) -> None:
         "media_control",
         "search_web",
         "read_file",
+        "list_dir",
         "write_file",
         "run_script",
+        "system_power",
         "get_time",
         "get_weather",
     }

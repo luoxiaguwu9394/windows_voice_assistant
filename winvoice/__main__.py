@@ -12,13 +12,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import signal
-from pathlib import Path
 
-from winvoice.audio import AudioPipeline, create_audio_stream
+from winvoice.audio import AudioPipeline, create_audio_stream, create_speech_player
 from winvoice.config import get_config, reset_config
 from winvoice.contracts import SystemState, ToolCall, ToolResult
 from winvoice.intent.router import create_intent_router
 from winvoice.logging import configure_logging, get_logger
+from winvoice.text import normalize_for_speech, segment_for_speech, speech_text_config
 from winvoice.tools.executor import create_tool_executor
 
 logger = get_logger(__name__)
@@ -32,6 +32,7 @@ class VoiceAssistant:
         self.use_stub = use_stub
         self.pipeline: AudioPipeline | None = None
         self.audio_stream = None
+        self.speech_player = None
         self.intent_router = None
         self.tool_executor = None
         self.dsh_router = None
@@ -66,6 +67,12 @@ class VoiceAssistant:
         self.pipeline.set_tool_executor(self.tool_executor)
         if self.dsh_router is not None:
             self.pipeline.set_dsh_router(self.dsh_router)
+
+        # The speaker. The pipeline owns playback through this object; the audio
+        # stream below stays input-only, which is what stops a chunk from being
+        # written straight into a device without a buffer or a pause.
+        self.speech_player = create_speech_player(use_stub=self.use_stub)
+        self.pipeline.set_speech_player(self.speech_player)
 
         await self.pipeline.initialize()
         logger.info("engines_ready", stub=self.use_stub)
@@ -106,7 +113,12 @@ class VoiceAssistant:
         return router
 
     async def shutdown(self) -> None:
-        """Release the agent's subprocess (it is not reaped by the GC)."""
+        """Release the agent's subprocess and the audio output device."""
+        if self.pipeline is not None:
+            try:
+                await self.pipeline.shutdown()
+            except Exception as e:
+                logger.warning("pipeline_shutdown_failed", error=str(e))
         if self.dsh_router is not None:
             try:
                 await self.dsh_router.close()
@@ -128,7 +140,6 @@ class VoiceAssistant:
             self.pipeline.stop()
         if self.audio_stream:
             self.audio_stream.stop()
-
     # ── callbacks ──────────────────────────────────────────────
 
     def _on_audio_frame(self, frame) -> None:
@@ -153,8 +164,21 @@ class VoiceAssistant:
         return result
 
     def _on_tts_chunk(self, chunk) -> None:
-        if self.audio_stream and chunk.data:
-            asyncio.create_task(self.audio_stream.play_audio(chunk.data, chunk.sample_rate))
+        """
+        Observe chunks; do **not** write them to a device.
+
+        Playback belongs to the pipeline's player now, which buffers, converts to
+        the device's own sample rate and writes the pauses between sentences.
+        Writing a chunk straight to an `OutputStream` here is exactly the defect
+        this replaced: no buffer, no pause, an 8 kHz MME stream on a 44.1 kHz
+        device.
+        """
+        logger.debug(
+            "tts_chunk",
+            bytes=len(chunk.data),
+            sample_rate=chunk.sample_rate,
+            pause_after_ms=getattr(chunk, "pause_after_ms", 0),
+        )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -184,7 +208,8 @@ async def run_check(config_path: str, use_stub: bool) -> int:
         ("VAD  (silence)", getattr(pipe.vad, "model_path", None)),
         ("ASR  (speech->text)", getattr(pipe.asr, "model_path", None)),
         ("SV   (speaker ID)", getattr(pipe.sv, "model_path", None)),
-        ("TTS  (text->speech)", getattr(pipe.tts, "model_dir", None)),
+        ("TTS  (text->speech)", getattr(getattr(pipe.tts, "model", None), "model_file", None)
+         or getattr(pipe.tts, "model_dir", None)),
     ]
 
     print("\n  Engines loaded:")
@@ -194,9 +219,25 @@ async def run_check(config_path: str, use_stub: bool) -> int:
     if not use_stub:
         print("\n  Details:")
         print(f"    SV embedding dim   : {pipe.sv.embedding_dim}")
+        print(f"    TTS backend        : {getattr(getattr(pipe.tts, 'model', None), 'backend', '?')}")
         print(f"    TTS sample rate    : {pipe.tts.sample_rate} Hz")
         print(f"    TTS speakers       : {pipe.tts.num_speakers}")
         print(f"    ASR mode           : {'streaming' if pipe.asr.streaming else 'sense-voice (offline)'}")
+
+    # Segmentation is what decides how the assistant sounds, so the check prints
+    # it: the same information `scripts/show_segmentation.py` gives, for the
+    # configuration that is actually loaded.
+    speech = speech_text_config()
+    sample = "我先把桌面上那份重要的文件保存好，接下来我会把处理结果告诉你。"
+    print("\n  Spoken output (segmentation and pauses):")
+    print(f"    budget             : {speech.max_chars} chars "
+          f"(agent replies {speech.reply_max_chars}), tail silence {speech.tail_silence_ms}ms")
+    print(f"    trim edge silence  : {speech.trim_silence} "
+          f"(ratio {speech.trim_ratio}, guard {speech.trim_guard_ms}ms)")
+    print(f"    seg {sample}")
+    for index, segment in enumerate(segment_for_speech(normalize_for_speech(sample, max_chars=240), speech)):
+        print(f"      {index}: {segment.chars:>3} chars  pause {segment.pause_after_ms:>4}ms  "
+              f"[{segment.kind}] {segment.text}")
 
     print("\n  Intent rules:")
     from winvoice.intent.rules import match_rules

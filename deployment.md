@@ -191,7 +191,7 @@ pip install onnxruntime-openvino==1.18.0
 
 ### 2.4 安装 DeepSeek Harness 桥接（可选：让 DSH 做 Agent 层）
 
-> **默认关闭。** 不装这一节，助手照常运行（规则层 + 10 个工具）。装上之后，
+> **默认关闭。** 不装这一节，助手照常运行（规则层 + 12 个工具）。装上之后，
 > 规则层没有命中的请求会交给 DSH Agent 来规划、调用工具并组织回答。
 
 DSH 的 Agent 循环跑在 Node 里，它通过 **MCP** 调用本项目的工具
@@ -294,16 +294,25 @@ pip install sentencepiece pypinyin
 ### 4.1 下载所有音频模型 (KWS/VAD/ASR/TTS/SV)
 
 ```powershell
-# 一键下载 (约 600MB，需科学上网)
+# 一键下载 (约 700MB，需科学上网；TTS 一项就占 153MB)
 python scripts/download_models.py --all
 
 # 或分步下载 (可断点续传)
 python scripts/download_models.py --kws zipformer-zh-en
 python scripts/download_models.py --vad silero
 python scripts/download_models.py --asr sense-voice
-python scripts/download_models.py --tts
+python scripts/download_models.py --tts          # Matcha 22.05k + 声码器 + 8k 回退
+python scripts/download_models.py --tts-fallback # 只下 8kHz 的老模型
 python scripts/download_models.py --sv campplus
 ```
+
+> **TTS 现在要下三个文件（共约 153 MB）**：
+> `matcha-icefall-zh-baker.tar.bz2`（72 MB，22.05 kHz 声学模型）、
+> `vocos-22khz-univ.onnx`（51 MB，**声码器，缺了模型发不出声音**）、
+> `vits-icefall-zh-aishell3`（30 MB，8 kHz 回退模型）。
+> 只下了老模型也能跑：引擎会回退到 8 kHz 并打一条 `tts_primary_model_missing` 警告。
+> 下载中途断线不用重来，重跑同一条命令即从 `.part` 续传
+> （GitHub 偶尔会 reset 连接，实测需要多试几次）。
 
 > **模型位置**：`models/` 目录 (已在 .gitignore)
 
@@ -362,9 +371,20 @@ weather:
   enabled: true                             # false → 说「天气查询没有打开。」
   city: "北京"                               # 句子里没说城市时用这个
   timeout_s: 5                              # wttr.in 无需 API key；别调大，等的时候是静音
+
+llm:
+  ask:                                      # 问答/闲聊（「什么是量子力学」）
+    enabled: true                           # false → 问答明说没打开；打招呼不受影响
+    max_chars: 80                           # 答案念出来的上限（再过滤英文/格式）
+    timeout_s: 20                           # 超时明说「答不上来」，不静默
+
+tools:
+  confirm_timeout_s: 15                     # 写文件/跑脚本的确认等待窗口
+  search_web_confirm: true                  # 「搜索 X」先问一句再开浏览器
 ```
 
-> `weather.*` 每次调用时重新读取，改完**不用重启**（引擎类配置只在启动时读一次，
+> `weather.*`、`llm.ask.*`、`tools.confirm_timeout_s`、`tools.search_web_confirm`
+> 每次调用/挂起时重新读取，改完**不用重启**（引擎类配置只在启动时读一次，
 > 其余配置项基本都要重启才生效）。
 
 ### 5.2 设置环境变量 (仅云端启用时需要)
@@ -661,6 +681,10 @@ python -m winvoice
 # 说唤醒词："assistant" / "小助手" / "你好助手"（关键词集见 §5.3）
 # 然后发指令："打开记事本"、"音量调大 20"、"音量调到百分之十"、"搜索 Python 教程"
 # 查询类："现在几点了"（念出当前时间）、"今天天气怎么样"（念出今日天气）
+# 文件类："当前目录下有什么文件"（念出数量和前几项）
+# 问答类："什么是量子力学"（本地模型自由生成，无工具能力，不弹浏览器）
+# 确认类："写入文件 …" → 助手问确认 → 说「确认」执行 /「取消」放弃
+# 收尾："没事了" → 「好的。」并回到等待唤醒
 # 观察日志输出
 ```
 
@@ -668,24 +692,58 @@ python -m winvoice
 > ```
 > 现在几点了        → 「现在是下午 3 点 25 分。」
 > 今天天气怎么样    → 「北京今天晴，气温 10 到 20 度，现在 15 度。」
+> 明天佛山天气怎么样 → 「佛山明天晴，气温 27 到 35 度。」（明天/后天都支持；
+>                      「明天佛山**的**天气」同样命中，2026-09-27 修复）
 > （断网/超时）      → 「暂时查不到天气。」
 > ```
 > 天气走 `wttr.in`（无需 API key），城市取句子里说的那个，说不出来就用
 > `weather.city`。天气没打开时回「天气查询没有打开。」
 
-> **实测启动日志（2026-09-19）**
+> **新交互的期望回应（2026-09-27 起）**
 > ```
-> kws_initialized   keywords=['assistant', 'hey assistant'] threshold=0.25
+> 当前目录下有什么文件 → 「一共有12项，前面几项是文档、图片，还有其他。」
+> （空文件夹）         → 「这个文件夹是空的。」
+> 什么是量子力学      → 一两句中文口语答案（llama-server 在跑时）
+> （LLM 不可用/超时）  → 「抱歉，这个问题我现在答不上来。」
+> 你好                → 「你好！有什么可以帮你的吗？」（不经过模型）
+> 搜索量子力学        → 「你要我搜索量子力学吗？确认请说确认，取消请说取消。」
+>   ↳ 说「确认」        → 打开浏览器
+>   ↳ 说「取消」        → 「好的，先不做了。」
+>   ↳ 说别的           → 该句作废挂起请求，并按新指令处理
+>   ↳ 沉默 15 秒       → 请求作废（日志 confirmation_expired）
+> 写入文件 X 内容 Y    → 「我将要写入一个文件，确认请说确认，取消请说取消。」
+>   ↳ 说「确认」        → 真的写入，snapshots/ 下有快照
+> 没事了              → 「好的。」回到等待唤醒状态，什么都不做
+> 关机                → 「我将要关机，确认请说确认，取消请说取消。」
+>   ↳ 说「确认」        → 5 秒后关机（shutdown /a 可中止）；重启/睡眠/休眠/锁屏/注销同理
+>   ↳ 访客说「确认」     → 被声纹分级拒绝
+> ```
+> 确认等待期间**不需要唤醒词**——回答的是助手刚问出的问题。挂起的请求绑定
+> 说话人：换个声纹说「确认」会被拒绝。
+
+> **实测启动日志（2026-09-26）**
+> ```
+> kws_initialized   keywords=['assistant', '小助手', '你好助手'] threshold=0.25
 > vad_initialized   model=...\silero_vad_v5.onnx
 > asr_initialized   language=auto mode=sense_voice
 > sv_initialized    dim=192 enrolled=[]          <- 尚未注册声纹
-> tts_initialized   num_speakers=174 sample_rate=8000
+> tts_initialized   backend=matcha sample_rate=22050 num_speakers=1 trim_silence=True
+> audio_output_route route='wasapi shared' sample_rate=48000 blocksize=960
+> audio_output_started sample_rate=48000 blocksize_ms=20 host_api=auto
 > pipeline_initialized stub=False
 > audio_input_started blocksize=1600 sample_rate=16000
 > microphone_open
 > Assistant is listening. Say the wake word (default: 'assistant'). Ctrl+C to stop.
 > pipeline_started
 > ```
+> `audio_output_route` 这两行是这次改造的重点之一：输出流整会话**只开一次**，走 **WASAPI 共享模式**、
+> 用**该路由自己的采样率**（本机 48 000 Hz），由播放层把模型的 22 050 Hz 重采样上去。
+> 老实现是「8 kHz 的 MME 流 + 200 ms blocksize + 每次 100 ms 一块」，音质与延迟都不可控。
+>
+> **同一个扬声器在不同 host API 下采样率不同**：本机 WASAPI 是 48 000 Hz、MME 是 44 100 Hz，
+> 而且向 WASAPI 要 44 100 会直接报 `Invalid sample rate` —— 所以采样率必须按路由分别解析，
+> 不能一次性算好（见 `open_output_stream`）。
+>
 > `enrolled=[]` 表示**还没注册声纹**：此时 `verify()` 返回 `None`，
 > 说话人分级不生效（不做拦截），功能可用但**没有声纹保护**。
 > 要启用请执行第 7 节的注册命令
@@ -711,6 +769,53 @@ python -m winvoice
 | 代码格式化 | `ruff check --fix winvoice` |
 | 装/刷新 DSH 桥接 | `python scripts/install_dsh_bridge.py --install` |
 | 检查桥接是否生效 | `python scripts/install_dsh_bridge.py --verify` |
+| **看一句话会被怎么念**（不需模型/设备） | `python scripts/show_segmentation.py "我先把文件保存好了，接下来告诉你结果。"` |
+| **标定当前 TTS 模型的停顿** | `python scripts/calibrate_tts_pauses.py` |
+
+---
+
+## 9.5️⃣ 语音调参：断句与停顿
+
+听感由两部分决定，都不在模型里，都在配置里：
+
+| 决定 | 配置键 | 说明 |
+|---|---|---|
+| **切在哪里** | `tts.first_chunk_max_chars` (16)、`tts.clause_max_chars` (24)、`tts.chunk_max_chars` (40)、`tts.hard_max_chars` (80)、`tts.chunk_min_chars` (10) | 首块短 → 出声快；两次可闻停顿之间最多说 `clause_max_chars` 字（到逗号换气）；没有任何标点的长句只在 `hard_max_chars` 处硬切 |
+| **停多久** | `tts.pause_*`（句号 240 / 问号 280 / 感叹 260 / 省略 420 / 分号 200 / 逗号 140 / 顿号 100 / 冒号 180 / 换行 420 / 硬切 60 / 连词前 90） | 模型词表里**没有任何标点**、`silence_scale` 实测无效，所以这些数字是唯一来源：播放层把它们写成真实静音帧 |
+| **剪掉模型自带的死气** | `tts.trim_silence`、`tts.trim_ratio` (0.02)、`tts.trim_guard_ms` (30) | 实测每次 `generate()` 首尾各带噪声底（Matcha 60–110 ms / 8k 回退 80–250 ms，占峰值 0.24–1.74 %，不是数字零）；不剪就会叠加到每个停顿上 |
+| **压掉句中的卡顿洞** | `tts.max_internal_gap_ms` (60)、`tts.internal_gap_keep_ms` (30) | 模型在句中**自掏 1–7 个 40–240 ms 的静音洞**（词表无标点，它看不到逗号），是「语流碎片化」的来源之一。超过 60 ms 的句中静音压回 30 ms（实测 140–170 ms 的洞全部压到 30，30–40 ms 的自然微停顿与塞音闭合保留）；0 = 关闭 |
+| **音高** | `tts.pitch` (1.0 = 原声) | baker 原生**中位 F0 = 276 Hz**。锚点：0.9 ≈ 248 Hz、0.85 ≈ 235 Hz、0.8 ≈ 221 Hz——觉得偏「童声」往低调、偏「中性/沉」往上调。机制：chunk 的采样率标称为模型率 × pitch（播放层重采样即整体降调，连共振峰一起降），引擎用 `speed/pitch` 补偿语速——`speed` 管语速、`pitch` 管音高，两个旋钮互不影响。**只在启动时读一次** |
+
+**前两个键段是热生效的**（每回合重新读取），改完不用重启；`tts.speed` / `tts.pitch` 要重启。
+
+```powershell
+# 1) 先看：不加载模型、不出声，只打印切点与停顿
+python scripts/show_segmentation.py --table "我先把文件保存好了，接下来告诉你结果。"
+python scripts/show_segmentation.py --json "好的。"          # 便于对比改动前后
+
+# 2) 再量：测量当前配置的模型（首尾静音、语速、句内自然停顿、修剪效果）
+python scripts/calibrate_tts_pauses.py
+#    输出会给建议值 —— 脚本**不会**自动改写 config.yaml：
+#    ConfigManager 用 yaml.safe_dump 落盘，会把这文件里的注释全部删掉。
+
+# 3) 改 config/config.yaml 的 tts.pause_* / tts.clause_max_chars，回到 1) 复核
+```
+
+实测参考（10 ms RMS 包络，两个模型都量过）：
+
+| 指标 | Matcha（默认，22.05 kHz） | VITS aishell3（回退，8 kHz） |
+|---|---|---|
+| 语速 | **176–239 ms/字（speed 1.0）；配置默认 0.75 时 ≈ 250 ms/字**（240 字 ≈ 60 s） | 262–315 ms/字（speed 1.0，240 字 ≈ 60 s）；0.75 时 ≈ 369 ms/字（≈ 90 s） |
+| 每段自带首尾静音 | lead 60–90 ms / tail 60–110 ms | lead 0–120 ms / tail 180–210 ms |
+| 噪声底（占峰值） | 0.24–1.68 % | 0.78–1.74 % |
+| 起音电平 | 35–53 % | 37–46 % |
+| 句内自然停顿 | 40–190 ms | 40–230 ms |
+| 修剪掉的每段死气 | 72–98 ms | 172–279 ms |
+| `tts.speed` | 1.15 → 87 %、1.3 → 77 % | 1.15 → 81 %、1.3 → 66 %（对 VITS 是更强的杠杆） |
+
+> 换模型后一定要重跑 `calibrate_tts_pauses.py`：这些数字是模型相关的
+> （两个模型的噪声底相差 3 倍、语速相差 35 %）。`tts.trim_ratio` 的默认 0.02
+> 就是「高于两者最高的噪声底 1.74 %」选出来的，这样每段都会被一致地修剪。
 
 ---
 
@@ -728,10 +833,25 @@ python -m winvoice
 | `min_intra < 0.4` 注册失败 | 换安静环境、贴近麦克风、重录 8 遍 |
 | `numpy` 版本冲突 | `pip install "numpy<2"` 或确认所有依赖支持 numpy 2.x |
 | 意图分类总是 UNKNOWN | 1) `python scripts/check_llm.py` 确认 LLM 层 2) 检查 `llm.local.model` 是否与 llama-server 加载的一致 |
-| TTS 只有 8 kHz 音质 | icefall aishell3 原生即为 8 kHz，属正常现象 |
+| **音质像电话 / 只有 8 kHz** | 说明跑的是**回退模型**（`vits-icefall-zh-aishell3` 原生 8 000 Hz）。看启动日志：`tts_initialized backend=vits sample_rate=8000` 且带 `tts_primary_model_missing` 警告 → 下新模型 `python scripts/download_models.py --tts`。正确状态是 `backend=matcha sample_rate=22050` |
+| **播报有咔哒声 / 断续** | 1) 日志 `player_utterance_done` 里的 `underruns`（饿死补静音）与 `dropped_blocks`（设备卡死丢块）：前者大说明合成跟不上，调小 `tts.clause_max_chars` 或加大 `audio.output_prebuffer_ms`；后者大说明输出设备有问题 2) 确认 `audio_output_started` 的 `sample_rate` 等于设备原生率（本机 44100）3) 换输出设备试试：`audio.output_device` |
+| **没有声音 / `audio_output_unavailable`** | 输出设备打不开（被独占、被拔掉、驱动问题）。播放层会逐级回退（WASAPI 共享 → WASAPI auto-convert → 系统默认/MME），全失败就降级为静音继续跑，并把每条路由的失败原因写进 `error`。先看设备是否可见：`python -c "import sounddevice as sd; print(sd.query_devices())"` |
+| **打断之后就没声音了** | 不应该发生：`abort()` 撞上正在 `write()` 的喂音线程时，某些驱动会拒绝立刻 `start()`，播放层会重试（0/20/50/100 ms）并最终**重开流**（日志 `audio_restart_failed` → `audio_output_reopened`）。若真出现无声，看这两条日志与 `player_utterance_done` 的 `frames` |
+| **走的是 MME 还是 WASAPI？** | 启动日志 `audio_output_route route=…`：`wasapi shared` 最好（低延迟），`wasapi auto-convert` 次之（Windows 做重采样），`system default` 表示 WASAPI 打不开、退回 MME（延迟最差）。`audio.output_host_api` 可强制 `wasapi` 或 `default` |
+| **发音太快 / 换模型后比以前快很多** | 默认模型从 8 kHz VITS（≈277 ms/字）换成了 Matcha（speed 1.0 时 ≈193 ms/字，快 45 %）。调 `tts.speed`：时长 ∝ 1/speed，默认 0.75 ≈ 250 ms/字；还嫌快用 0.7（≈旧 VITS 语速）、嫌慢用 0.8。**该键引擎只在启动时读一次，改完要重启**（`pause_*`/`chunk_*` 才是热生效的）。先排除播放链路问题：`audio_output_started` 的 `sample_rate` 应为设备原生率、`audio_playback_done` 的 `audio_ms` 应 ≈ 字数 × ms/字 |
+| **音调高 / 声音尖、像小孩**（或反过来：过于中性/低沉） | baker 原生中位 F0 = 276 Hz（p10–p90 196–345）。`tts.pitch` 是纯口味旋钮：1.0 = 原声（当前默认）；嫌高用 0.85–0.9，嫌低用 1.0–1.05。语速不受影响（引擎自动用 `speed/pitch` 补偿）。**要重启**。音色本身（读腔、flat pitch contour）不可调，不满意只能换模型（见「访客和主人声音一样」行） |
+| **一句话里有卡顿 / 语流碎片化（词→断点→词）** | 两个来源，都已处理：①**逐块重采样的边缘伪影**（每 100 ms 块独立 `resample_poly`，接缝处有 20–50 % 峰值的振幅台阶——一个字 2–3 下，即「字内断点」；已改为**按段整段重采样**，接缝只剩段边界且被停顿掩蔽，伪影实测归零到量化底噪）；②**模型自己的句内静音洞**（1–7 个 40–240 ms，位置随机；由 `tts.max_internal_gap_ms` 60 / `internal_gap_keep_ms` 30 压掉，热生效）。排查顺序：先看 `audio_playback_done` 的 `underruns`（>0 见「播报有咔哒声」行）；`underruns=0` 还碎就是②，把阈值降到 50 再试 |
+| **回答上叠加了一层杂音（同一个音、断续规律、忽有忽无）** | **已实锤：Windows「空间音效」（Spatial Sound）**。该 DSP 层在设备上处理所有音频，会周期性产生卡顿杂音；关闭后杂音消失（2026-09-27 用户实测），与黑匣子取证「应用写入设备的数据干净」互相印证。排查入口：设置 → 系统 → 声音 → 属性 → 空间音效 → 关。若关闭后仍有：蓝牙 A2DP↔HFP 切换、其他「音频增强」、其他应用改变端点格式、USB 省电，用 `python scripts/diagnose_playback.py`（杂音在场时）+ `WINVOICE_DIAG_PLAYBACK` 黑匣子对比取证 |
+| **句间停顿太长/太短** | 改 `tts.pause_*`（这些键**热生效**，下一句就变），用 `python scripts/show_segmentation.py "文本"` 先看不合成；`pause_comma_ms` 默认 140 ms 落在实测的自然停顿带 40–190 ms 上沿。**想在任何逗号处都停顿**就把 `tts.clause_max_chars` 调到 14–16（默认 24 表示「一句话不超过 24 字就不在逗号处换气」）；每段自带的噪声底由 `tts.trim_ratio`（默认 0.02）剪掉 |
+| **首句延迟大** | 首块越大越慢：调小 `tts.first_chunk_max_chars`（默认 16）；也确认 `tts.num_threads` 没被设成 1。日志里 `tts_segment` 的 `latency_ms` 是每段合成耗时，`first_segment_ms` 决定出声时间 |
+| **句子被切在奇怪的地方** | 断句规则在 `winvoice/text/segment.py`（禁区：数字内部、括号内、`的` 之后、`了` 之前）。先用 `show_segmentation.py` 复现，再改 `tts.clause_max_chars`（越大越少切）或补连词表 |
+| **访客和主人声音一样** | 单说话人模型的必然结果：matcha zh-baker 只有 1 个说话人，访客只能用 `tts.guest_speed` 区分语速。要真两种音色就换多说话人模型（`models/tts/vits-zh-hf-fanchen-C`，16 kHz，187 说话人，需要改 `tts.model` 并自行下载） |
+| **回复很长（几十秒）** | `tts.reply_max_chars` 默认 240，默认语速（speed 0.75 ≈ 250 ms/字）下 240 字约 60 秒（回退的 8 kHz 模型在 0.75 时 ≈369 ms/字 → 约 90 秒）。嫌长就调小（热生效），或在播报中说唤醒词打断 |
+| 控制台刷 `Unknown token: shei2` | **无害的上游数据缺陷**，可以忽略：Matcha 词表里有 4 条词条（`谁的`/`谁都`/`人生自古谁无死`/`鹿死谁手`）标了 pinyin `shei2`，但模型 `tokens.txt` 里只有 `shui2`。实测：这行**每次 `generate()` 都恰好打一次、与文本无关**，而且 `谁的`(580 ms) ≈ `谁`(362 ms) + `的`(269 ms)，两个音节都念出来了 —— 不是丢字。真正会丢字的是拉丁词（见 `OOV ... Ignore it!`） |
 | 唤醒词不灵敏 | 见 §5.3：优先换成中文关键词，其次降 `kws.threshold` 到 0.20，再不行 `kws.use_int8: false` |
 | 控制台刷 `OOV ... Ignore it!`（如 `OOV 90.`、`OOV app.`） | sherpa 中文 VITS 的**词表里没有任何拉丁词条**，数字靠 `number.fst` 展开。① 原文含英文 → 说明有工具把英文错误直接送进了 TTS（应走 `ToolResult.message`，中文面向用户，`error` 只进日志）② 数字被丢 → 检查 TTS 模型目录里 `number.fst` / `date.fst` / `phone.fst` 是否存在（引擎会把它们作为 `rule_fsts` 传入） |
 | 说「打开记事本」被拒绝 | 应用名按中文标签/英文 id/近似拼写解析（`记事本`、`notepad`、`Notpa` 都能命中）；不在白名单内的（微信/QQ）仍会拒绝。若要新增，改 `ALLOWED_APPS` + `APP_SPEECH` |
+| 说「关机」没有反应 / 回「没实现」 | 规则层 `system_power` 触发词：`关机/重启/重新启动/睡眠/休眠/锁屏/锁定屏幕/注销/退出登录`（「怎么关机」是问句，走问答）。执行需主人声纹 + 口头「确认」；关机/重启带 5 秒缓冲（`shutdown /a` 可中止）。日志 `confirmation_armed tool=system_power` |
 | 说「打开谷歌浏览器」回「我没找到…的安装位置」 | 程序既不在 `PATH`、也不在 `App Paths` 注册表里。查 `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe`（Chrome/Edge/VS Code 安装时都会写这个键）；绿色版/免安装版需要手动加进 `PATH`。**这是如实回答**：旧版拿裸名字 `Popen(..., shell=True)` 启动，`chrome.exe` 不在 `PATH` 时 cmd.exe 只打印「不是内部或外部命令」，而工具照样报成功 |
 | 说「关闭记事本」回「好像没有在运行」 | `taskkill` 退出码非 0（128 = 没找到该进程）：现在是如实回答，旧版无论有没有关掉都说「已经关闭」。系统设置是 URI 不是进程，会回「我关不掉系统设置。」 |
 | 说「关闭资源管理器」桌面/任务栏消失 | **旧版缺陷，已修**（2026-09-20）。`explorer.exe` 是 Windows 外壳，旧代码对它执行 `taskkill /f /im explorer.exe`，把整个 GUI 一起杀了。现在改成用 Explorer 自己的自动化对象只关**文件夹窗口**，并且 `explorer.exe` 在 `PROTECTED_PROCESSES` 里、任何情况下都不会被强杀。桌面已丢失的话：`Ctrl+Shift+Esc` → 文件 → 运行新任务 → `explorer.exe` |
@@ -740,9 +860,12 @@ python -m winvoice
 | 想强制关闭 | 说「**强制**关闭记事本」。`force` 只在你明确要求时才用 —— 它不弹保存提示，未保存的内容会直接被丢掉 |
 | 「用浏览器搜索天气」没开浏览器 / 「查一下天气」却开了浏览器 | 规则层按触发词分流：`搜索/搜一下/百度/google/search` 属**显式搜索**，优先于一切话题（开浏览器）；`查一下/查询` 是弱触发词，由话题决定（问天气）。改 `_EXPLICIT_SEARCH` / `_WEAK_SEARCH` 后跑 `pytest tests/unit/test_weather_speech.py tests/unit/test_web_search.py` |
 | 音量「调高」「调低」方向不对 | 方向词已覆盖 `调高/调低/调大/调小/减小/降低/小声/小一点/down/lower…`；绝对量走 `level`（0–100），相对量走 `delta`，两者不可混用 |
-| 写文件/跑脚本永远提示需要确认 | 确认回路尚未实现（`CONFIRMATION_REQUIRED`），见 README「Known limitations」 |
+| 写文件/跑脚本/搜索没执行，先听到一个问题 | 这就是**确认回路**：说「确认」执行、「取消」放弃、说别的等于改主意（该句作废挂起请求并按新指令处理）、沉默 15 秒作废（`tools.confirm_timeout_s`，热生效）。`search_web` 的先问后开由 `tools.search_web_confirm` 控制；关掉即恢复「说了就开」。Agent 经 MCP 调用不受确认回路影响 |
+| 说「确认」没有反应 | 确认等待期麦克风直接进 ASR（无需唤醒词），但窗口只有 15 秒，超时已作废（日志 `confirmation_expired`）。另检查 `tools.confirm_required` 是否为 `true`、说话人是否与当初请求的一致（换人会被拒，日志 `confirmation_speaker_mismatch`） |
+| 问答（「什么是X」）回「答不上来」 | llama-server 没起或超时（`llm.ask.timeout_s`，默认 20 s，3B CPU 生成约 10–20 token/s）。`python scripts/check_llm.py` 确认 LLM 层；答案里若全是英文会被可朗读过滤掉，同样回这句。`llm.ask.enabled: false` 也会明说没打开。打招呼（「你好/谢谢/再见」）不经过模型，任何时候都能回 |
+| 说「没事了」没回到待唤醒 | 规则层 DISMISS 是**兜底位**：句子里若带具体指令（「算了，打开记事本」）会按指令走。纯「没事了/不用了/算了/退下」应回「好的。」并回到等待唤醒（日志 `intent_rule_matched intent=dismiss`） |
 | 启动日志出现 `dsh_not_enabled` | 正常：`dsh.enabled` 或 `dsh.local.enabled` 为 `false`（默认都是 false）。要启用见 §2.4 |
-| 说了复杂指令却回「抱歉，这个请求我还没有实现。」 | 规则层没命中、而 DSH 没启用：此时没有模型层可以接。开 `dsh.enabled` + `dsh.local.enabled`，或让说法落到 10 个工具之一 |
+| 说了复杂指令却回「抱歉，这个请求我还没有实现。」 | 规则层没命中、而 DSH 没启用：此时没有模型层可以接。开 `dsh.enabled` + `dsh.local.enabled`，或让说法落到 12 个工具之一 |
 | `dsh_settings_unavailable` / `ModuleNotFoundError: deepseek_harness` | 可选依赖没装。`python -m pip install --target .pylibs --upgrade mcp deepseek-harness-sdk deepseek-harness-runtime-bin` |
 | Agent 完全不知道有工具（只会聊天） | 桥接 bundle 没装或没进 profile：跑 `python scripts/install_dsh_bridge.py --verify`。它应输出 `[OK] mcp-winvoice is present in the composed configuration` |
 | `patch: entry "mcp-winvoice" not found` | 有人手写了补丁行而没用 `insert:` 包一层。删掉手写的那份，改用 `scripts/install_dsh_bridge.py` 生成 |
@@ -752,6 +875,8 @@ python -m winvoice
 | 工具说成功了但 DSH 仍升级到云端 | 这是**验证器**在起作用：`verification.status == failed` 表示机器状态与目标不符。日志里搜 `tool_verified` 看是哪一项 check 没过（例如 `process_running`） |
 | 问「现在几点了」回「这个请求我还没有实现」 | 该意图没有映射到工具。检查 `AudioPipeline._intent_to_tool_calls` 里有 `get_time`，且 `ToolName.GET_TIME` 已注册（`pytest tests/unit/test_time_speech.py`） |
 | 天气一直回「暂时查不到天气」 | 1) 有没有网：`python -c "import httpx;print(httpx.get('https://wttr.in/Beijing?format=j1&timeout=5').status_code)"` 2) `weather.enabled` 是否为 `true` 3) `weather.timeout_s` 太小（默认 5 s）。句子里说的地名 wttr.in 认不出时（它会返回 500），会自动改用 `weather.city` 再查一次；只有**网络**类失败才会直接回这句兜底 |
+| 打开命令提示符/命令行窗口没弹新窗口，助手窗口里刷出 cmd 横幅 | **已修复（2026-09-27）**：控制台子系统程序用 `Popen` 启动时会**继承调用方的控制台**——cmd 的横幅打进助手窗口、还共享它的 stdin。现在 `_launch` 读 PE 头的 Subsystem 字段（CUI=3，免维护名单），给控制台程序加 `CREATE_NEW_CONSOLE` 弹独立窗口；GUI 程序不受影响。回归：`pytest tests/unit/test_app_launch.py` |
+| 问「明天X天气」回了北京的今天 | **已修复（2026-09-27）**：旧版两个叠加缺陷——①城市提取的 4 字贪婪窗口在「明天佛山**的**天气」里错位成「天佛山」，wttr.in 500 后静默回退 `weather.city`；②「明天」被无视、永远答今天。现在「的」在提取窗口外、`day` 参数选择预报条目（payload 只有今天时会如实说「今天」）。回归：`pytest tests/unit/test_weather_speech.py` |
 | 天气念成英文 / 缺一半字 | 天气描述必须走内置中文对照表：wttr.in 即使带 `lang=zh` 也只返回英文（`weatherDesc` 与 `lang_zh` 均为英文，已实测）。若出现新的 `weatherCode`，在 `winvoice/tools/weather.py` 的 `WEATHER_CODE_ZH` 补中文，并用 `pytest tests/unit/test_speech_is_pronounceable.py -k weather` 验证这些字在 TTS 词表里 |
 | 工具明明成功了，却只听到「好的，已为您完成。」 | 该工具没有写 `ToolResult.message`，或写的是英文（含拉丁字母会被拒绝并回退）。成功也念 `message`，见 README「Spoken output」 |
 | 答话被截断在半句 | `winvoice/contracts/speech.py` 的 `clip_for_speech` 会截到 80 字（优先在句号处）。工具该给短句，长内容请改成「一共有 N 项，前几项是…」 |
@@ -770,9 +895,13 @@ python -m winvoice
 │   │   └── winvoice_keywords_<sha1>.txt     # 运行时生成的唤醒词 token（需目录可写）
 │   ├── vad/silero_vad_v5.onnx
 │   ├── asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/
-│   ├── tts/vits-icefall-zh-aishell3/
+│   ├── tts/matcha-icefall-zh-baker/          # 默认：22.05 kHz
+│   │   ├── model-steps-3.onnx · lexicon.txt · tokens.txt
+│   │   ├── vocos-22khz-univ.onnx             # 声码器（缺了发不出声音）
+│   │   └── number.fst / date.fst / phone.fst # 数字、日期、电话的文本规范化规则
+│   ├── tts/vits-icefall-zh-aishell3/         # 回退：8 kHz（174 说话人）
 │   │   ├── model.onnx · lexicon.txt
-│   │   └── number.fst / date.fst / phone.fst   # 数字、日期、电话的文本规范化规则
+│   │   └── number.fst / date.fst / phone.fst
 │   ├── sv/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx
 │   ├── sv/profiles/me.json                  # 声纹档案（注册后生成）
 │   └── llm/qwen2.5-3b-instruct-q4_k_m.gguf
@@ -787,13 +916,17 @@ python -m winvoice
 ├── scripts/
 │   ├── download_models.py                   # 下载模型
 │   ├── smoke_test_models.py                 # 引擎冒烟测试（真实模型）
+│   ├── show_segmentation.py                 # 看一句话会被怎么切、停多久（不需模型）
+│   ├── calibrate_tts_pauses.py              # 标定当前模型的边缘静音/语速/自然停顿
 │   ├── check_llm.py                         # LLM 层检查
 │   ├── install_dsh_bridge.py                # 生成并安装 DSH 桥接 bundle
 │   └── verify_install.py                    # 依赖检查
 └── winvoice/                                # 源码包
     ├── mcp_server.py                        # 把工具注册表暴露给 DSH（MCP stdio）
     ├── dsh/                                 # DSH 客户端、升级策略、配置、桥接 bundle
-    ├── contracts/speech.py                  # 可朗读规则（中文、≤80 字）
+    ├── text/                                # 规范化/语义断句/短句分块/停顿表（纯函数）
+    ├── contracts/speech.py                  # 可朗读规则（中文、长度预算 → 见 text/）
+    ├── audio/playback.py                    # 常驻输出流 + 缓冲 + 停顿 + 打断
     ├── tools/verifier.py                    # 验证器：用机器状态核对工具结果
     └── tools/weather.py                     # 天气工具 + WWO 码中文对照表
 ```
@@ -804,7 +937,7 @@ python -m winvoice
 
 - [ ] `python -m winvoice --check` → `Startup check PASSED`（5 个引擎全部加载）
 - [ ] `python scripts/smoke_test_models.py` → `18/18 passed`
-- [ ] `python -m pytest tests/ -q` → `344 passed, 1 skipped`
+- [ ] `python -m pytest tests/ -q` → 全绿（2026-09-27：561 passed, 1 skipped）
 - [ ] `llama-server` 在 8080 端口监听，`main: server is listening on http://127.0.0.1:8080`
 - [ ] `python scripts/check_llm.py` → `9/9 intents matched`，`grammar-constrained decoding: ACTIVE`
 - [ ] `python -m winvoice` 启动 → `microphone_open` + `pipeline_started`

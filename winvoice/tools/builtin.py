@@ -234,12 +234,43 @@ def resolve_app_command(command: str) -> Optional[str]:
     return shutil.which(command) or None
 
 
+def _is_console_app(path: str) -> bool:
+    """
+    True when the executable is a console-subsystem binary.
+
+    A console program started without a console of its own *inherits* the
+    caller's: 「打开命令提示符」 used to print cmd's banner into the assistant's
+    own window and sit there sharing its stdin — no new window, just the
+    assistant's console "refreshing in place" (live report, 2026-09-27).
+    The subsystem byte is read from the PE header
+    (IMAGE_SUBSYSTEM_WINDOWS_CUI = 3) rather than maintained as a name list,
+    so the next console app added to the allowlist is correct without anyone
+    having to remember this. Unreadable/foreign binaries are treated as GUI:
+    the launch then behaves exactly as before.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0x3C)  # DOS header: e_lfanew, the offset of the PE header
+            pe_offset = int.from_bytes(f.read(4), "little")
+            # signature (4) + COFF header (20) + OptionalHeader.Subsystem (68)
+            f.seek(pe_offset + 4 + 20 + 68)
+            subsystem = int.from_bytes(f.read(2), "little")
+    except OSError:
+        return False
+    return subsystem == 3  # IMAGE_SUBSYSTEM_WINDOWS_CUI
+
+
 def _launch(command: str) -> None:
     """Start a resolved program; raises when the OS refuses."""
     if Path(command).suffix.lower() in (".cmd", ".bat"):
         # CreateProcess cannot run a script file: it needs a shell. VS Code's
         # `code.cmd` is reached this way when it has no App Paths entry.
         subprocess.run([os.environ.get("COMSPEC", "cmd.exe"), "/c", command], check=True)
+    elif _is_console_app(command):
+        # cmd.exe, powershell.exe: a console program must get a console of its
+        # own, or it borrows this process's — printing its banner into the
+        # assistant's window and sharing its stdin.
+        subprocess.Popen([command], creationflags=subprocess.CREATE_NEW_CONSOLE)
     else:
         # No shell: a shell would start, print 「不是内部或外部命令」 and exit 0,
         # which is how a failed launch was reported as success.
@@ -591,6 +622,74 @@ def read_file(args: Dict[str, Any]) -> Dict[str, Any]:
         return {"success": False, "error": str(e), "message": "读取这个文件的时候出错了。"}
 
 
+# How many entry names a directory listing may speak. A folder with sixty
+# files must not become sixty seconds of TTS: the count carries the information
+# and a handful of names makes it concrete.
+LIST_DIR_SPOKEN_NAMES = 4
+
+
+def list_dir(args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    List the entries of a folder, by count plus a few speakable names.
+
+    Same confinement as `read_file`: only under the user directory. Without a
+    path the user directory itself is listed — that is what 「当前目录下有什么
+    文件」 means for a voice assistant, whose working directory is meaningless
+    to the person talking to it.
+
+    The spoken message needs the same care as every other `message`: file names
+    are precisely where Latin text lives (`Desktop`, `setup.py`), and the
+    Chinese TTS lexicon drops every Latin word silently. So the count is always
+    spoken, names are filtered through `has_latin`, and a listing with nothing
+    pronounceable in it says so instead of reading a number followed by holes.
+    """
+    raw = str(args.get("path") or "").strip()
+    user_dir = Path.home()
+    try:
+        target = (Path(raw).expanduser() if raw else user_dir).resolve()
+        target.relative_to(user_dir)
+    except ValueError:
+        return {
+            "success": False,
+            "error": f"Path not allowed (outside user directory): {raw}",
+            "message": "我只能列出你自己目录下的文件夹。",
+        }
+    except Exception as e:
+        logger.warning("list_dir_failed", path=raw, error=str(e))
+        return {"success": False, "error": str(e), "message": "查看这个文件夹的时候出错了。"}
+
+    if not target.exists():
+        return {"success": False, "error": f"Not found: {target}", "message": "没有找到这个文件夹。"}
+    if not target.is_dir():
+        return {"success": False, "error": f"Not a directory: {target}", "message": "这个路径不是文件夹。"}
+
+    try:
+        with os.scandir(target) as entries:
+            # Directories first, then files, each alphabetical — the order the
+            # names are spoken in.
+            names = [entry.name for entry in sorted(
+                entries, key=lambda e: (not e.is_dir(), e.name.lower()),
+            )]
+    except OSError as e:
+        logger.warning("list_dir_failed", path=str(target), error=str(e))
+        return {"success": False, "error": str(e), "message": "查看这个文件夹的时候出错了。"}
+
+    total = len(names)
+    if total == 0:
+        return {"success": True, "message": "这个文件夹是空的。", "count": 0, "entries": [], "path": str(target)}
+
+    speakable = [name for name in names if not has_latin(name)]
+    head = speakable[:LIST_DIR_SPOKEN_NAMES]
+    if head:
+        message = f"一共有{total}项，前面几项是{'、'.join(head)}"
+        if total > len(head):
+            message += "，还有其他"
+        message += "。"
+    else:
+        message = f"一共有{total}项，名字念不出来，请看屏幕。"
+    return {"success": True, "message": message, "count": total, "entries": names, "path": str(target)}
+
+
 def write_file(args: Dict[str, Any]) -> Dict[str, Any]:
     """Write content to a file."""
     path = Path(args.get("path", "")).resolve()
@@ -669,6 +768,74 @@ def run_script(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("run_script_failed", path=str(path), error=str(e))
         return {"success": False, "error": str(e), "message": "运行这个脚本的时候出错了。"}
+
+
+# ──────────────────────────────────────────────────────────────
+# Power Actions
+# ──────────────────────────────────────────────────────────────
+
+# The action spoken to the user — one source for the confirmation question the
+# pipeline asks (`我将要关机，确认请说确认…`) and the refusal wording below.
+POWER_ACTION_SPEECH = {
+    "shutdown": "关机",
+    "restart": "重启",
+    "sleep": "进入睡眠",
+    "hibernate": "休眠",
+    "lock": "锁屏",
+    "signout": "注销",
+}
+
+# Seconds between the confirmed command and the machine acting. Long enough to
+# say 「等等!」 and abort (`shutdown /a`), short enough to feel obedient.
+POWER_DELAY_S = 5
+
+# Each action's command and what to say once it has been *initiated*. These
+# claim no outcome beyond the start — sleep may degrade to hibernate depending
+# on the machine's power configuration, and there is no way to observe the
+# difference from here (same honesty class as `media_control`).
+POWER_COMMANDS = {
+    "shutdown": (["shutdown", "/s", "/t", str(POWER_DELAY_S)], f"机器将在 {POWER_DELAY_S} 秒后关机。"),
+    "restart": (["shutdown", "/r", "/t", str(POWER_DELAY_S)], f"机器将在 {POWER_DELAY_S} 秒后重启。"),
+    "sleep": (["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"], "正在进入睡眠。"),
+    "hibernate": (["shutdown", "/h"], "正在休眠。"),
+    "lock": (["rundll32.exe", "user32.dll,LockWorkStation"], "已经锁定屏幕。"),
+    "signout": (["shutdown", "/l"], "正在注销。"),
+}
+
+
+def system_power(args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Power actions on this machine: shutdown, restart, sleep, hibernate, lock,
+    sign out.
+
+    Three gates stand between a spoken 「关机」 and the machine acting, and all
+    three are inherited rather than reimplemented here: the registry demands a
+    spoken confirmation (`requires_confirmation`), the speaker tier must be the
+    owner's (`guest_allowed=False` — a guest reaching this handler is already
+    impossible), and the agent's MCP path can never supply that confirmation,
+    so no model tier can shut the machine down either.
+
+    Fire-and-forget on purpose: `subprocess.run` here would hold the audio loop
+    for the whole action (a `sleep` command does not return until the machine
+    wakes). Like `media_control`, the message says the action was *initiated* —
+    sleep degrading to hibernate on some power configurations is not
+    observable from this side.
+    """
+    action = str(args.get("action", "")).strip().lower()
+    if action not in POWER_COMMANDS:
+        return {
+            "success": False,
+            "error": f"Unknown power action: {action}",
+            "message": "我没听清要执行哪种电源操作。",
+        }
+
+    command, spoken = POWER_COMMANDS[action]
+    try:
+        subprocess.Popen(command)
+    except OSError as e:
+        logger.warning("system_power_failed", action=action, error=str(e))
+        return {"success": False, "error": str(e), "message": "执行这个操作的时候出错了。"}
+    return {"success": True, "message": spoken, "action": action}
 
 
 # ──────────────────────────────────────────────────────────────

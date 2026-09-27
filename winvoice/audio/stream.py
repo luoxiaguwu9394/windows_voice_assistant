@@ -1,19 +1,20 @@
 """
-Audio I/O Stream Manager.
+Audio I/O Stream Manager — microphone input only.
 
-Handles microphone input and speaker output using sounddevice.
-Provides callback-based streaming for the audio pipeline.
+Playback deliberately does **not** live here. It used to: `play_audio()` opened an
+`OutputStream` per sample rate and wrote TTS chunks straight into it, which meant
+no buffer, no pause between sentences, and an 8 kHz MME stream on a 44.1 kHz
+device (see `winvoice/audio/playback.py`, which replaced it). Keeping a second
+way to write PCM to a device is how that defect would come back.
 """
 
 from __future__ import annotations
 
-import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Deque, Optional
 
-import numpy as np
 import sounddevice as sd
 
 from winvoice.config import get_config
@@ -34,10 +35,10 @@ class StreamConfig:
 
 class AudioStreamManager:
     """
-    Manages audio input/output streams.
+    Manages the microphone input stream.
 
     - Input: Microphone → callback → AudioFrame queue
-    - Output: Speaker playback from TTS chunks
+    - Output: not here — see `winvoice.audio.playback.SpeechPlayer`
     """
 
     def __init__(
@@ -53,7 +54,6 @@ class AudioStreamManager:
         self.on_audio_frame = on_audio_frame
 
         self._input_stream: Optional[sd.InputStream] = None
-        self._output_stream: Optional[sd.OutputStream] = None
         self._running = False
         self._frame_queue: Deque[AudioFrame] = deque(maxlen=1000)
         self._trace_id = ""
@@ -98,41 +98,19 @@ class AudioStreamManager:
         logger.info("audio_input_started", sample_rate=self.config.sample_rate, blocksize=self.config.blocksize)
 
     def stop(self) -> None:
-        """Stop audio streams."""
+        """Stop the microphone stream."""
         self._running = False
         if self._input_stream:
             self._input_stream.stop()
             self._input_stream.close()
             self._input_stream = None
-        if self._output_stream:
-            self._output_stream.stop()
-            self._output_stream.close()
-            self._output_stream = None
-        logger.info("audio_streams_stopped")
+        logger.info("audio_stream_stopped")
 
     def get_frame(self) -> Optional[AudioFrame]:
         """Get next audio frame (non-blocking)."""
         if self._frame_queue:
             return self._frame_queue.popleft()
         return None
-
-    async def play_audio(self, pcm_bytes: bytes, sample_rate: int = 16000) -> None:
-        """Play PCM audio to output device."""
-        if self._output_stream is None or self._output_stream.samplerate != sample_rate:
-            if self._output_stream:
-                self._output_stream.stop()
-                self._output_stream.close()
-            self._output_stream = sd.OutputStream(
-                samplerate=sample_rate,
-                channels=1,
-                dtype="int16",
-                blocksize=1600,
-                latency="low",
-            )
-            self._output_stream.start()
-
-        audio = np.frombuffer(pcm_bytes, dtype=np.int16)
-        self._output_stream.write(audio)
 
     @property
     def is_running(self) -> bool:

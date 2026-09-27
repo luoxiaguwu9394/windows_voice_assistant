@@ -129,6 +129,29 @@ _WEAK_SEARCH = r"查一下|查询"
 # never leaves a verb fragment in the query.
 _SEARCH_VERBS = rf"{_EXPLICIT_SEARCH}|{_WEAK_SEARCH}"
 
+# ──────────────────────────────────────────────────────────────
+# Question / small-talk / dismissal vocabulary (ASK, DISMISS)
+# ──────────────────────────────────────────────────────────────
+
+# These are evaluated late in the rule order: 「音量怎么调小」 must stay a
+# volume command and 「今天天气怎么样」 a weather query, so the specific topics
+# are matched first and only what they all decline reaches the question
+# patterns — which then route to the tool-free Q&A path.
+_ASK_QUESTION = (
+    r"什么是|什么叫|为什么|为啥|如何|怎么|怎样|是谁|什么|介绍|讲讲|说说|聊聊"
+    r"|给我讲|你知道吗|你会不会|有没有|能不能"
+)
+_ASK_GREET = (
+    r"你好|您好|嗨|哈喽|\bhello\b|\bhi\b|在吗|早上好|中午好|下午好|晚上好"
+)
+_ASK_THANKS = r"谢谢你|谢谢|多谢|感谢"
+_ASK_BYE = r"再见|拜拜|晚安"
+
+# 「没事了」 after the wake word means "nothing, at ease": acknowledge and go
+# back to waiting. Kept last in the rule order so that 「算了，打开记事本」
+# still opens Notepad — bare dismissals are what falls through everything else.
+_DISMISS = r"没事了|没事儿|没什么事了|没什么|退下|一边去|当我没说|不用了|算了|never\s?mind"
+
 # Patterns are evaluated in dict order and the first hit wins, so the more
 # specific intents are listed first. In particular `运行脚本` must be checked
 # before OPEN_APP, whose verb list also contains `运行`.
@@ -159,6 +182,27 @@ RULE_PATTERNS: Dict[IntentName, List[str]] = {
     IntentName.GET_TIME: [
         r"几点|什么时间|现在时间|time|clock",
     ],
+    # Before ASK, whose 「什么/怎么」 patterns would otherwise swallow the
+    # file-listing questions 「目录下有什么文件」「文件夹里有什么」.
+    IntentName.LIST_DIR: [
+        r"列出文件|列出目录|列一下目录|列出所有|什么文件|哪些文件|文件列表"
+        r"|目录下|目录里|文件夹里|看看目录|list\s+(?:the\s+)?files?",
+    ],
+    # Before SEARCH_WEB's weak verbs: 「怎么搜索」 is a question about how,
+    # not a request to open the browser.
+    IntentName.ASK: [
+        _ASK_QUESTION,
+        _ASK_GREET,
+        _ASK_THANKS,
+        _ASK_BYE,
+    ],
+    # After ASK (「怎么关机」 is a question about how) and before OPEN_APP
+    # (「重新启动电脑」 contains 启动 and must not become a failed app launch).
+    # Everything here is registry-gated: confirmation required, guest denied.
+    IntentName.SYSTEM_POWER: [
+        r"关机|重启|重新启动|睡眠|休眠|锁屏|锁定屏幕|注销|退出登录"
+        r"|\b(?:shutdown|restart|reboot|log\s?off|sign\s?out)\b",
+    ],
     IntentName.SEARCH_WEB: [
         _SEARCH_VERBS,
     ],
@@ -168,6 +212,11 @@ RULE_PATTERNS: Dict[IntentName, List[str]] = {
     ],
     IntentName.CLOSE_APP: [
         r"关闭|退出|close|quit|exit",
+    ],
+    # Last: a dismissal only counts when nothing more specific was asked, so
+    # 「算了，打开记事本」 still opens Notepad.
+    IntentName.DISMISS: [
+        _DISMISS,
     ],
 }
 
@@ -204,7 +253,43 @@ _WEATHER_NOT_A_CITY = set("看查问帮我知道想要了解说讲下吗呢么�
 # or Latin for a name ASR left in Latin script (`New York天气`). Latin names
 # are matched too because falling back to the configured city there would
 # answer about the wrong place without saying so.
-_WEATHER_CITY_PATTERN = r"([\u4e00-\u9fa5]{2,4}|[A-Za-z][A-Za-z.'\- ]{0,23}?)\s*天气"
+#
+# The optional 「的」 sits *outside* the group. Spoken requests routinely say
+# 「明天佛山的天气怎么样」, and with 「的」 inside the greedy 2-4 character
+# window the group came out as 「天佛山的」 — a token that is not a place, which
+# wttr.in answered 500 and the tool then silently swapped for the configured
+# city (live bug report, 2026-09-27: asked about 佛山, heard 北京).
+_WEATHER_CITY_PATTERN = r"([\u4e00-\u9fa5]{2,4}|[A-Za-z][A-Za-z.'\- ]{0,23}?)(?:的)?\s*天气"
+
+# Which forecast day the question names. wttr.in's j1 payload carries three
+# days (today, tomorrow, the day after), so the offsets are 0-2; 大后天 has no
+# entry and maps to 后天 — the sentence names the day it reports, which is
+# closer than answering about today.
+_WEATHER_DAY_OFFSETS = (("大后天", 2), ("后天", 2), ("明天", 1), ("明晚", 1))
+
+# ──────────────────────────────────────────────────────────────
+# Power actions (SYSTEM_POWER)
+# ──────────────────────────────────────────────────────────────
+
+# Trigger vocabulary first, in specificity order — 重新启动 must be extracted
+# before 重启 is irrelevant (no substring overlap), but the *pattern* below has
+# to outrank OPEN_APP, whose verb list contains 启动.
+_POWER_ACTIONS = (
+    ("重新启动", "restart"),
+    ("重启", "restart"),
+    ("关机", "shutdown"),
+    ("休眠", "hibernate"),
+    ("睡眠", "sleep"),
+    ("锁定屏幕", "lock"),
+    ("锁屏", "lock"),
+    ("退出登录", "signout"),
+    ("注销", "signout"),
+    ("shutdown", "shutdown"),
+    ("restart", "restart"),
+    ("reboot", "restart"),
+    ("log off", "signout"),
+    ("sign out", "signout"),
+)
 
 
 def _weather_city(text: str) -> Optional[str]:
@@ -358,6 +443,11 @@ def _extract_args(intent: IntentName, text: str) -> dict:
         city = _weather_city(text)
         if city:
             args["city"] = city
+        # 「明天/后天」 select the forecast day; absent means today.
+        for token, offset in _WEATHER_DAY_OFFSETS:
+            if token in text:
+                args["day"] = offset
+                break
 
     elif intent == IntentName.READ_FILE:
         # Longest alternative first, so "读取文件 X" yields X, not "文件 X".
@@ -374,5 +464,37 @@ def _extract_args(intent: IntentName, text: str) -> dict:
         value = after_verb(r"运行脚本|执行脚本|跑一下脚本|运行|执行|run\s+script|run")
         if value:
             args["path"] = value
+
+    elif intent == IntentName.LIST_DIR:
+        # A spoken folder path cannot be extracted reliably, so the handler
+        # defaults to the user directory when `path` is absent.
+        pass
+
+    elif intent == IntentName.ASK:
+        # Deterministic small talk needs no model; a real question is passed
+        # through verbatim and answered by the tool-free Q&A path.
+        if not re.search(_ASK_QUESTION, text, re.IGNORECASE):
+            if re.search(_ASK_GREET, text, re.IGNORECASE):
+                args["kind"] = "greet"
+            elif re.search(_ASK_THANKS, text, re.IGNORECASE):
+                args["kind"] = "thanks"
+            elif re.search(_ASK_BYE, text, re.IGNORECASE):
+                args["kind"] = "bye"
+            else:
+                args["question"] = text
+        else:
+            args["question"] = text
+
+    elif intent == IntentName.DISMISS:
+        pass
+
+    elif intent == IntentName.SYSTEM_POWER:
+        # Both halves come from the same table, so a word that triggers the
+        # intent is always a word that yields an action.
+        hay = text.lower()
+        for token, action in _POWER_ACTIONS:
+            if token in hay:
+                args["action"] = action
+                break
 
     return args

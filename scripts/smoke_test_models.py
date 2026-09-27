@@ -278,7 +278,7 @@ async def test_sv(res: Results) -> None:
         traceback.print_exc()
 
 
-async def test_tts(res: Results) -> None:
+async def test_tts(res: Results, save_audio: bool = False) -> None:
     hr("TTS - speech synthesis (real model)")
     import numpy as np
 
@@ -290,27 +290,61 @@ async def test_tts(res: Results) -> None:
     engine = create_tts_engine(use_stub=False)
     try:
         await engine.initialize()
+        model = getattr(engine, "model", None)
         res.add("tts: initialize", True,
-                f"sr={engine.sample_rate} speakers={engine.num_speakers}")
+                f"backend={getattr(model, 'backend', '?')} sr={engine.sample_rate} "
+                f"speakers={engine.num_speakers} trim={engine.speech.trim_silence}")
+        res.add("tts: model on disk", model is not None and model.model_file.exists(),
+                str(getattr(model, "model_file", "?")))
     except Exception as e:
         res.add("tts: initialize", False, f"{type(e).__name__}: {e}")
         traceback.print_exc()
         return
 
-    text = "你好，我是语音助手。"
+    # A reply with two sentences and an internal comma: the segmentation and the
+    # pauses are the point of the smoke test, not just "did audio come out".
+    text = "你好，我是语音助手。今天天气不错，要不要出去走走？"
     try:
         chunks = []
-        async for chunk in engine.synthesize(TtsRequest(text=text, voice="default")):
+        segments = []
+        async for chunk in engine.synthesize(TtsRequest(text=text, voice="default", max_chars=240)):
             chunks.append(chunk)
+            if getattr(chunk, "pause_after_ms", 0):
+                segments.append((chunk.text, chunk.pause_after_ms))
         total = sum(len(c.data) for c in chunks)
         duration_ms = int(total / 2 / engine.sample_rate * 1000)
         res.add("tts: synthesize", total > 0,
                 f"{len(chunks)} chunk(s), {duration_ms} ms audio for {len(text)} chars")
+        res.add("tts: segments carry a pause", len(segments) >= 2,
+                "; ".join(f"{t!r} +{p}ms" for t, p in segments))
+        res.add("tts: pauses are the configured ones",
+                all(p in (
+                    engine.speech.pause_sentence_ms, engine.speech.pause_question_ms,
+                    engine.speech.pause_exclaim_ms, engine.speech.pause_ellipsis_ms,
+                    engine.speech.pause_semicolon_ms, engine.speech.pause_comma_ms,
+                    engine.speech.pause_enumeration_ms, engine.speech.pause_colon_ms,
+                    engine.speech.pause_paragraph_ms, engine.speech.pause_forced_ms,
+                    engine.speech.pause_conjunction_ms, engine.speech.tail_silence_ms,
+                ) for _, p in segments),
+                f"table: comma={engine.speech.pause_comma_ms} sentence={engine.speech.pause_sentence_ms} "
+                f"tail={engine.speech.tail_silence_ms}")
 
         if chunks:
             pcm = np.frombuffer(b"".join(c.data for c in chunks), dtype=np.int16)
             peak = int(np.abs(pcm).max())
             res.add("tts: audio not silent", peak > 0, f"peak={peak}")
+
+            if save_audio:
+                import wave
+
+                out = ROOT / "runtime" / "smoke_tts.wav"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                with wave.open(str(out), "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(engine.sample_rate)
+                    w.writeframes(pcm.tobytes())
+                print(f"        (wrote {out} for listening - {engine.sample_rate} Hz)")
     except Exception as e:
         res.add("tts: synthesize", False, f"{type(e).__name__}: {e}")
         traceback.print_exc()
@@ -353,6 +387,11 @@ TESTS: dict[str, Callable] = {
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Smoke-test the audio engines against real models")
     parser.add_argument("--only", choices=list(TESTS), help="run a single engine test")
+    parser.add_argument(
+        "--save-audio",
+        action="store_true",
+        help="write runtime/smoke_tts.wav so the TTS output can be listened to",
+    )
     args = parser.parse_args()
 
     print("Windows Voice Assistant - real-model smoke test")
@@ -363,7 +402,10 @@ async def main() -> int:
 
     for name in names:
         try:
-            await TESTS[name](res)
+            if name == "tts":
+                await TESTS[name](res, save_audio=args.save_audio)
+            else:
+                await TESTS[name](res)
         except Exception as e:
             res.add(f"{name}: unexpected failure", False, f"{type(e).__name__}: {e}")
             traceback.print_exc()

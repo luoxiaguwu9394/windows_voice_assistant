@@ -17,11 +17,13 @@ model rather than a user of it.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, Optional, Set
 
 import pytest
 
 from winvoice.contracts import SpeakerTier, ToolCall, ToolName
+from winvoice.tools import builtin
 from winvoice.tools.executor import ToolExecutor
 from winvoice.tools.state_capture import PathState
 
@@ -141,7 +143,9 @@ async def test_verification_is_attached_to_the_result() -> None:
     assert result.verification["verified"] is True
 
 
-async def test_a_verified_goal_does_not_rewrite_an_honest_failure() -> None:
+async def test_a_verified_goal_does_not_rewrite_an_honest_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     `close_app` on something that is not running reports failure — a truthful,
     useful answer. The postcondition (the app is not running) nevertheless holds,
@@ -152,11 +156,30 @@ async def test_a_verified_goal_does_not_rewrite_an_honest_failure() -> None:
     not close it"), and both are honest. What this test pins is that the
     verifier's `verified` verdict does not overwrite either of them with a false
     claim of success.
+
+    `taskkill` itself is stubbed: this test used to run the real one, so it
+    passed on machines without Notepad open and *closed the developer's actual
+    Notepad window* on machines with it — an environment-dependent flake.
     """
+
+    class _FakeTaskkill:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def run(self, command, **kwargs):
+            self.calls.append(list(command))
+            return SimpleNamespace(
+                returncode=128, stdout="", stderr='错误: 没有找到进程 "notepad.exe"。'
+            )
+
+    fake = _FakeTaskkill()
+    monkeypatch.setattr(builtin.subprocess, "run", fake.run)
+
     executor = ToolExecutor(probe=FakeProbe(processes={"explorer.exe"}))
 
     result = await executor.execute(ToolCall(tool=ToolName.CLOSE_APP, args={"app": "记事本"}))
 
+    assert fake.calls and fake.calls[0][:2] == ["taskkill", "/im"], fake.calls
     assert result.success is False
     assert result.message and result.message.isascii() is False
     assert "已经关闭" not in result.message

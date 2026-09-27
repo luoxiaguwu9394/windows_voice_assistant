@@ -11,6 +11,7 @@ from ._common import (
     frames_to_float32,
     read_wav,
     to_float32,
+    trim_edge_silence,
 )
 from .kws import KwsEngine, KwsResult, StubKwsEngine, create_kws_engine
 from .vad import StubVadEngine, VadEngine, VadSegment, create_vad_engine
@@ -22,8 +23,23 @@ from .sv import (
     SvResult,
     create_sv_engine,
 )
-from .tts import StubTtsEngine, TtsChunk, TtsEngine, create_tts_engine
+from .tts import (
+    StubTtsEngine,
+    TtsChunk,
+    TtsEngine,
+    TtsModel,
+    build_offline_tts,
+    create_tts_engine,
+    resolve_tts_model,
+)
 from .pipeline import AudioPipeline, PipelineContext, PipelineState
+from .playback import (
+    AudioOutputUnavailable,
+    NullSpeechPlayer,
+    PlaybackStats,
+    SpeechPlayer,
+    create_speech_player,
+)
 from .stream import AudioStreamManager, StreamConfig, create_audio_stream
 
 __all__ = [
@@ -32,6 +48,7 @@ __all__ = [
     "to_float32",
     "frames_to_float32",
     "float32_to_pcm",
+    "trim_edge_silence",
     "read_wav",
     # KWS
     "KwsEngine", "KwsResult", "StubKwsEngine", "create_kws_engine",
@@ -42,8 +59,11 @@ __all__ = [
     # SV
     "SvEngine", "SvResult", "SpeakerProfile", "StubSvEngine", "create_sv_engine",
     # TTS
-    "TtsEngine", "TtsChunk", "StubTtsEngine", "create_tts_engine",
-    # pipeline / stream
+    "TtsEngine", "TtsChunk", "TtsModel", "StubTtsEngine", "create_tts_engine",
+    "resolve_tts_model", "build_offline_tts",
+    # pipeline / stream / playback
     "AudioPipeline", "PipelineState", "PipelineContext",
     "AudioStreamManager", "StreamConfig", "create_audio_stream",
+    "SpeechPlayer", "NullSpeechPlayer", "PlaybackStats",
+    "AudioOutputUnavailable", "create_speech_player",
 ]

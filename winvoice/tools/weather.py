@@ -87,14 +87,35 @@ def _description(condition: Dict[str, Any]) -> str:
     return WEATHER_CODE_ZH.get(str(condition.get("weatherCode", "")).strip(), "")
 
 
-def _midday_condition(today: Dict[str, Any]) -> Dict[str, Any]:
-    """The forecast's midday entry: a serviceable 'today' when `current` is absent."""
-    hourly = today.get("hourly")
+def _midday_condition(day: Dict[str, Any]) -> Dict[str, Any]:
+    """The forecast's midday entry: a serviceable 'now' when `current` is absent."""
+    hourly = day.get("hourly")
     if isinstance(hourly, list) and hourly:
         middle = hourly[len(hourly) // 2]
         if isinstance(middle, dict):
             return middle
     return {}
+
+
+# The labels for the forecast days, in payload order (index 0 = today).
+_DAY_WORDS = ("今天", "明天", "后天")
+
+
+def _resolve_day(payload: Dict[str, Any], offset: int) -> tuple[Dict[str, Any], int]:
+    """
+    The forecast entry `offset` days ahead, and the index actually used.
+
+    wttr.in's `weather` array starts at today and `format=j1` carries three
+    days. A payload with fewer entries clamps the index, and the spoken label
+    follows the *clamped* index — a one-day payload asked about 明天 answers
+    about 今天 and says so, instead of labelling today's row 明天.
+    """
+    days = payload.get("weather")
+    if isinstance(days, list) and days:
+        index = min(max(offset, 0), len(days) - 1)
+        if isinstance(days[index], dict):
+            return days[index], index
+    return {}, 0
 
 
 @dataclass(frozen=True)
@@ -105,22 +126,37 @@ class WeatherSummary:
     A named type rather than a loose dict: the spoken sentence and the
     machine-readable result are built from the same instance, so they cannot
     disagree about what the weather is.
+
+    `day_index` is the forecast entry the numbers came from (0 = today) — the
+    sentence's 今天/明天/后天 must be derived from it, not from what was
+    *asked for*, because a short payload clamps the index.
     """
 
     condition: str = ""
     temp_c: Optional[int] = None
     high_c: Optional[int] = None
     low_c: Optional[int] = None
+    day_index: int = 0
 
     @classmethod
-    def from_payload(cls, payload: Dict[str, Any]) -> "WeatherSummary":
+    def from_payload(cls, payload: Dict[str, Any], day_offset: int = 0) -> "WeatherSummary":
+        day, index = _resolve_day(payload, day_offset)
         current = _first_item(payload.get("current_condition"))
-        today = _first_item(payload.get("weather"))
+        if index == 0:
+            # 「现在 X 度」 and the live description only exist for today; a
+            # forecast day has no "now", and quoting today's temperature
+            # against 明天 would be a lie with a number in it.
+            condition = _description(current) or _description(_midday_condition(day))
+            temp_c = _int_field(current, "temp_C")
+        else:
+            condition = _description(_midday_condition(day))
+            temp_c = None
         return cls(
-            condition=_description(current) or _description(_midday_condition(today)),
-            temp_c=_int_field(current, "temp_C"),
-            high_c=_int_field(today, "maxtempC"),
-            low_c=_int_field(today, "mintempC"),
+            condition=condition,
+            temp_c=temp_c,
+            high_c=_int_field(day, "maxtempC"),
+            low_c=_int_field(day, "mintempC"),
+            day_index=index,
         )
 
     def is_empty(self) -> bool:
@@ -142,22 +178,26 @@ class WeatherSummary:
 
     def speech(self, city: str) -> str:
         """
-        One short Chinese sentence about today, or '' if there is nothing to say.
+        One short Chinese sentence about the day that was read, or '' if there
+        is nothing to say.
 
-        `city` is named only when it can be spoken: a Latin place name would be
-        dropped word by word by the lexicon, and calling it 「当地」 would claim
-        the answer is about wherever the user is — which is exactly what is not
-        known when they named somewhere else. So it is left out instead.
+        The day word (今天/明天/后天) follows `day_index` — what the payload
+        actually contained — never what was asked for. `city` is named only
+        when it can be spoken: a Latin place name would be dropped word by
+        word by the lexicon, and calling it 「当地」 would claim the answer is
+        about wherever the user is — which is exactly what is not known when
+        they named somewhere else. So it is left out instead.
         """
         if self.is_empty():
             return ""
 
+        when = _DAY_WORDS[min(self.day_index, len(_DAY_WORDS) - 1)]
         who = str(city or "").strip()
         if has_latin(who):
             who = ""
 
         if self.low_c is not None and self.high_c is not None:
-            head = f"{who}今天{self.condition}" if self.condition else f"{who}今天"
+            head = f"{who}{when}{self.condition}" if self.condition else f"{who}{when}"
             if not self.condition:
                 sentence = f"{head}气温 {self.low_c} 到 {self.high_c} 度"
             else:
@@ -171,14 +211,14 @@ class WeatherSummary:
             else:
                 sentence = f"{head}，气温 {self.temp_c} 度"
         else:
-            sentence = f"{who}今天{self.condition}"
+            sentence = f"{who}{when}{self.condition}"
 
         return f"{sentence}。"
 
 
-def format_spoken_weather(city: str, payload: Dict[str, Any]) -> str:
+def format_spoken_weather(city: str, payload: Dict[str, Any], day_offset: int = 0) -> str:
     """The sentence `get_weather` would speak for `payload` ('' when unusable)."""
-    return WeatherSummary.from_payload(payload).speech(city)
+    return WeatherSummary.from_payload(payload, day_offset).speech(city)
 
 
 async def _fetch_weather_json(url: str, timeout_s: float) -> Any:
@@ -217,7 +257,9 @@ class LookupFailure(str, Enum):
     OFFLINE = "offline"
 
 
-async def _lookup(city: str, timeout_s: float) -> tuple[Optional[WeatherSummary], LookupFailure]:
+async def _lookup(
+    city: str, timeout_s: float, day_offset: int = 0
+) -> tuple[Optional[WeatherSummary], LookupFailure]:
     """
     Fetch and read one city.
 
@@ -238,7 +280,9 @@ async def _lookup(city: str, timeout_s: float) -> tuple[Optional[WeatherSummary]
         logger.warning("weather_lookup_failed", city=city, error=str(e))
         return None, LookupFailure.OFFLINE
 
-    summary = WeatherSummary.from_payload(payload if isinstance(payload, dict) else {})
+    summary = WeatherSummary.from_payload(
+        payload if isinstance(payload, dict) else {}, day_offset
+    )
     if summary.is_empty():
         logger.warning("weather_payload_unusable", city=city)
         return None, LookupFailure.UNRESOLVED
@@ -247,10 +291,12 @@ async def _lookup(city: str, timeout_s: float) -> tuple[Optional[WeatherSummary]
 
 async def get_weather(args: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Answer 「今天天气怎么样」 with one spoken sentence.
+    Answer 「今天/明天/后天天气怎么样」 with one spoken sentence.
 
     The city comes from the request when the rule layer found one, otherwise
-    from `weather.city` in the config.
+    from `weather.city` in the config. The day (absent = today, 1 = 明天,
+    2 = 后天) selects the forecast entry; a payload with fewer days answers
+    about its last day and says so.
     """
     cfg = get_config()
     if not cfg.get("weather.enabled", True):
@@ -263,9 +309,13 @@ async def get_weather(args: Dict[str, Any]) -> Dict[str, Any]:
     requested = str(args.get("city") or "").strip()
     configured = str(cfg.get("weather.city") or "北京")
     timeout_s = _float_or(cfg.get("weather.timeout_s", 5.0), 5.0)
+    try:
+        day_offset = max(0, int(args.get("day") or 0))
+    except (TypeError, ValueError):
+        day_offset = 0
     city = requested or configured
 
-    summary, failure = await _lookup(city, timeout_s)
+    summary, failure = await _lookup(city, timeout_s, day_offset)
 
     if failure is LookupFailure.UNRESOLVED and requested and requested != configured:
         # The sentence named something the provider cannot place — a
@@ -275,7 +325,7 @@ async def get_weather(args: Dict[str, Any]) -> Dict[str, Any]:
         # failure is *not* handled here, because another city would not help.
         logger.info("weather_city_unresolved", city=requested, fallback=configured)
         city = configured
-        summary, failure = await _lookup(configured, timeout_s)
+        summary, failure = await _lookup(configured, timeout_s, day_offset)
 
     if summary is None:
         return {
@@ -288,5 +338,6 @@ async def get_weather(args: Dict[str, Any]) -> Dict[str, Any]:
         "success": True,
         "message": summary.speech(city),
         "city": city,
+        "day_index": summary.day_index,
         **summary.as_result_fields(),
     }

@@ -62,6 +62,26 @@ _WHITESPACE = re.compile(r"\s+")
 _ASCII_PUNCTUATION = re.compile("[" + re.escape(string.punctuation) + "]+")
 
 
+def strip_markdown(text: str) -> str:
+    """
+    Remove markdown scaffolding while keeping the text it wraps.
+
+    Shared by `sanitize_for_tts` and `winvoice.text.normalize_for_speech`: the
+    speech path has two guards now (the pipeline's contract check and the
+    normalizer's pre-pass), and two copies of these regexes would be two chances
+    for them to disagree about what a fence, a bullet or a link is.
+    """
+    if not text:
+        return ""
+
+    cleaned = _MARKDOWN_FENCE.sub(" ", text)
+    cleaned = _MARKDOWN_LINK.sub(r"\1", cleaned)
+    cleaned = _MARKDOWN_INLINE.sub(r"\1", cleaned)
+    cleaned = _MARKDOWN_HEADING.sub("", cleaned)
+    cleaned = _MARKDOWN_BULLET.sub("", cleaned)
+    return cleaned
+
+
 def sanitize_for_tts(text: str, limit: int = MAX_SPEECH_CHARS) -> str:
     """
     Reduce a model's answer to something the Chinese TTS can actually say.
@@ -80,11 +100,7 @@ def sanitize_for_tts(text: str, limit: int = MAX_SPEECH_CHARS) -> str:
     if not text:
         return ""
 
-    cleaned = _MARKDOWN_FENCE.sub(" ", text)
-    cleaned = _MARKDOWN_LINK.sub(r"\1", cleaned)
-    cleaned = _MARKDOWN_INLINE.sub(r"\1", cleaned)
-    cleaned = _MARKDOWN_HEADING.sub("", cleaned)
-    cleaned = _MARKDOWN_BULLET.sub("", cleaned)
+    cleaned = strip_markdown(text)
     cleaned = _LATIN_WORD.sub(" ", cleaned)
     cleaned = _ASCII_PUNCTUATION.sub(" ", cleaned)
     cleaned = _WHITESPACE.sub(" ", cleaned).strip()
@@ -92,4 +108,10 @@ def sanitize_for_tts(text: str, limit: int = MAX_SPEECH_CHARS) -> str:
     return clip_for_speech(cleaned, limit)
 
 
-__all__ = ["MAX_SPEECH_CHARS", "clip_for_speech", "has_latin", "sanitize_for_tts"]
+__all__ = [
+    "MAX_SPEECH_CHARS",
+    "clip_for_speech",
+    "has_latin",
+    "sanitize_for_tts",
+    "strip_markdown",
+]

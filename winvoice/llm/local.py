@@ -123,6 +123,67 @@ class LocalLlmBackend:
         """Convenience wrapper for a raw user utterance."""
         return await self.complete(build_intent_prompt(text))
 
+    async def generate(
+        self,
+        prompt: str,
+        *,
+        system: Optional[str] = None,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        timeout_s: Optional[float] = None,
+    ) -> str:
+        """
+        Free-form completion — the Q&A path (`IntentName.ASK`).
+
+        Deliberately a separate method from `complete()`: that one is intent
+        classification end to end (classifier system prompt, GBNF grammar, JSON
+        parsing, `max_tokens=256`), and reusing it would either constrain the
+        answer to the intent grammar or depend on which prompt it was handed.
+        Q&A is plain text in, plain text out — no grammar, no JSON, and above
+        all **no tool capability**: this method cannot call anything.
+
+        `timeout_s` overrides the client's default per request, so a slow
+        answer degrades to the caller's fallback sentence instead of holding
+        the turn for a minute.
+        """
+        messages: list = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+
+        start = time.perf_counter()
+        try:
+            resp = await self._client.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                timeout=timeout_s,
+            )
+        except httpx.TimeoutException:
+            inc_request("llm_ask", "timeout")
+            raise
+        except httpx.HTTPError as e:
+            inc_request("llm_ask", "error")
+            logger.error("llm_ask_transport_error", error=str(e))
+            raise
+        latency = time.perf_counter() - start
+
+        if resp.status_code != 200:
+            inc_request("llm_ask", "error")
+            detail = _short(resp.text)
+            logger.error("llm_ask_error", status=resp.status_code, detail=detail)
+            raise RuntimeError(f"llama-server returned HTTP {resp.status_code}: {detail}")
+
+        observe_latency("llm_ask", latency)
+        inc_request("llm_ask", "success")
+        return str(resp.json()["choices"][0]["message"]["content"] or "").strip()
+
     async def health_check(self) -> bool:
         """True when llama-server answers on the configured base_url."""
         for path in ("/models", "/health"):

@@ -34,8 +34,43 @@ _log = _stdlib_logging.getLogger(__name__)
 
 HOT_RELOADABLE: Set[str] = {
     "llm.local.confidence_threshold",
+    # The Q&A path reads these per question: the switch, the spoken-length cap,
+    # and the timeout all tune without a restart.
+    "llm.ask.enabled",
+    "llm.ask.max_chars",
+    "llm.ask.max_tokens",
+    "llm.ask.timeout_s",
     "tools.whitelist",
+    # Read when a confirmation is armed / a search is intercepted, so the
+    # window and the ask-first behaviour tune without a restart.
+    "tools.confirm_timeout_s",
+    "tools.search_web_confirm",
     "tts.voice",
+    # The speech path reads these per utterance (`speech_text_config()`), so a
+    # change really does apply to the next reply — which is what makes prosody
+    # tunable instead of guessed at. `scripts/show_segmentation.py` previews them.
+    "tts.reply_max_chars",
+    "tts.first_chunk_max_chars",
+    "tts.clause_max_chars",
+    "tts.chunk_max_chars",
+    "tts.chunk_min_chars",
+    "tts.hard_max_chars",
+    "tts.tail_silence_ms",
+    "tts.pause_sentence_ms",
+    "tts.pause_question_ms",
+    "tts.pause_exclaim_ms",
+    "tts.pause_ellipsis_ms",
+    "tts.pause_semicolon_ms",
+    "tts.pause_comma_ms",
+    "tts.pause_enumeration_ms",
+    "tts.pause_colon_ms",
+    "tts.pause_paragraph_ms",
+    "tts.pause_forced_ms",
+    "tts.pause_conjunction_ms",
+    # Read per utterance with the pause table: the gap collapse shapes the same
+    # rhythm, so it tunes the same way.
+    "tts.max_internal_gap_ms",
+    "tts.internal_gap_keep_ms",
     "llm.remote.enabled",
     "llm.remote.base_url",
     "llm.remote.model",
@@ -51,6 +86,14 @@ REQUIRES_RESTART: Set[str] = {
     "audio.input_device",
     "audio.sample_rate",
     "audio.half_duplex",
+    # The output stream is opened once, at startup, and the player holds it for
+    # the whole session — a new rate or device means re-opening it, i.e. a
+    # restart, not a hot reload.
+    "audio.output_device",
+    "audio.output_sample_rate",
+    "audio.output_host_api",
+    "audio.output_prebuffer_ms",
+    "audio.output_blocksize_ms",
     "kws.model",
     "kws.keywords",
     "kws.threshold",
@@ -70,6 +113,20 @@ REQUIRES_RESTART: Set[str] = {
     "llm.local.api_key",
     "llm.local.model",
     "tts.model",
+    "tts.fallback_models",
+    "tts.backend",
+    "tts.vocoder",
+    "tts.speaker_id",
+    "tts.guest_speaker_id",
+    "tts.speed",
+    "tts.guest_speed",
+    # Read by TtsEngine.__init__ (the claimed-rate trick needs it before the
+    # first synthesize), so a change only applies to a fresh engine.
+    "tts.pitch",
+    "tts.num_threads",
+    "tts.trim_silence",
+    "tts.trim_ratio",
+    "tts.trim_guard_ms",
     "tools.guest_denied",
     "tools.destructive",
     "tools.confirm_required",

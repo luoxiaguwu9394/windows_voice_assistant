@@ -278,6 +278,9 @@ async def test_a_disabled_weather_section_says_so_without_any_request(monkeypatc
         ("上海明天天气", "上海"),          # the trailing time word is stripped
         ("牡丹江天气", "牡丹江"),
         ("乌鲁木齐天气", "乌鲁木齐"),
+        ("明天佛山天气怎么样", "佛山"),
+        ("佛山的天气", "佛山"),
+        ("明天天气怎么样", None),
         # A Latin name must be used, not dropped: falling back to the configured
         # city would answer about the wrong place without saying so.
         ("New York天气", "New York"),
@@ -288,6 +291,40 @@ def test_the_city_is_taken_from_the_utterance_only_when_it_is_one(utterance, cit
     intent = match_rules(utterance)
     assert intent is not None and intent.intent.value == "get_weather", utterance
     assert intent.args.get("city") == city, f"{utterance!r} -> {intent.args!r}"
+
+
+@pytest.mark.parametrize(
+    "utterance,city",
+    [
+        # Live bug (2026-09-27): the spoken form with 「的」 misaligned the
+        # greedy window and extracted 「天佛山」 — a token wttr.in answers 500,
+        # which the tool then silently swapped for the configured city. The
+        # user asked about 佛山 and heard 北京.
+        ("明天佛山的天气怎么样", "佛山"),
+        ("明天广州的天气怎么样", "广州"),
+    ],
+)
+def test_the_spoken_de_particle_does_not_break_the_city(utterance, city):
+    intent = match_rules(utterance)
+    assert intent is not None and intent.intent.value == "get_weather", utterance
+    assert intent.args.get("city") == city, f"{utterance!r} -> {intent.args!r}"
+
+
+@pytest.mark.parametrize(
+    "utterance,day",
+    [
+        ("明天佛山天气怎么样", 1),
+        ("明晚天气怎么样", 1),
+        ("后天北京天气", 2),
+        ("大后天天气", 2),                 # clamped to the last forecast day
+        ("今天天气怎么样", None),          # absent means today
+        ("上海天气", None),
+    ],
+)
+def test_the_day_is_taken_from_the_utterance(utterance, day):
+    intent = match_rules(utterance)
+    assert intent is not None and intent.intent.value == "get_weather", utterance
+    assert intent.args.get("day") == day, f"{utterance!r} -> {intent.args!r}"
 
 
 @pytest.mark.parametrize(
@@ -404,4 +441,81 @@ async def test_a_network_failure_never_substitutes_another_city(monkeypatch):
     assert result["success"] is False
     assert result["message"] == "暂时查不到天气。"
     assert len(urls) == 1, f"a transport failure must not be retried elsewhere: {urls}"
+
+
+# ── 明天/后天: the forecast day the question named ─────────────────────────
+
+TWO_DAY_PAYLOAD = {
+    "current_condition": [
+        {"temp_C": "15", "weatherCode": "113", "weatherDesc": [{"value": "晴"}]}
+    ],
+    "weather": [
+        {
+            "date": "2026-09-27",
+            "maxtempC": "20",
+            "mintempC": "10",
+            "hourly": [{"weatherCode": "113", "weatherDesc": [{"value": "晴"}]}],
+        },
+        {
+            "date": "2026-09-28",
+            "maxtempC": "28",
+            "mintempC": "19",
+            "hourly": [{"weatherCode": "116", "weatherDesc": [{"value": "Partly cloudy"}]}],
+        },
+    ],
+}
+
+
+def test_tomorrow_is_read_from_the_forecast_array():
+    """
+    Live bug (2026-09-27), second half: asking about 明天 was answered with
+    今天's numbers — `from_payload` never looked past `weather[0]`.
+    """
+    spoken = format_spoken_weather("佛山", TWO_DAY_PAYLOAD, day_offset=1)
+    assert spoken == "佛山明天多云，气温 19 到 28 度。", spoken
+
+
+def test_a_forecast_day_has_no_current_temperature():
+    """「现在 X 度」 is a claim about today; tomorrow's sentence must not make it."""
+    spoken = format_spoken_weather("佛山", TWO_DAY_PAYLOAD, day_offset=1)
+    assert "现在" not in spoken
+
+
+def test_today_is_unchanged_when_a_day_is_not_requested():
+    assert format_spoken_weather("北京", TWO_DAY_PAYLOAD) == "北京今天晴，气温 10 到 20 度，现在 15 度。"
+
+
+def test_a_day_beyond_the_payload_labels_itself_honestly():
+    """One forecast day, asked about 后天: answer about today and *say* 今天."""
+    spoken = format_spoken_weather("北京", FULL_PAYLOAD, day_offset=2)
+    assert spoken.startswith("北京今天"), spoken
+
+
+async def test_the_day_argument_selects_the_forecast_entry(monkeypatch, spoken_payload):
+    monkeypatch.setattr(weather, "get_config", lambda: _FakeConfig(DEFAULT_CONFIG))
+    spoken_payload["payload"] = TWO_DAY_PAYLOAD
+
+    result = await get_weather({"city": "佛山", "day": 1})
+
+    assert result["success"] is True, result
+    assert result["message"] == "佛山明天多云，气温 19 到 28 度。", result
+    assert result["day_index"] == 1
+
+
+async def test_the_city_fallback_keeps_the_requested_day(monkeypatch):
+    """A garbage city must not silently turn 明天 into 今天 either."""
+    monkeypatch.setattr(weather, "get_config", lambda: _FakeConfig(DEFAULT_CONFIG))
+
+    async def fake_fetch(url: str, timeout_s: float) -> dict:
+        if quote("北京") in url:
+            return TWO_DAY_PAYLOAD
+        request = httpx.Request("GET", url)
+        raise httpx.HTTPStatusError("500", request=request, response=httpx.Response(500, request=request))
+
+    monkeypatch.setattr(weather, "_fetch_weather_json", fake_fetch)
+
+    result = await get_weather({"city": "天佛山", "day": 1})
+
+    assert result["success"] is True, result
+    assert result["message"] == "北京明天多云，气温 19 到 28 度。", result
 

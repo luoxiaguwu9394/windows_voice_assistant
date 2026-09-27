@@ -23,9 +23,16 @@
 
 | 约束 | 出处 | 违反的后果 |
 |---|---|---|
-| **TTS 只能念中文**。`vits-icefall-zh-aishell3` 的词表 66 377 条里**拉丁词条为 0** | `winvoice/audio/tts.py`、`models/tts/*/lexicon.txt` | sherpa 逐词丢 `OOV ... Ignore it!`，用户听到一句话中间空掉 |
+| **TTS 只能念中文**。matcha 与 vits 两个中文模型的词表里**拉丁词条为 0** | `winvoice/audio/tts.py`、`models/tts/*/lexicon.txt` | sherpa 逐词丢 `OOV ... Ignore it!`，用户听到一句话中间空掉 |
+| **停顿不是模型给的，是我们给的**。词表里**没有任何标点**，sherpa 的 `silence_scale` 实测无效（0.2 与 0.0 输出逐字节相同），且每次 `generate()` 自带 **80–250 ms 的噪声底**（不是数字零，是峰值的 0.78–1.74 %） | `scripts/calibrate_tts_pauses.py` 实测、`winvoice/text/segment.py`、`winvoice/audio/playback.py`、`winvoice/audio/_common.py:trim_edge_silence` | 停顿长度回到「模型随便给多少」：逗号没有停顿、每句多 0.3–0.4 s 死气。改停顿只能改 `tts.pause_*`（播放层写成真实静音帧），不要指望模型或 `silence_scale` |
+| **合成是逐段（句/从句）进行的**，段间停顿由 `SpeechSegment.pause_after_ms` 携带 | `winvoice/audio/tts.py:synthesize` | 若把整段回复塞进一次 `generate()`，首字延迟回到「全文合成完」，且块内标点全部失去停顿 |
+| **说话长度由 `context.speech_budget` 决定**（工具短句 80、Agent 回答 `tts.reply_max_chars`=240），不再是统一的 80 | `pipeline._run_agent`、`contracts/speech.py` | 改 `MAX_SPEECH_CHARS` 会同时影响工具短句；改 `tts.reply_max_chars` 才是改 Agent 回答长度 |
+| **播放只有一个出口**：`winvoice/audio/playback.py` 的 `SpeechPlayer`，整会话只开一次输出流 | 旧的 `__main__._on_tts_chunk` → `AudioStreamManager.play_audio` 就是那个 bug（8 kHz MME 流 + 200 ms blocksize + 无缓冲） | 再往 `sd.OutputStream` 直接写 PCM = 丢缓冲、丢停顿、丢打断 |
+| **输出流的两条真机约束**（只有插上设备才暴露，注入假流的单测测不到）：①`sd.OutputStream` **没有 `hostapi` 参数**，要选 host API 只能传**该 host API 下的设备索引**；②**采样率是按路由不同的**：本机同一个扬声器在 WASAPI 下是 **48 000 Hz**、在 MME 下是 **44 100 Hz**，问 WASAPI 要 44 100 会直接 `Invalid sample rate` | `winvoice/audio/playback.py:open_output_stream`、`tests/unit/test_playback_player.py`、`deployment.md` §10 | 一次性解析采样率→首选路由必失败→悄悄退回 MME（老路）；选 host API 用错参数→音频完全打不开（`audio_output_unavailable`） |
+| **打断后的重启要防抖**：`abort()` 是事件循环线程发的，可能正撞上喂音线程在 `write()` 里，MME 会回「media data is still playing」拒绝 `start()` | `SpeechPlayer._restart_stream`（重试 0/20/50/100 ms → 仍失败则 `_reopen`）/ `tests/unit/test_playback_player.py` | 不重试 = 一次打断之后**整个会话再也没声音**（且只在真机上复现） |
 | **用户可见文本走 `ToolResult.message`，机器文本走 `error`** | `winvoice/contracts/messages.py`（`ToolResult`）、`pipeline.py`（`_speakable` / `_spoken_success`） | 英文错误被念出来 = 上面的 OOV 刷屏 |
 | **成功结果现在也会被念**：`_default_reply` 成功分支念 `ToolResult.message`，没有 message 才回「好的，已为您完成。」 | `pipeline.py` 的 `_spoken_success` | 新工具成功了却不给 `message`，用户只听到「好的」= 回到了老 bug |
+| **模型词表里 4 条词条的拼音在 `tokens.txt` 里不存在**（Matcha：`谁的`/`谁都`/`人生自古谁无死`/`鹿死谁手` 标了 `shei2`，而 token 表只有 `shui2`） | 实测见 `deployment.md` §10 排障行；`models/tts/matcha-icefall-zh-baker/lexicon.txt` | 控制台每次合成会打一行 `Unknown token: shei2`。**实测无害**：与文本无关（每个 `generate()` 恰好一次），且 `谁的` 的两个音节都念得出来（580 ms ≈ 谁 362 + 的 269）。别去「修」词表 —— 那是上游数据，改了升级就丢 |
 | **数字必须靠 `rule_fsts`**（`number.fst`/`date.fst`/`phone.fst`）。引擎已接，模型目录缺这几个文件就会失声 | `winvoice/audio/tts.py` | 「调到90」被念成「调到」 |
 | **LLM 永不选工具**（分类器只输出 intent + args，工具选择在代码里）。**2026-09-20 修订**：DSH Agent 模式下，模型**会**选择并调用工具。边界改为 —— 模型只能调用**注册表里已注册**的工具，参数仍过 pydantic 校验、说话人分级、快照与验证器；它仍然**不能**生成并执行任意 shell 命令。工具暴露给 DSH 的唯一通道是 `winvoice/mcp_server.py`，它转手调用同一个 `ToolExecutor` | 原：`winvoice/llm/grammar.py`、`pipeline.py` 的 `_intent_to_tool_calls`；现：`winvoice/mcp_server.py`、`winvoice/tools/executor.py` | 破坏整个安全模型（白名单只在代码里）。<br>**注意**：`dsh.local.profile` 默认 `sdk`，该 profile 自带文件系统等工具 —— 想彻底堵住「模型绕过 ToolExecutor 直接动手」，把 profile 换成 `sdk-minimal`（见 3.x） |
 | **`ToolResult` 只有 `contracts` 里那一个类型**（曾有两个同名类型，导致工具结果被静默丢弃） | `winvoice/contracts/messages.py` | 工具结果丢失，回复变成假的「好的。」 |
@@ -38,6 +45,7 @@
 | | **测试**：`pytest tests -q`（当前 344 passed, 1 skipped）。加载真实模型的测试要 `skipif` 缺模型；`pytest.ini` 里的 `unit`/`integration` 标记没人用，**按目录选** | `pytest.ini` | `pytest -m unit` 会选中 0 个测试 |
 | **不要用 pytest 的 `tmp_path`**：受限/沙箱环境下它建在系统临时目录里、且被 `chmod 0o700`，写入会被拒（本项目实测 19 个 error 全部来自这里） | `tests/` | 需要临时目录时用仓库内的 scratch（见 `tests/unit/test_dsh_router.py` 的 `work` fixture） |
 | **跨进程的「当前这句话」走 `runtime/utterance.json`**：MCP 子进程读它来判定说话人分级 | `winvoice/tools/utterance.py` | 不读它 → guest 能通过 DSH 读写文件（见 1.1） |
+| **控制台子系统程序不给新控制台就会借走助手的**：`Popen` 启动 cmd.exe/powershell.exe 若不带 `CREATE_NEW_CONSOLE`，子进程继承调用方控制台——横幅打进助手窗口、stdin 被共享，用户看到「原窗口刷新了一下」而没有新窗口 | 实测 2026-09-27（日志里紧跟 `tool_call` 的两行 cmd 横幅）；`builtin._launch` 现读 PE 头 `Subsystem`（CUI=3）决定加旗标，GUI 程序不受影响 | 只修名单（cmd/powershell 加旗标）= 下一个进白名单的控制台程序再踩一遍 |
 | **`explorer.exe` 是 Windows 外壳，不是「一个应用」**：桌面、任务栏、开始菜单、文件夹窗口全是它。`taskkill /f /im explorer.exe` 会干掉整个 GUI —— 2026-09-20 实测：用户说「关闭文件资源管理器」，桌面直接消失 | `winvoice/tools/builtin.py`（explorer 分支 + `PROTECTED_PROCESSES`）、`winvoice/tools/_explorer.py`、`tests/unit/test_close_app_safety.py` | 「关文件夹窗口」变成「关掉整个桌面」。而且**验证器还会判它成功**，因为后置条件被写成了「explorer.exe 不存在」 |
 | **默认优雅关闭；`/f` 必须由用户显式要求**：`taskkill /f` 跳过应用自己的「是否保存？」提示 | `builtin.close_app` 的 `force` 参数、`intent/rules.py` 的强制词识别 | 「关闭记事本」会静默丢掉未保存的内容，用户毫无机会拦 |
 | **验证器只能核对「你叫它核对的那个条件」**：后置条件写错，它就会为错误的目标准确盖章 | `winvoice/tools/verifier.py`：explorer 改查「文件夹窗口数 = 0」，而不是「进程是否消失」 | 把「桌面没了」判为「操作成功」 |
@@ -65,14 +73,15 @@
 - **仍未做**：敏感应用名单（guest 现在仍能打开任何白名单应用）——
   见第 3 节「敏感应用名单」。
 
-### 1.2 tick 异常被吞
+### 1.2 tick 异常只补了 traceback，分类与计数仍未做 —— 🔶 部分下线
 
-- **现状**：`pipeline.py:180-182` 的 `except Exception as e: logger.error("pipeline_tick_failed",
-  error=str(e), ...)` —— 没有 `exc_info`，也没有 traceback。本文件里若干个 bug（唤醒后哑掉、
-  工具结果丢失）当初都是因此被掩盖的。
-- **要做的**：至少加 `exc_info=True`；更好的是把异常按 `state` 分类并计数，便于判断是不是
-  「同一个错误刷屏」。
-- **验收**：人为让某引擎抛异常，控制台/日志里能看到完整堆栈。
+（2026-09-26 部分完成：`run()` 的 `pipeline_tick_failed` 现在带 `exc_info` 与 `error_type`；
+新增的回合任务也有 `turn_failed`（含堆栈），不再让后台任务的异常变成一句
+「Task exception was never retrieved」。见 `tests/integration/test_pipeline_barge_in.py`。）
+
+- **仍未做**：按 `state` 分类并计数，用来判断是不是「同一个错误刷屏」。现状是一行一个事件，
+  但不聚合。
+- **验收（剩余部分）**：同一 state 下连续失败能看出是同一个错误（计数 + 首次/最近时间戳）。
 
 ### 1.3 结构化日志进不了文件
 
@@ -89,106 +98,56 @@
 
 ## 2. 交互功能待办（按用户可感知的缺失排序）
 
-### 2.0 Agent 思考时无法打断（DSH 集成后新出现）
+### 2.0 Agent 思考 / 播报时无法打断 —— ✅ 已实现，条目下线
 
-- **现象**：DSH 正在规划/调用工具时，说唤醒词 **不会立刻打断**，那句话要等本轮结束才被处理。
-- **现状**：`pipeline._run_agent` 直接 `await self._dsh_router.route(...)`，而 `run()` 的
-  tick 循环正是发出这个 await 的地方 —— 于是 `PipelineState.LLM_THINKING` 期间不再消费
-  `_audio_queue`。**音频没有丢**（deque `maxlen=2000`，约 200 s），丢的是「打断的及时性」。
-  这个问题在 DSH 之前就存在（意图分类约 1 s），只是 agent 一轮更长（数秒到数十秒），
-  所以从「几乎察觉不到」变成「明显」。
-- **要做的**：把 agent 回合改成 `asyncio.Task`，新增 `PipelineState.AGENT_THINKING`，
-  tick 在该状态下继续喂 KWS 并检查任务是否完成，完成后再进 TTS。
-  关键在于**打断要不要取消这个回合**：取消 DSH 回合会让 harness 停在一个未知状态
-  （`session_prompt` 已经把消息入队），所以第一版建议「继续跑完但丢弃 TTS」，
-  而不是 cancel。
-- **验收**：agent 思考中说唤醒词 → 5 s 内回到监听态；音频队列长度不增长到异常值；
-  并发跑 `tests/unit/test_pipeline_agent_routing.py` 不回归。
-- **风险**：动的是状态机，必须先补 `tests/integration/test_pipeline.py` 级别的回归，
-  否则容易把「思考中」变成「卡死」。
+（2026-09-26 下线。做法与验收见下。）
 
-### 2.1 问答 / 闲聊 —— 目前完全不存在
+- **做过的**：回合改成 `asyncio.Task`（`AudioPipeline._start_turn` / `_run_turn`），
+  新增 `PipelineState.AGENT_THINKING`，`_tick` 在 `AGENT_THINKING` 与 `TTS_PLAYING` 下继续喂 KWS；
+  打断时 `tts.interrupt()` + `speech_player.interrupt()`（`abort()` 立刻丢弃设备缓冲）
+  并 `_turn_generation += 1`，被作废的回合**不再播报**（`turn_superseded`）。
+  按原建议**不取消** DSH 回合 —— 取消会把 harness 留在未知状态，而丢弃输出已经解决了问题。
+- **验收**：`tests/integration/test_pipeline_barge_in.py` —— 播报中唤醒词 → 播放器被打断且回合被作废、
+  新一句话立刻进入聆听；Agent 思考中唤醒词 → 回合输出不入队、队列长度有界、状态回到聆听；
+  另有「回合运行中 tick 循环仍在消费音频」的回归测试。原 `_route_intent` 保留为同步入口（测试与
+  逐步驱动仍可用），实时路径走 `_start_turn`。
 
-- **现象**：「什么是量子力学」「帮我看看这个项目里有什么」→ 要么被硬塞进某个命令工具，
-  要么答「抱歉，这个请求我还没有实现。」
-- **现状（已实测）**：`IntentName` 11 个成员里没有问答；
-  `rules.py` 的规则全是命令；`pipeline._intent_to_tool_calls` 只映射 10 个工具
-  （含 `get_time`/`get_weather`）→ 无映射 → `_default_reply` 返回「没实现」。
-  2026-09-19 的实测路由（3B 模型）：`什么是量子力学？` → `get_weather`（参数
-  `location=量子力学`，现在会因此回一句「暂时查不到天气。」）；`帮我看看这个项目里有什么`
-  → **`search_web`**（→ 弹浏览器，见 2.4）；`你好` → `unknown`。
-- **技术细节与建议**：
-  - 新增 `IntentName.ASK`；在 `winvoice/llm/local.py` 加一个**自由生成**方法，
-    **不要复用 `complete()`** —— 它是意图分类专用：system prompt 写死 "You are an intent
-    classifier"、`max_tokens=256`、且带 `INTENT_GRAMMAR` 约束。
-  - 答案必须过「可朗读」关：中文、短、无英文单词（第 0 节约束）、无 markdown/列表符号。
-    建议硬性截断（例如 ≤ 80 字）并过滤掉拉丁字符与代码符号。
-  - **延迟是真实问题**：3B CPU 生成约 10–20 token/s，50 字答案约 3–6 s；而 `TtsEngine.synthesize`
-    是**先整句合成再分块 yield**（`tts.py` 的 `generate()` 一次性调用），所以首字延迟 =
-    LLM 全文 + 全文合成。要么改成按句流式（边生成边合成），要么先回一句中文垫场
-    （「我看一下」）再出答案。
-  - 硬约束：问答路径**不得给 LLM 工具能力**（第 0 节），它只是文本进、文本出。
-- **验收**：「什么是量子力学」→ 用中文简短作答并念出，**不弹浏览器**；「你好」→ 打招呼；
-  LLM 不可用/超时 → 明确说查不到，不静默、不崩。
+### 2.1 问答 / 闲聊 —— ✅ 已实现，条目下线
 
-### 2.2 列目录 —— 「当前目录下有什么文件」
+（2026-09-27 下线。做法：规则层新增 `IntentName.ASK`（问句/问候触发词排在具体话题之后、
+SEARCH_WEB 弱动词之前），pipeline 在 `_run_turn` 里**先于 agent 拦截** ASK；
+`LocalLlmBackend.generate` 自由生成（不复用分类的 `complete()`），答案过 `sanitize_for_tts`
+（≤ `llm.ask.max_chars`=80、拉丁词/markdown 全剥）后播报；`你好/谢谢/再见` 等寒暄由规则层
+直接给中文回话，不经模型。LLM 不可用/超时/答案不可念 → 明说「答不上来」，绝不回落给 agent
+（问答路径无工具能力）。验收：`tests/unit/test_intent_rules_qa.py`、
+`tests/integration/test_pipeline_qa.py`。新缺口见 §3「问答依赖 llama-server 在跑」。）
 
-- **现象**：无解。规则层不命中 → LLM 判成 `read_file`，参数是字面量 `"current directory"`
-  → `File not found`。
-- **现状**：没有 `list_dir`；`read_file`（`builtin.py:361`）只能读文件，且限制在用户目录下。
-- **技术细节与建议**：
-  - `ToolName.LIST_DIR` + `ToolSpec`（`required=["path"]`，`destructive=False`）+
-    handler：限制在 `Path.home()` 之下（与 `read_file` 同样的 `relative_to` 检查）、
-    `os.scandir`、目录优先排序。
-  - **必须截断**：输出「一共有 N 项，前面几个是 A、B、C」，否则 TTS 要念几十秒。
-    成功结果现在会被念出来（`_default_reply` 会念 `ToolResult.message`），所以
-    **输出必须是中文且短**；`winvoice/contracts/speech.py` 的 `clip_for_speech` 会在
-    80 字处截断，但更短更好。文件名常常含拉丁字符，念之前要先过一遍「可朗读」检查
-    （`winvoice/tools/builtin.py` 的 `_speakable`）。
-  - 规则层加一条明确的触发词（例如「有什么文件 / 列出 / 目录下」），避免又漏给 3B 去猜。
-- **验收**：「当前目录下有什么文件」→ 念出数量 + 前几项；空目录、超长目录、
-  家目录之外的路径各有合理的中文回应。
+### 2.2 列目录 —— ✅ 已实现，条目下线
 
-### 2.3 二次确认回路 —— 让 `write_file` / `run_script` 真正可用
+（2026-09-27 下线。做法：`ToolName.LIST_DIR` + handler（与 `read_file` 同样的 `relative_to(home)`
+限制；无 path 参数默认列用户目录；目录优先排序；**只念纯中文名**，拉丁名计数但不念，超过 4 个
+念「还有其他」）；guest 不可用（同 `read_file`）；规则层触发词
+`列出/什么文件/目录下/文件夹里/看看目录`，排在 ASK 之前。验收：`tests/unit/test_list_dir.py`。）
 
-- **现象**：任何写文件/跑脚本的请求都回「这个操作需要你先确认，我还没有实现确认的流程。」
-  （已修成中文，但功能是死的。）
-- **现状**：`__main__._on_tool_call`（`winvoice/__main__.py`）与 `pipeline._run_tools` 都调用
-  `executor.execute(call)`，**从不传 `confirmed=True`**；`get_pending_confirmation()` /
-  `clear_pending_confirmation()`（`executor.py:131`、`:134`）有 API 无调用者。
-  快照那一半是好的（destructive 工具执行前会 snapshot，失败会 restore）。
-- **技术细节与建议**：
-  - 新增 `PipelineState.CONFIRMING`；`_run_tools` 收到 `CONFIRMATION_REQUIRED` 后：
-    念中文问题（`ToolResult.message` 已经具备）→ 等一下一句话 → 判定：
-    确认词 = 「确认/是/好/可以/继续」，否认词 = 「取消/不用/算了/不要」。
-  - **必须有 TTL**（例如 15 秒或「下一句非确认话即作废」），否则挂起的调用会跨话题误触发。
-  - 确认后**重放同一个 `ToolCall`**（`confirmed=True`），不要重新让 LLM 解析一遍。
-  - **安全**：挂起的调用要绑定 `trace_id` + 说话人；**guest / 换人不得确认**（依赖 1.2）。
-  - 界面提示：说清楚「将对哪个路径做什么」，路径是英文/含中文都可能——念之前要按
-    `_speakable` 的规则处理（路径含拉丁字符会被 TTS 丢掉，建议只念文件名或改用「目标文件」）。
-  - 确认后写文件/跑脚本的成功提示也必须是中文 `message`：现在是「已经写好了。」
-    /「脚本已经运行完了。」（英文 `message` 会被 `_spoken_success` 拒绝并回退成
-    「好的，已为您完成。」，用户等于没得到反馈）。
-- **验收**：「写入文件 X 内容 Y」→ 追问 → 说「确认」→ 真的写入且 `snapshots/` 下有快照；
-  说「取消」→ 不写；沉默超时 → 不写；guest 确认 → 拒绝。
+### 2.3 二次确认回路 —— ✅ 已实现，条目下线
 
-### 2.4 打开浏览器的确认制（`search_web`）
+（2026-09-27 下线。做法：新增 `PipelineState.CONFIRMING`；`_run_tools` 收到
+`CONFIRMATION_REQUIRED` 后挂起 `_PendingConfirmation`（原 `ToolCall` + tier/trace 绑定 +
+`tools.confirm_timeout_s`=15 s 截止时间）、念中文问题（不念拉丁路径）并进 CONFIRMING——该状态下
+麦克风**免唤醒词**直接喂 VAD/ASR；「取消」词优先于「确认」词（「不要确认」不会误确认）；
+确认后**重放同一个 `ToolCall`**（`confirmed=True`），不让 LLM 重解析；下一句非确认话 = 作废挂起
+并按全新话语重路由（新 trace、重新声纹校验、被拒声纹直接终止）；TTL 到期作废；任何
+`_abort_utterance` 都会丢弃挂起调用。**guest/换人不能确认**（比较挂起 tier 与当前 SV tier，
+日志 `confirmation_speaker_mismatch`）。快照链路不变。验收：
+`tests/integration/test_pipeline_confirmation.py`。）
 
-- **现象**：被误判成搜索的句子会**立刻弹浏览器**（实测：「帮我看看这个项目里有什么」）。
-- **现状**：`winvoice/tools/builtin.py` 的 `search_web` 现在会检查 `webbrowser.open()`
-  的返回值（打不开就回「我没能打开浏览器。」），query 也已 `quote()` 编码。
-  **只差确认这一步**：任何显式「搜索 X」都会不打招呼地开窗口。
-- **已修的部分**（2026-09-19）：规则层把 `用浏览器/搜索/搜一下/百度/google/search`
-  这类**显式搜索词**排在话题规则之前（拉丁词带「后面不是 `.` `/` `\`」的保护，
-  免得「运行脚本 search.py」被判成搜索；带路径参数的意图排在它更前面），
-  「查一下/查询」仍是弱触发词、由话题决定，「用浏览器搜索天气」现在正确开浏览器。
-- **技术细节与建议**：
-  - 要么复用 2.3 的确认回路（把 `search_web` 标成 `requires_confirmation=True`），
-    要么先在界面上给一句「这就帮你搜 X」再开（浏览器起来有延迟，用户至少知道发生了什么）。
-  - 配置里加个开关更实际（例如 `tools.search_web_confirm: true`）。
-- **验收**：显式说「搜索 X」时，用户要么被问过一次、要么先听到确认；
-  规则层能进 `search_web` 的只剩「显式搜索」这一类（问句仍可能被 3B 模型判成
-  `search_web`，见 2.1）。
+### 2.4 打开浏览器的确认制（`search_web`）—— ✅ 已实现，条目下线
+
+（2026-09-27 下线。做法：复用 2.3 的确认回路——`_run_tools` 在执行 SEARCH_WEB 前若
+`tools.search_web_confirm`（默认 true，热生效）则先挂起、念「你要我搜索 X 吗？确认请说确认，
+取消请说取消」（query 含拉丁字母时只说「打开浏览器搜索吗」）；确认后照常执行。**刻意只作用于
+语音路径**：agent 经 MCP 调用的 `search_web` 不受影响，避免把 agent 的搜索变成死路。验收：
+`tests/integration/test_pipeline_confirmation.py`。）
 
 ### 2.5 唤醒词灵敏度标定（需要用户本人录音，agent 无法独立完成）
 
@@ -211,16 +170,21 @@
 | **升级条件比 new_way.md 窄** | `assess_turn` 只在**验证器判定 failed**、回合异常结束、回答为空时升级；`new_way.md` 还列了「Tool execution fails and the local model cannot recover」，设计稿 §3.4 写的是 `success == False + retryable == False` | 这是**有意收窄**（见 `winvoice/tools/verifier.py:unresolved` 与 `winvoice/dsh/validation.py` 的 docstring）：没有验证结论的失败是**确定性拒绝**（不在白名单、确认回路未实现），云端会被同样拒绝，升级只换来一次无用的往返。若将来要严格对齐 new_way，需要区分「值得重试的工具失败」与「策略拒绝」——目前没有可靠信号 |
 | **升级上下文缺工具参数** | `ToolActivity.name` 多数情况为空（只解析工具**结果**，不解析 `tool/call` 事件），也没有 args | 云端因此看到 `tool=unknown`。够驱动升级决策（决策只看验证结论），但不足以让云端「接着上次做」。补齐需要解析 DSH 的调用事件，而它是 pre-release，信封可能变 |
 | **敏感应用名单** | 分级已经生效（见 1.1），但 `open_app`/`close_app` 对 guest 与 full **一视同仁**：白名单里 9 个应用 guest 都能开 | 需要一份「敏感应用」清单（设置、cmd、powershell 至少应算），并接到 `ToolRegistry.get_allowed(tier)` / `validate_call` 上。清单来源应当是配置（`tools.sensitive_apps`），不要写死在代码里 |
-| **验证器只覆盖 5/10 个工具** | `get_time`/`get_weather`/`read_file`/`search_web`/`media_control` 没有验证器 | 前四个确实没有可观测的后置条件（查询类、只读）。`media_control` 与 `search_web` 是「能验证动作、不能验证目标」：要验证目标需要 UI Automation / 读取媒体会话，属大改。当前它们既不升级也不阻断，是诚实的选择 |
+| **验证器只覆盖 5/11 个工具** | `get_time`/`get_weather`/`read_file`/`list_dir`/`search_web`/`media_control` 没有验证器 | 前四个确实没有可观测的后置条件（查询类、只读）。`media_control` 与 `search_web` 是「能验证动作、不能验证目标」：要验证目标需要 UI Automation / 读取媒体会话，属大改。当前它们既不升级也不阻断，是诚实的选择 |
+
+| **问答依赖 llama-server 在跑（2026-09-27 新增，来自 2.1）** | 规则层 ASK 在 pipeline 里**先于 agent** 拦截：llama-server 没起时，问句（「什么是X」）得到「答不上来」，而**不再像以前那样交给 DSH agent 回答**（那是有意为之——agent 带工具能力，违反「问答无工具」硬约束） | 若接受「问答可以让 agent 回、只是不许它动工具」，需要 DSH 支持按回合挂起工具（或单独的 no-tools profile），当前没有这个开关。寒暄（你好/谢谢/再见）不经模型，不受影响 |
+| **确认回路只覆盖语音路径（2026-09-27 新增，来自 2.3/2.4）** | DSH 经 MCP 调 `write_file`/`run_script` 仍是确定性拒绝（MCP 子进程无法与用户对话确认），`search_web` 则直接执行 | 让 agent 侧也走确认需要把「挂起 + 问句」跨进程回传给音频进程，并让 harness 学会等一轮用户输入——等 DSH 的交互模型稳定后再评估。另：CONFIRMING 状态不喂 KWS（唤醒词会被当文本转写、走「非确认话=作废并重路由」，行为正确但多花一次 ASR） |
 | **DSH 回合的 `tool/call` 事件未解析** | `winvoice/dsh/validation.py` 只认**工具结果**（按本项目自己写的 `success` 载荷识别），不解析调用事件 | 因此 `ToolActivity.name` 在多数情况下为空，升级上下文里只能写 `tool=unknown`。已经足够驱动升级决策（决策只看验证结论），但想让云端 agent 看到「本地调了哪个工具」需要再解析一层；风险是 DSH 是 pre-release，事件信封可能变 |
-| 配置热更新 | `ConfigManager.start_watching()` 会重读配置对象，但**没有任何消费者**：引擎只在 `initialize()` 读一次 | 要么做 fan-out（引擎重载），要么在 README/CLI 明确「改配置需重启」，别留半截。DSH 相关配置已**明确**列进 `REQUIRES_RESTART`（改 model/provider 就得重启子进程，假装能热更新更糟） |
+| 配置热更新 | `ConfigManager.start_watching()` 会重读配置对象，但**消费者只有两个**：`get_weather`（每次调用重读）与语音路径的 `speech_text_config()`（每个回合重读分块/停顿表，2026-09-26 起）。引擎仍在 `initialize()` 只读一次 | 分块与停顿表可以热调（见 `HOT_RELOADABLE`），模型/采样率/输出设备不行（列在 `REQUIRES_RESTART`）。别再指望其余字段会热生效 |
 | Prometheus 指标 | `logging.init_metrics()` **全项目零调用**，`observe_latency`/`inc_request` 是空操作 | 接了才有 KWS 命中率、ASR 延迟这些数据；也是 2.5 的长期替代方案 |
 | 磁盘配额 | `storage.max_total_gb` 读进配置但**无任何代码计算/清理** | 模型+日志+快照目前无上限 |
 | 模型完整性 | 只有下载路径校验，且 `MANIFEST` 里**只有 KWS 一条钉了真 SHA256**，其余 `sha256: None` | 启动校验（size+mtime → SHA256 → `.corrupt/`）未实现；至少把其余模型的 hash 补上 |
 | pytest 标记 | `pytest.ini` 注册了 `unit`/`integration`/`manual`，只有 e2e 用了 `manual` | `-m unit` 选中 0 个；要么给测试打标，要么把标记删掉 |
 | `docs/adr/` | `AGENTS.md` 引用了它，目录不存在 | 有了架构决策就建目录并按 `0001-*.md` 命名 |
 | 阈值可视化 UI / PySide6 | 全部是 CLI，无 GUI | 阈值目前靠 `--max-inter`/`--min-gap` 调；直方图+滑块属长期项 |
-| 全双工 / AEC | 半双工规避回声；打断只到 chunk 边界（≈100 ms），且**只有唤醒词能打断** | 真全双工需要 AEC（WebRTC APM 或 speexdsp），属大改 |
+| 全双工 / AEC | 半双工规避回声；**2026-09-26 起**打断是 `stream.abort()`（立刻丢弃设备缓冲），不再等 chunk 边界。仍**只有唤醒词**能打断：KWS 没有别的触发词，也没有 VAD 级打断 | 真全双工需要 AEC（WebRTC APM 或 speexdsp），属大改 |
+| **访客音色只靠语速**（matcha zh-baker 是单说话人） | `TtsEngine._speed_for`：`num_speakers <= 1` 时访客用 `tts.guest_speed`（默认 0.9，绝对值；主人默认 0.75，两者差 14 %）；多说话人模型仍按 `guest_speaker_id` 换音色 | 单说话人模型下主人与访客音色相同，只有语速差异。想要真正两种音色就换多说话人模型（如 `vits-zh-hf-fanchen-C`，16 kHz，187 说话人） |
+| **LLM 侧不流式** | `DSHRouter.route()` 一次性返回全文，`TtsEngine.synthesize()` 只能等拿到整段文本再切句 | 首字延迟 ≈ 首块合成（约 0.3 s）+ 模型出文时间。要边生成边播需要 DSH 的增量事件 |
 | 天气数据源单一 | `get_weather` 只用 `https://wttr.in`：**无 key**，但会限流，而且**不返回中文**（`weatherDesc`/`lang_zh` 恒为英文，2026-09-19 实测），所以中文靠 `winvoice/tools/weather.py` 里的 WWO 码对照表 | 换和风天气等需 key 的源可拿到官方中文与更稳的 SLA；要动的前提是把 key 放进 config（`${VAR}` 展开已支持）并保留中文兜底。缺 code 时当前**静默丢描述**，加日志/上报会更好排查 |
 | 应用启动只证明「系统接受了启动请求」 | `open_app` 现在按真实路径启动（`App Paths` → `PATH`），进程创建失败会如实报错；但 Chrome 已有实例时主进程会立刻退出，所以只能报「已发出启动请求」 | 想真正确认「窗口起来了」需要 UI Automation / `EnumWindows` 之类的手段，属大改；当前至少不再出现「cmd 报错但工具说成功」 |
 | 免安装 / 绿色版程序打不开 | 解析只查 `PATH` 与 `App Paths` 注册表，没有第二套「安装目录猜测表」（那样的表一定会腐烂） | 用户把目录加进 `PATH` 即可；若将来常见，可考虑读取 `HKCU\...\App Paths` 之外的注册来源或允许 `config.yaml` 里手工登记路径 |
@@ -231,12 +195,21 @@
 
 | 日期 | 动作 |
 |---|---|
+| 2026-09-27 | **新增电源操作 `system_power`（用户需求：「让它关机之类的命令行操作」）。** `ToolName/IntentName.SYSTEM_POWER` + 规则层触发词（关机/重启/重新启动/睡眠/休眠/锁屏/锁定屏幕/注销/退出登录，排在 ASK 之后——「怎么关机」是问句；OPEN_APP 之前——「重新启动」不能被「启动」抢走），触发词与动作共用一张 `_POWER_ACTIONS` 表。handler 用 `Popen` fire-and-forget（`subprocess.run` 会把音频循环挂到机器唤醒为止），关机/重启带 `shutdown /t 5` 缓冲（`shutdown /a` 可中止）。三道闸沿用既有机制：registry `requires_confirmation=True`（语音确认回路问「我将要关机，确认请说确认…」，动作名取自 handler 同一张 `POWER_ACTION_SPEECH` 表）、`guest_allowed=False`、agent 经 MCP 拿不到确认（CONFIRMATION_REQUIRED 是确定性拒绝）——任何模型层都无法自行关机。无验证器（fire-and-forget 无可观测后置条件，与 media_control 同类）。新增 `tests/unit/test_system_power.py`（17 项）；`test_core`/`test_mcp_server` 枚举补齐（全套 600 passed, 1 skipped）。同步 README / deployment / spec。 |
+| 2026-09-27 | **实测报障修复：「打开命令提示符」不弹新窗口。** 日志里 `tool_call` 后紧跟着两行 cmd 横幅——控制台子系统程序 `Popen` 启动时**继承调用方控制台**：横幅打进助手窗口、stdin 共享，这就是用户看到的「原窗口刷新了一下」。修复：`builtin._launch` 读目标 PE 头的 `Subsystem` 字段（`IMAGE_SUBSYSTEM_WINDOWS_CUI=3`，免维护名单），控制台程序加 `CREATE_NEW_CONSOLE` 弹独立窗口；GUI（记事本/Chrome/…）与 `.cmd/.bat` 脚本路径不变。真机验证：open_app 产生新 cmd 进程与独立窗口（验证后已单独关闭）。新增 6 项回归（`tests/unit/test_app_launch.py`，含真实二进制的子系统探测；全套 583 passed, 1 skipped）。新增 §0 约束一行；同步 README / deployment 排障表。 |
+| 2026-09-27 | **实测报障修复：问「明天佛山天气怎么样」回了「北京今天」。** 两个叠加根因：①规则层城市提取的 4 字贪婪窗口在口语「明天佛山**的**天气怎么样」里错位——组内吞不下「的」，窗口后移一位，提取出「天佛山」，wttr.in 对它 500，工具按设计静默回退 `weather.city`（北京）；②「明天」从未被提取，工具永远答 `weather[0]`（今天）。修复：`_WEATHER_CITY_PATTERN` 把「的」移到窗口外（`(?:的)?`，拉丁名同样受益：「Shanghai的天气」）；新增 `_WEATHER_DAY_OFFSETS`（明天/明晚→1，后天/大后天→2），`get_weather` 增 `day` 参数按条目取预报，`WeatherSummary.day_index` 决定播报的今天/明天/后天标签——payload 条目不足时按**实际**条目如实说（要明天、只有今天 → 说「今天」），明天/后天句不含「现在 X 度」（那是对今天的断言）；城市回退保留 day。真机链路验证：「明天佛山的天气怎么样」→「佛山明天晴，气温 27 到 35 度。」新增 9 项回归（`tests/unit/test_weather_speech.py`，全套 578 passed, 1 skipped）。同步 README / deployment（§8.5、排障表）/ spec §6.1。 |
+| 2026-09-27 | **交互功能四件套 + 「没事了」（下线 §2.1–§2.4 与文末追加项）。** ①**问答/闲聊**：`IntentName.ASK`（规则层问句/问候触发词，排在具体话题后、弱搜索动词前）+ `LocalLlmBackend.generate` 自由生成（不复用 `complete()`），pipeline **先于 agent 拦截**（问答永无工具能力），答案过 `sanitize_for_tts`（≤80 字、剥英文/markdown）；「你好/谢谢/再见」免模型直接回；LLM 不可用明说「答不上来」。②**列目录**：`ToolName.LIST_DIR`（home 限制、目录优先、只念纯中文名、>4 项念「还有其他」、guest 拒绝）。③**二次确认回路**：`PipelineState.CONFIRMING`（免唤醒词喂 VAD/ASR）、`_PendingConfirmation`（原 `ToolCall` 重放 `confirmed=True` + tier/trace 绑定 + 15 s TTL）、取消词优先、非确认话=作废并按新话语重路由、换人/guest 不得确认。④**搜索先问后开**：`tools.search_web_confirm`（语音路径专用，agent 的 MCP 路径不受影响）。⑤**「没事了」**：`IntentName.DISMISS` 作为规则层兜底位，回「好的。」并回等待唤醒。新增配置 `llm.ask.*`、`tools.confirm_timeout_s`、`tools.search_web_confirm`（均热生效）。新增 `tests/unit/test_intent_rules_qa.py`、`tests/unit/test_list_dir.py`、`tests/integration/test_pipeline_qa.py`、`tests/integration/test_pipeline_confirmation.py`（全套 561 passed, 1 skipped）；顺带把 `test_a_verified_goal_does_not_rewrite_an_honest_failure` 改为密闭（原测试真跑 `taskkill`，开发机开着记事本时会把它关掉）。第 3 节新增两条缺口（问答依赖 llama-server、确认回路只覆盖语音路径）。同步 README / deployment（§5.1、§8.5、排障表）/ spec（§5、§6.1、§6.2、§7.1、§9.1、§14、§15）。 |
+| 2026-09-27 | **杂音根因实锤 + 音高回调**。用户关闭 Windows「空间音效」（Spatial Sound）后杂音消失——设备层 DSP 实锤，与黑匣子「写入数据干净」的取证互相印证；deployment §10 排查行已更新为确认结论。音高按用户要求回调：`tts.pitch` 0.8 → **1.0**（原声；0.8 当初针对「童声感」，用户现觉「过于中性」，1.0/0.9/0.85/0.8 锚点已写入 config 注释与排查表）。机制与速度补偿不变。 |
+| 2026-09-27 | **黑匣子实锤（数据层排除）**。用户在杂音现场用 `WINVOICE_DIAG_PLAYBACK` 抓到失败回合的写入数据（runtime/diag.pcm，5.3 s 一条回复，峰值正常）。全量分析：**逐 20 ms 帧对相关 0 次卡死重播（0/250）**、120 探测窗 **0 重复片段**、句内静音仅 1 个 200 ms 段（= 设计的句间停顿，位置 1.34 s）、无异常毛刺。结论：**应用写进设备的数据在杂音现场是干净的，杂音产生于设备/驱动/环境层**（应用之下）。设备侧证据待取：杂音在场时跑 `python scripts/diagnose_playback.py` 录扬声器实放，若出现卡死重播/重复片段即为实锤。 |
+| 2026-09-27 | **叠加杂音排查（应用内 A/B + 黑匣子）**。用户关键对照：`python -m winvoice`（完整应用）有「覆盖一层规律卡顿的同一个音」，同期裸引擎+播放器脚本清晰 → 排除蓝牙/设备状态等环境因素，嫌疑收窄到应用内差异。逐项复现均干净：①真实 AudioPipeline（真 KWS tick/回合任务/get_time 链路）+ 真实播放器 + loopback 实录——0 卡死帧、0 重复片段；②加入**真实麦克风流**（16 k MME 输入与 WASAPI 输出共存）——发现**开麦后输出路由从 wasapi shared@48000 翻转为 wasapi auto-convert@44100**（复现稳定），但设备输出依然干净；③6 线程烧核 + 合成播放并发——无卡死重播；④双回合守卫核查无重叠播报。无法在可测条件下复现 → 交付两件仪器：`scripts/diagnose_playback.py`（写入 tee + loopback 实录 + 卡死重播/重复片段判定）与 `WINVOICE_DIAG_PLAYBACK` 环境变量（应用黑匣子：`SpeechPlayer.attach_diag` 把每个写入设备的样本存档，用户下次复现时即可用实盘数据一锤定音「我们的数据 vs 设备层」）。排查注意：soundcard loopback 按混音格式捕获且不重采样（本机 44.1 k），与 48 k 写入信号对比前必须伸缩校正；长块阻塞式 loopback 录制在负载下会丢帧，用逐秒分块。 |
+| 2026-09-26 | **听感三轮：语流碎片化的真凶 + 音调定案**。用户反馈「一个字里面也有高频断点」。逐项排查 12 条清单后实锤两层根因：①**逐块重采样边缘伪影**——播放器对每个 100 ms 块独立 `resample_poly`，接缝处振幅台阶达峰值的 20–50 %（一个字 2–3 下，正是「字内断点」；此前用 10 ms RMS 窗验证边界是测量方法错误，把 0.5 ms 瞬态平均掉了）；②模型句内静音洞（见上轮）。修复：播放器改为**按段整段重采样**（段内各块本就微秒级连续入队，整段转换零额外首音延迟；接缝只剩段边界、被设计停顿掩蔽），伪影实测降到 int16 量化底噪（0.02 % 峰值）。音调定案：逐帧自相关 F0 实测 baker 原生**中位 276 Hz**（成人女声带 180–230、童声 280–350），「童声夹嗓子」= 模型嗓音本身 → `tts.pitch` 0.9 → **0.8**（≈221 Hz）；空隙压缩收紧为 60/30（实测 140–170 ms 洞全部压到 30、自然微停顿保留）。语速保持 246 ms/字、真机 underruns=0。新增按段重采样的连续性验证与默认值测试；同步 README / deployment / spec §8。**遗留**：baker 音色本身（读腔、flat pitch contour）不可调，想要「自然成人口语」只能换模型（kokoro-multi-lang / 多说话人 VITS，需下载 + 接入）。 |
+| 2026-09-26 | **听感二轮：音调与卡顿**。用户反馈换 Matcha 后「音调偏高、一句话很多断点」。实测定位：①卡顿不是播放链路（真机 `underruns=0`），是模型**句内自掏 1–7 个 40–240 ms 静音洞**（词表无标点）→ 新增 `_common.collapse_internal_gaps`（`tts.max_internal_gap_ms`=110 以上压回 `internal_gap_keep_ms`=80，热生效）；②`speed` 实测**不变调**（对数频谱比对 1.000，推翻第一轮文档里「1.15≈92%」的旧测量），音调高是 baker 女声 + vocos 亮色 → 新增 `tts.pitch`（默认 0.9）：chunk 标称采样率 = 模型率 × pitch、`generate()` 用 `speed/pitch` 补偿语速，两旋钮解耦，**需重启**（已列入 REQUIRES_RESTART）。实测：语速保持 251 ms/字、压缩后句中静音 ≤110 ms。新增 `tests/unit/test_tts_internal_gaps.py`（9 项）与 pitch 数学 3 项。同步 README / deployment（调参表 + 排查两行）/ spec §8。 |
+| 2026-09-26 | **TTS 架构改造（语义断句 + 停顿 + 22.05 kHz 输出）**。新增 `winvoice/text/`（规范化/语义断句/短句分块/停顿表，纯函数）、`winvoice/audio/playback.py`（常驻输出流 + 抖动词缓冲 + `abort()` 级打断 + 设备原生率重采样）、`_common.trim_edge_silence`（RMS 窗口剪掉每段 80–250 ms 噪声底）、`scripts/show_segmentation.py`、`scripts/calibrate_tts_pauses.py`；`TtsEngine` 改为多后端（matcha/vits）+ 模型回退 + 逐段合成 + 工作线程合成；`AudioPipeline` 回合改为 `asyncio.Task`（新增 `AGENT_THINKING`）；`TtsChunk` 增 `pause_after_ms`/`text`，`TtsRequest` 增 `max_chars`；默认模型换 `matcha-icefall-zh-baker` + `vocos-22khz-univ`（22 050 Hz），8 kHz 的 aishell3 转为回退模型。**下线 §2.0**（打断已实现）、**§1.2 部分下线**（已补 traceback 与回合异常日志）、**§2.1 的「先整句合成」一条改写为已完成（只剩 LLM 侧流式）**。新增第 0 节三条约束（停顿不是模型给的、逐段合成、播报长度走 `speech_context.speech_budget`、播放只有一个出口）与第 3 节两条缺口（访客只靠语速、LLM 侧不流式）。同步 README / deployment / spec §8 / DEPENDENCIES。 |
 | 2026-09-20 | **DSH 集成**（`docs/dsh_integration_design.md`）。新增：`winvoice/dsh/`（SDK 客户端、程序化校验、两级升级、配置、桥接 bundle 生成）、`winvoice/mcp_server.py`（把工具注册表用 MCP 暴露给 DSH）、`winvoice/tools/verifier.py` + `state_capture.py`（用机器状态核对工具结果）、`winvoice/tools/utterance.py`（跨进程传说话人分级）、`winvoice/_vendor.py`、`scripts/install_dsh_bridge.py`；`contracts/speech.py` 新增 `sanitize_for_tts`；`tools/_coreaudio.py` 抽出 Core Audio 互操作（工具与验证器共用一份）。<br>**下线 1.1**（说话人分级已传到工具层，同步 README/spec §4.2/§6.5/§7.0）。<br>**新增 2.0**（agent 思考时无法打断——await 回合把唤醒词排队）、第 3 节三条（敏感应用名单、验证器覆盖 5/10、DSH 调用事件未解析）、第 0 节两条（不要用 `tmp_path`、跨进程分级靠 utterance.json）。<br>**与设计稿的偏差**（都记在 `docs/dsh_integration_design.md` §1a）：工具桥接从「生成 TypeScript 插件 + HTTP 桥」改为 **MCP**；验证器**不再改写** `ToolResult.success`（否则会把「好像没有在运行」这句实话改成「已经关闭了」）；只给**有可观测后置条件**的工具配验证器。 |
 | 2026-09-19 | 建档。条目来源：`spec.md` §15「未实现清单」、`README.md` Known limitations，以及本次调试中实测确认的缺口（路由误判、浏览器弹窗、tier 未传、日志缺陷）。 |
 | 2026-09-19 | 下线 原 §1.1「成功结果永远不会被念出来」、原 §2.3「查时间」、原 §2.4「查天气」。实现：`_spoken_success`（成功也念中文 `message`，可朗读 + ≤80 字规则统一放在 `winvoice/contracts/speech.py`）+ `ToolName.GET_TIME`/`GET_WEATHER` + `winvoice/tools/weather.py`（wttr.in，async + 整体 deadline，中文兜底，内置 WWO 码中文表）。同批同步 README / deployment / spec。原 1.2–1.4 与 2.5–2.7 已重编号为 1.1–1.3 与 2.3–2.5；新缺口写入第 0 节（成功也必须给 `message`、handler 可为 async）、1.1（新工具已声明 guest 但暂不生效）、2.4（`search_web` 只解决了一半）与第 3 节（天气数据源单一）。顺带修掉一个仓库陷阱：`.gitignore` 里未锚定的 `tools/` 连 `winvoice/tools/` 一起忽略，新增模块会静默进不了提交（已改为 `/tools/`）。 |
 | 2026-09-19 | 实测报障修复（用户现场日志）：①「用浏览器搜索天气」被天气工具抢走，并把「览器搜索」当地名发给 wttr.in（500）→ 规则层改为三段优先级：**带路径参数的意图** > **显式搜索词**（`用浏览器/搜索/搜一下/百度/google/search`，拉丁词不得紧跟 `.`/`/`/`\`）> 表内顺序（`查一下/查询` 仍是弱触发词）；查询取「最后一个动词之后」的文本（`google 搜索天气` → 天气）；句子里的地名查不到时改用 `weather.city` 重查一次，网络类失败不换城市。②「打开谷歌浏览器」失败却报成功：`chrome.exe`/`msedge.exe`/`Code.exe` 都不在 `PATH`，改为 `resolve_app_command`（`App Paths` 注册表 →（`code` 用别名 `Code.exe`）→ `PATH`）按真实路径启动、去掉 shell、找不到就如实说；`close_app` 同样不再谎报（128/「找不到」→「好像没有在运行」，其余非 0（如 Access denied）→「我没能关掉…」，URI 目标→「我关不掉…」）；`search_web` 也不再把 `webbrowser.open()` 的 `False` 当成成功。③ query 改为 `quote()` 编码。新增 `tests/unit/test_app_launch.py`、`tests/unit/test_web_search.py`，并更新两个把旧缺陷当契约的旧测试。第 0 节、第 3 节、2.4、spec §5/§6.1、README、deployment 排障表已同步。 |
 
 
-我再加一条：触发以后说没事了就接下来都不要操作了，回退到等待语音触发的状态
 > 删除条目时请**只删条目**，并把同一次提交里同步过的文档（README / deployment / spec）
 > 写进提交信息，方便回溯「哪次提交让它从这份文件里消失」。

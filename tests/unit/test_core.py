@@ -161,8 +161,14 @@ class TestToolRegistry:
     def test_get_allowed_tools_guest_tier(self):
         registry = ToolRegistry()
         allowed = {spec.name for spec in registry.get_allowed("guest")}
-        # Guest denied: read_file, write_file, run_script
-        assert allowed == set(ToolName) - {ToolName.READ_FILE, ToolName.WRITE_FILE, ToolName.RUN_SCRIPT}
+        # Guest denied: read_file, list_dir, write_file, run_script, system_power
+        assert allowed == set(ToolName) - {
+            ToolName.READ_FILE,
+            ToolName.LIST_DIR,
+            ToolName.WRITE_FILE,
+            ToolName.RUN_SCRIPT,
+            ToolName.SYSTEM_POWER,
+        }
 
     def test_get_allowed_tools_rejected_tier(self):
         registry = ToolRegistry()

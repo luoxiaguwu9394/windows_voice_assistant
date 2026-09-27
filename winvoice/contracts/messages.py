@@ -48,6 +48,10 @@ class SystemStateName(str, Enum):
     ASR_RUNNING = "asr_running"
     LLM_THINKING = "llm_thinking"
     TTS_PLAYING = "tts_playing"
+    # A destructive call was announced and is waiting for the user's spoken
+    # 确认/取消. In this state the microphone feeds VAD/ASR directly, without a
+    # wake word — the answer to a spoken question must not need one.
+    CONFIRMING = "confirming"
     ERROR = "error"
 
 
@@ -64,8 +68,12 @@ class ToolName(str, Enum):
     MEDIA_CONTROL = "media_control"
     SEARCH_WEB = "search_web"
     READ_FILE = "read_file"
+    LIST_DIR = "list_dir"
     WRITE_FILE = "write_file"
     RUN_SCRIPT = "run_script"
+    # Power actions (shutdown/restart/…): confirmation-gated in the registry and
+    # guest-denied, so a spoken 确认 from the owner is the only way through.
+    SYSTEM_POWER = "system_power"
     # Read-only queries: no arguments, no confirmation, guest-allowed. They
     # answer with speech (`ToolResult.message`) instead of an action.
     GET_TIME = "get_time"
@@ -86,10 +94,20 @@ class IntentName(str, Enum):
     MEDIA_CONTROL = "media_control"
     SEARCH_WEB = "search_web"
     READ_FILE = "read_file"
+    LIST_DIR = "list_dir"
     WRITE_FILE = "write_file"
     RUN_SCRIPT = "run_script"
     GET_TIME = "get_time"
     GET_WEATHER = "get_weather"
+    # Power actions (「关机/重启/锁屏」…). Routed by the rule tier and gated by
+    # the spoken-confirmation loop; a guest can reach neither.
+    SYSTEM_POWER = "system_power"
+    # Free-form question / small talk. Text in, text out — the answering model
+    # must never get tool capability (spec.md §6.5).
+    ASK = "ask"
+    # 「没事了」 and friends: acknowledge and fall back to waiting for the wake
+    # word, running nothing.
+    DISMISS = "dismiss"
     UNKNOWN = "unknown"
 
 
@@ -225,6 +243,12 @@ class TtsRequest(BaseModel):
     text: str
     voice: str = "default"  # or "guest"
     sample_rate: int = 16000
+    # How many characters of `text` may be spoken. The TTS synthesises sentence
+    # by sentence now, so length costs latency per segment rather than blocking
+    # the first sound — but a long reply is still a long monologue, and the
+    # caller is the only one that knows whether this is a tool one-liner (80) or
+    # an agent's answer (240). See `winvoice/contracts/speech.py`.
+    max_chars: int = 80
 
 
 class TtsChunk(BaseModel):

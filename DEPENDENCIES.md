@@ -73,7 +73,8 @@ pip install -e .[dev]
 | **VAD** | Silero VAD v5 | `models/vad/silero/silero_vad_v5.onnx` | 2.3 MB | ✅ |
 | **ASR (主)** | SenseVoice int8（中英日韩粤 + ITN） | `models/asr/sense-voice/sherpa-onnx-sense-voice-...-int8-2024-07-17/` | **163 MB** | ✅ |
 | **ASR (备选)** | Streaming Zipformer **small** bilingual zh-en | `models/asr/zipformer/sherpa-onnx-streaming-zipformer-small-bilingual-zh-en-2023-02-16/` | 458 MB | ✅ |
-| **TTS** | VITS 中文（icefall aishell3） | `models/tts/vits-zh/vits-icefall-zh-aishell3/` | 31.6 MB | ✅ |
+| **TTS（默认）** | Matcha 中文（icefall baker，**22.05 kHz**，1 女声）+ **vocos-22khz-univ 声码器** | `models/tts/matcha-icefall-zh-baker/` | 72 MB + 51 MB | ✅ URL 已实测 200（2026-09-26） |
+| **TTS（回退）** | VITS 中文（icefall aishell3，8 kHz，174 说话人） | `models/tts/vits-icefall-zh-aishell3/` | 31.6 MB | ✅ |
 | **Speaker Verification** | 3D-Speaker CAM++ zh-cn 16k | `models/sv/campplus/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx` | 28.3 MB | ✅ |
 | **LLM (本地)** | Qwen2.5-3B-Instruct Q4_K_M | `models/llm/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_k_m.gguf` | ~2.2 GB | ✅ |
 
@@ -87,7 +88,7 @@ pip install -e .[dev]
 | VAD | `vad-models/silero_vad.onnx` (404) | `asr-models/silero_vad_v5.onnx` |
 | ASR Zipformer | `...bilingual-zh-en-2023-02-16.tar.bz2` (404，缺 `small`) | `...streaming-zipformer-**small**-bilingual-zh-en-2023-02-16.tar.bz2` |
 | ASR SenseVoice | 期望 494 MB（脚本猜错） | 实际 **163 MB**——下载本身没问题，是校验值错了 |
-| TTS | `rhasspy/piper/.../zh_CN-huayan-medium.onnx` (404) | `tts-models/vits-icefall-zh-aishell3.tar.bz2` |
+| TTS | `rhasspy/piper/.../zh_CN-huayan-medium.onnx` (404) | `tts-models/vits-icefall-zh-aishell3.tar.bz2`（回退模型）；默认模型见上表新增两行 |
 | Speaker Verification | `modelscope/3D-Speaker/releases/.../campplus.onnx` (404) | `speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx` |
 
 > 注：`speaker-recongition-models` 是上游 release **标签本身的拼写错误**，属实需照抄。

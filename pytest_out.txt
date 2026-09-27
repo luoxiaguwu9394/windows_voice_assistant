@@ -1,0 +1,46 @@
+============================= test session starts =============================
+platform win32 -- Python 3.14.7, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\xinxi\Desktop\windows_voice_assistant
+configfile: pytest.ini
+testpaths: tests
+plugins: anyio-4.15.1, asyncio-1.4.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 562 items
+
+tests\e2e\test_e2e.py ..                                                 [  0%]
+tests\integration\test_mcp_server.py .........                           [  1%]
+tests\integration\test_pipeline.py ..........                            [  3%]
+tests\integration\test_pipeline_barge_in.py ............                 [  5%]
+tests\integration\test_pipeline_confirmation.py ..........               [  7%]
+tests\integration\test_pipeline_qa.py .........                          [  9%]
+tests\integration\test_pipeline_tool_reply.py .........                  [ 10%]
+tests\unit\test_app_launch.py ...............                            [ 13%]
+tests\unit\test_app_name_resolution.py .............................     [ 18%]
+tests\unit\test_close_app_safety.py ......................               [ 22%]
+tests\unit\test_core.py ...........................................s     [ 30%]
+tests\unit\test_dsh_router.py .......................                    [ 34%]
+tests\unit\test_enroll_prompts.py ..............                         [ 37%]
+tests\unit\test_executor_verification.py ...............                 [ 39%]
+tests\unit\test_intent_rules_qa.py ............                          [ 41%]
+tests\unit\test_kws_keywords_file.py ..                                  [ 42%]
+tests\unit\test_list_dir.py .........                                    [ 43%]
+tests\unit\test_pipeline_agent_routing.py ...............                [ 46%]
+tests\unit\test_playback_player.py .........................             [ 50%]
+tests\unit\test_speech_is_pronounceable.py ..........................    [ 55%]
+tests\unit\test_speech_sanitize.py ............                          [ 57%]
+tests\unit\test_speech_segmentation.py ................................. [ 63%]
+........                                                                 [ 64%]
+tests\unit\test_sv_audio_frames.py ....                                  [ 65%]
+tests\unit\test_sv_thresholds.py .............                           [ 67%]
+tests\unit\test_time_speech.py ................                          [ 70%]
+tests\unit\test_tts_engine_segments.py ..........................        [ 75%]
+tests\unit\test_tts_internal_gaps.py ........                            [ 76%]
+tests\unit\test_tts_trim_silence.py .............                        [ 79%]
+tests\unit\test_verifier.py ..........................                   [ 83%]
+tests\unit\test_volume_absolute.py ...............                       [ 86%]
+tests\unit\test_volume_direction.py ......................               [ 90%]
+tests\unit\test_weather_speech.py ...................................... [ 97%]
+..........                                                               [ 98%]
+tests\unit\test_web_search.py ......                                     [100%]
+
+================== 561 passed, 1 skipped in 60.05s (0:01:00) ==================

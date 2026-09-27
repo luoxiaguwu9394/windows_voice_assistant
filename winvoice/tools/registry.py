@@ -109,8 +109,8 @@ class ToolRegistry:
         """Register all builtin tools."""
         from .builtin import (
             open_app, close_app, set_volume, media_control,
-            search_web, read_file, write_file, run_script,
-            get_time,
+            search_web, read_file, list_dir, write_file, run_script,
+            get_time, system_power,
         )
         # The network tool lives in its own module: it is the only one whose
         # reason to change is an external provider.
@@ -212,6 +212,20 @@ class ToolRegistry:
         ))
 
         self.register(ToolSpec(
+            name=ToolName.LIST_DIR,
+            description="List the entries of a folder (count plus a few names)",
+            # `path` is optional: 「当前目录下有什么文件」 names no folder, and
+            # the handler lists the user directory when it is absent.
+            schema=ToolSchema(properties={"path": {"type": "string"}}, required=[]),
+            handler=list_dir,
+            destructive=False,
+            # Listing someone's home directory discloses it; a guest gets the
+            # same refusal as `read_file`.
+            guest_allowed=False,
+            requires_confirmation=False,
+        ))
+
+        self.register(ToolSpec(
             name=ToolName.WRITE_FILE,
             description="Write content to a file",
             schema=ToolSchema(properties={"path": {"type": "string"}, "content": {"type": "string"}}, required=["path", "content"]),
@@ -233,6 +247,33 @@ class ToolRegistry:
             requires_confirmation=True,
             modified_paths=["{args.path}"],
             verifier=verifiers.get(ToolName.RUN_SCRIPT.value),
+        ))
+
+        self.register(ToolSpec(
+            name=ToolName.SYSTEM_POWER,
+            description=(
+                "Power action on this machine: shutdown, restart, sleep, "
+                "hibernate, lock, or sign out. Set action only from the user's "
+                "explicit request. Shutdown and restart carry a 5-second "
+                "buffer (`shutdown /a` aborts them)."
+            ),
+            schema=ToolSchema(
+                properties={
+                    "action": {
+                        "type": "string",
+                        "enum": ["shutdown", "restart", "sleep", "hibernate", "lock", "signout"],
+                    },
+                },
+                required=["action"],
+            ),
+            handler=system_power,
+            destructive=False,
+            # Shutting down the owner's machine is the owner's call: the tier
+            # check refuses a guest before the confirmation question is even
+            # asked, and the agent's MCP path can never supply the
+            # confirmation, so no model can power the machine down either.
+            guest_allowed=False,
+            requires_confirmation=True,
         ))
 
         # ── read-only queries ──────────────────────────────────
