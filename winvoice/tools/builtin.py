@@ -94,6 +94,19 @@ ALLOWED_APPS = {
     "settings": "ms-settings:",
 }
 
+# The process image each app *runs as*, when it differs from the launch command
+# above. VS Code launches through the `code` shim (App Paths `Code.exe`, or the
+# PATH `code.cmd`), but the process the user sees — and the one `close_app`
+# kills and the verifier watches — is `Code.exe`. Keeping this as a separate
+# table (instead of overloading ALLOWED_APPS) is what lets the launch keep its
+# shim resolution while the close stops answering 「我关不掉代码编辑器。」 with
+# a handler that never even built a `taskkill` command (live report
+# 2026-09-27: VS Code could be opened but not closed). Apps absent here launch
+# and close under the same name.
+APP_PROCESS_IMAGES = {
+    "vscode": "Code.exe",
+}
+
 # How each allowlisted app is *said*. The TTS model is Chinese-only, so the
 # English ids and executable names above must never reach the speaker.
 APP_SPEECH = {
@@ -343,7 +356,10 @@ def close_app(args: Dict[str, Any]) -> Dict[str, Any]:
             "message": f"{_speakable_name(spoken)}不在我能关闭的名单里。我能关闭{_ALLOWLIST_EXAMPLES}。",
         }
 
-    exe = ALLOWED_APPS[app]
+    # What `taskkill` matches is the process image, not the launch command:
+    # VS Code launches via the `code` shim but runs as `Code.exe`
+    # (see `APP_PROCESS_IMAGES`).
+    exe = APP_PROCESS_IMAGES.get(app, ALLOWED_APPS[app])
 
     # ── the shell: close its windows, never its process ───────────
     if app == "explorer":

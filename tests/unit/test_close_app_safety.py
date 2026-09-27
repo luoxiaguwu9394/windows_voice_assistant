@@ -263,3 +263,71 @@ def test_explorer_verifier_admits_when_it_cannot_observe() -> None:
 
 def test_close_app_still_has_a_verifier() -> None:
     assert "close_app" in default_verifiers()
+
+
+# ── launch command ≠ process image (live report 2026-09-27) ───────────────
+
+
+def test_closing_vscode_kills_the_real_process_image(monkeypatch) -> None:
+    """
+    「关闭代码编辑器」 used to answer 「我关不掉代码编辑器。」 without ever
+    building a `taskkill`: the handler read the *launch command* (`code`, the
+    shim) where it needed the *process image* (`Code.exe`). Opening worked
+    because the launch path resolves through App Paths — only closing was dead.
+    """
+    runner = RecordedRun()
+    monkeypatch.setattr(builtin.subprocess, "run", runner)
+
+    result = builtin.close_app({"app": "代码编辑器"})
+
+    assert result["success"] is True, result
+    assert runner.taskkill_commands == [["taskkill", "/im", "Code.exe"]], runner.taskkill_commands
+
+
+def test_closing_vscode_honours_an_explicit_force(monkeypatch) -> None:
+    runner = RecordedRun()
+    monkeypatch.setattr(builtin.subprocess, "run", runner)
+
+    builtin.close_app({"app": "vscode", "force": True})
+
+    assert runner.taskkill_commands == [["taskkill", "/f", "/im", "Code.exe"]]
+
+
+def test_closing_vscode_when_it_is_not_running_is_honest(monkeypatch) -> None:
+    runner = RecordedRun(returncode=128, stderr='错误: 没有找到进程 "Code.exe"。')
+    monkeypatch.setattr(builtin.subprocess, "run", runner)
+
+    result = builtin.close_app({"app": "代码编辑器"})
+
+    assert result["success"] is False
+    assert "好像没有在运行" in result["message"]
+
+
+def test_the_verifier_watches_the_same_image_the_tool_kills() -> None:
+    """Open and close verification must agree with the real process name."""
+    from winvoice.tools.verifier import _expected_image
+
+    assert _expected_image("代码编辑器") == "code.exe"
+
+
+def test_the_verifier_certifies_vscode_closed(monkeypatch) -> None:
+    from winvoice.tools.state_capture import WindowsProbe  # noqa: F401  (import shape check)
+
+    verifier = CloseAppVerifier()
+
+    class Probe:
+        def __init__(self, processes):
+            self._processes = {p.lower() for p in processes}
+
+        def running_processes(self):
+            return set(self._processes)
+
+    # Still running -> FAILED with the real image name in the reason.
+    verdict = verifier.verify({"app": "代码编辑器"}, {"success": False}, None, Probe({"Code.exe"}))
+    assert verdict.status is VerificationStatus.FAILED
+    assert "code.exe" in verdict.reason
+
+    # Gone -> VERIFIED, even though the graceful taskkill may have reported
+    # a non-zero exit (the postcondition is what the verifier is told to check).
+    verdict = verifier.verify({"app": "代码编辑器"}, {"success": False}, None, Probe(set()))
+    assert verdict.status is VerificationStatus.VERIFIED

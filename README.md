@@ -543,9 +543,11 @@ tts:
   guest_voice: guest
   speaker_id: 0
   guest_speaker_id: 1
-  speed: 0.75                  # duration ∝ 1/speed; 1.0 ≈ 193 ms/char — 45 % faster
-                               # than the old 8 kHz voice, which read as "too fast";
-                               # 0.75 ≈ 250 ms/char (≈ 4 chars/s). Restart to apply
+  speed: 0.9                   # duration ∝ 1/speed; 0.9 ≈ 208 ms/char (4.8 chars/s,
+                               # mid-band of natural conversation 4.5-5.5).
+                               # Anchors: 1.0 ≈ 193 ms/char (broadcast-y),
+                               # 0.8 ≈ 241 (slow), 0.75 ≈ 250 (clearly slow).
+                               # Restart to apply
   guest_speed: 0.9             # absolute, not relative: with one speaker, pace is the
                                # only difference left, so it must stay above `speed`
   pitch: 1.0                   # voice pitch as a frequency ratio: 1.0 = the model's
@@ -736,8 +738,8 @@ How a reply is spoken, in the order the stages run:
 
 Budgets: a tool one-liner keeps the 80-character contract limit; an agent's
 answer gets `tts.reply_max_chars` (240). At the configured pace (`tts.speed`
-0.75 ≈ 250 ms per character) that is ~60 s with the default 22 kHz voice and
-~90 s with the 8 kHz fallback (which also inherits `tts.speed`), and the
+0.9 ≈ 208 ms per character) that is ~50 s with the default 22 kHz voice and
+~79 s with the 8 kHz fallback (which also inherits `tts.speed`), and the
 wake word interrupts it — lower `tts.reply_max_chars` if that is too much.
 
 Two scripts exist for this, and neither needs an audio device:
@@ -785,7 +787,7 @@ The following are **not yet decided**. They are documented here so they aren't s
 | Weather needs the internet | `get_weather` queries `wttr.in` (no API key) with a `weather.timeout_s` deadline covering the whole request (5 s by default, and the answer is silent until it arrives). Offline or timed out it says 「暂时查不到天气。」; `weather.enabled: false` disables it entirely. Conditions come from the tool's own Chinese table because `lang=zh` returns English descriptions |
 | Agent needs the bridge installed | The optional DSH tier only has tools after `python scripts/install_dsh_bridge.py --install`; without it the agent can chat but cannot act (`deployment.md` §2.4) |
 | The agent's *output* is not streamed | The turn is a task now, so a wake word during planning is acted on immediately (the abandoned turn's reply is dropped). What cannot happen yet is speaking the answer while the model is still writing it: DSH returns the response whole, so the first sound waits for the whole reply plus its first sentence's synthesis |
-| Guest voice is only a pace | The default Matcha model has a single speaker, so a guest hears the same voice at `tts.guest_speed` (0.9 — faster than the owner's 0.75). Swap in a multi-speaker model (e.g. `vits-zh-hf-fanchen-C`, 16 kHz, 187 speakers) to get a genuinely different voice |
+| Guest voice is only a pace | The default Matcha model has a single speaker, so a guest hears the same voice at `tts.guest_speed` (1.0 — faster than the owner's 0.9). Swap in a multi-speaker model (e.g. `vits-zh-hf-fanchen-C`, 16 kHz, 187 speakers) to get a genuinely different voice |
 | Verification covers 5 of 12 tools | `get_time`, `get_weather`, `read_file`, `list_dir`, `search_web`, `media_control` and `system_power` have no observable postcondition worth checking (the machine is asleep, the browser is the user's, a power action is fire-and-forget), so they have no verifier and therefore no escalation signal |
 | `search_web` cannot verify its target | The ask-first confirmation (「你要我搜索…吗？」) is voice-path only — the agent's own `search_web` over MCP still opens the browser directly — and "did the right page open" is not machine-checkable, so it has no verifier |
 | Force-close is opt-in | `taskkill /f` skips the application's own save prompt, so it is only used for an explicit 「强制关闭 X」. A plain 「关闭 X」 waits for the app to decide, which means it can appear to hang while the app asks you to save |

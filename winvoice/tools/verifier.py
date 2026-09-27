@@ -159,18 +159,23 @@ def _expected_image(app_arg: str) -> Optional[str]:
     The process image an `app` argument should create, or None.
 
     Resolution goes through the same table `open_app` launches from, so the
-    verifier cannot disagree with the tool about what a spoken name means.
+    verifier cannot disagree with the tool about what a spoken name means —
+    including the launch-command-vs-image split (`vscode` launches as the
+    `code` shim but runs as `Code.exe`; see `builtin.APP_PROCESS_IMAGES`).
     A URI target (`ms-settings:`) has no process and returns None.
     """
-    from .builtin import ALLOWED_APPS, resolve_app
+    from .builtin import ALLOWED_APPS, APP_PROCESS_IMAGES, resolve_app
 
     app_id = resolve_app(app_arg)
     if app_id is None:
         return None
     command = ALLOWED_APPS.get(app_id)
-    if not command or not command.lower().endswith(".exe"):
+    if not command:
         return None
-    return command.lower()
+    image = APP_PROCESS_IMAGES.get(app_id, command)
+    if not image.lower().endswith(".exe"):
+        return None
+    return image.lower()
 
 
 class OpenAppVerifier(Verifier):

@@ -805,7 +805,7 @@ python scripts/calibrate_tts_pauses.py
 
 | 指标 | Matcha（默认，22.05 kHz） | VITS aishell3（回退，8 kHz） |
 |---|---|---|
-| 语速 | **176–239 ms/字（speed 1.0）；配置默认 0.75 时 ≈ 250 ms/字**（240 字 ≈ 60 s） | 262–315 ms/字（speed 1.0，240 字 ≈ 60 s）；0.75 时 ≈ 369 ms/字（≈ 90 s） |
+| 语速 | **176–239 ms/字（speed 1.0）；配置默认 0.9 时 ≈ 208 ms/字**（240 字 ≈ 50 s） | 262–315 ms/字（speed 1.0，240 字 ≈ 60 s）；0.9 时 ≈ 331 ms/字（≈ 79 s） |
 | 每段自带首尾静音 | lead 60–90 ms / tail 60–110 ms | lead 0–120 ms / tail 180–210 ms |
 | 噪声底（占峰值） | 0.24–1.68 % | 0.78–1.74 % |
 | 起音电平 | 35–53 % | 37–46 % |
@@ -838,7 +838,7 @@ python scripts/calibrate_tts_pauses.py
 | **没有声音 / `audio_output_unavailable`** | 输出设备打不开（被独占、被拔掉、驱动问题）。播放层会逐级回退（WASAPI 共享 → WASAPI auto-convert → 系统默认/MME），全失败就降级为静音继续跑，并把每条路由的失败原因写进 `error`。先看设备是否可见：`python -c "import sounddevice as sd; print(sd.query_devices())"` |
 | **打断之后就没声音了** | 不应该发生：`abort()` 撞上正在 `write()` 的喂音线程时，某些驱动会拒绝立刻 `start()`，播放层会重试（0/20/50/100 ms）并最终**重开流**（日志 `audio_restart_failed` → `audio_output_reopened`）。若真出现无声，看这两条日志与 `player_utterance_done` 的 `frames` |
 | **走的是 MME 还是 WASAPI？** | 启动日志 `audio_output_route route=…`：`wasapi shared` 最好（低延迟），`wasapi auto-convert` 次之（Windows 做重采样），`system default` 表示 WASAPI 打不开、退回 MME（延迟最差）。`audio.output_host_api` 可强制 `wasapi` 或 `default` |
-| **发音太快 / 换模型后比以前快很多** | 默认模型从 8 kHz VITS（≈277 ms/字）换成了 Matcha（speed 1.0 时 ≈193 ms/字，快 45 %）。调 `tts.speed`：时长 ∝ 1/speed，默认 0.75 ≈ 250 ms/字；还嫌快用 0.7（≈旧 VITS 语速）、嫌慢用 0.8。**该键引擎只在启动时读一次，改完要重启**（`pause_*`/`chunk_*` 才是热生效的）。先排除播放链路问题：`audio_output_started` 的 `sample_rate` 应为设备原生率、`audio_playback_done` 的 `audio_ms` 应 ≈ 字数 × ms/字 |
+| **发音太快 / 换模型后比以前快很多** | 默认模型从 8 kHz VITS（≈277 ms/字）换成了 Matcha（speed 1.0 时 ≈193 ms/字，快 45 %）。调 `tts.speed`：时长 ∝ 1/speed，默认 0.9 ≈ 208 ms/字（4.8 字/秒）；嫌快往 0.8（≈241）、嫌慢往 0.95–1.0（≈193，播报腔）。**该键引擎只在启动时读一次，改完要重启**（`pause_*`/`chunk_*` 才是热生效的）。先排除播放链路问题：`audio_output_started` 的 `sample_rate` 应为设备原生率、`audio_playback_done` 的 `audio_ms` 应 ≈ 字数 × ms/字 |
 | **音调高 / 声音尖、像小孩**（或反过来：过于中性/低沉） | baker 原生中位 F0 = 276 Hz（p10–p90 196–345）。`tts.pitch` 是纯口味旋钮：1.0 = 原声（当前默认）；嫌高用 0.85–0.9，嫌低用 1.0–1.05。语速不受影响（引擎自动用 `speed/pitch` 补偿）。**要重启**。音色本身（读腔、flat pitch contour）不可调，不满意只能换模型（见「访客和主人声音一样」行） |
 | **一句话里有卡顿 / 语流碎片化（词→断点→词）** | 两个来源，都已处理：①**逐块重采样的边缘伪影**（每 100 ms 块独立 `resample_poly`，接缝处有 20–50 % 峰值的振幅台阶——一个字 2–3 下，即「字内断点」；已改为**按段整段重采样**，接缝只剩段边界且被停顿掩蔽，伪影实测归零到量化底噪）；②**模型自己的句内静音洞**（1–7 个 40–240 ms，位置随机；由 `tts.max_internal_gap_ms` 60 / `internal_gap_keep_ms` 30 压掉，热生效）。排查顺序：先看 `audio_playback_done` 的 `underruns`（>0 见「播报有咔哒声」行）；`underruns=0` 还碎就是②，把阈值降到 50 再试 |
 | **回答上叠加了一层杂音（同一个音、断续规律、忽有忽无）** | **已实锤：Windows「空间音效」（Spatial Sound）**。该 DSP 层在设备上处理所有音频，会周期性产生卡顿杂音；关闭后杂音消失（2026-09-27 用户实测），与黑匣子取证「应用写入设备的数据干净」互相印证。排查入口：设置 → 系统 → 声音 → 属性 → 空间音效 → 关。若关闭后仍有：蓝牙 A2DP↔HFP 切换、其他「音频增强」、其他应用改变端点格式、USB 省电，用 `python scripts/diagnose_playback.py`（杂音在场时）+ `WINVOICE_DIAG_PLAYBACK` 黑匣子对比取证 |
@@ -846,11 +846,12 @@ python scripts/calibrate_tts_pauses.py
 | **首句延迟大** | 首块越大越慢：调小 `tts.first_chunk_max_chars`（默认 16）；也确认 `tts.num_threads` 没被设成 1。日志里 `tts_segment` 的 `latency_ms` 是每段合成耗时，`first_segment_ms` 决定出声时间 |
 | **句子被切在奇怪的地方** | 断句规则在 `winvoice/text/segment.py`（禁区：数字内部、括号内、`的` 之后、`了` 之前）。先用 `show_segmentation.py` 复现，再改 `tts.clause_max_chars`（越大越少切）或补连词表 |
 | **访客和主人声音一样** | 单说话人模型的必然结果：matcha zh-baker 只有 1 个说话人，访客只能用 `tts.guest_speed` 区分语速。要真两种音色就换多说话人模型（`models/tts/vits-zh-hf-fanchen-C`，16 kHz，187 说话人，需要改 `tts.model` 并自行下载） |
-| **回复很长（几十秒）** | `tts.reply_max_chars` 默认 240，默认语速（speed 0.75 ≈ 250 ms/字）下 240 字约 60 秒（回退的 8 kHz 模型在 0.75 时 ≈369 ms/字 → 约 90 秒）。嫌长就调小（热生效），或在播报中说唤醒词打断 |
+| **回复很长（几十秒）** | `tts.reply_max_chars` 默认 240，默认语速（speed 0.9 ≈ 208 ms/字）下 240 字约 50 秒（回退的 8 kHz 模型在 0.9 时 ≈331 ms/字 → 约 79 秒）。嫌长就调小（热生效），或在播报中说唤醒词打断 |
 | 控制台刷 `Unknown token: shei2` | **无害的上游数据缺陷**，可以忽略：Matcha 词表里有 4 条词条（`谁的`/`谁都`/`人生自古谁无死`/`鹿死谁手`）标了 pinyin `shei2`，但模型 `tokens.txt` 里只有 `shui2`。实测：这行**每次 `generate()` 都恰好打一次、与文本无关**，而且 `谁的`(580 ms) ≈ `谁`(362 ms) + `的`(269 ms)，两个音节都念出来了 —— 不是丢字。真正会丢字的是拉丁词（见 `OOV ... Ignore it!`） |
 | 唤醒词不灵敏 | 见 §5.3：优先换成中文关键词，其次降 `kws.threshold` 到 0.20，再不行 `kws.use_int8: false` |
 | 控制台刷 `OOV ... Ignore it!`（如 `OOV 90.`、`OOV app.`） | sherpa 中文 VITS 的**词表里没有任何拉丁词条**，数字靠 `number.fst` 展开。① 原文含英文 → 说明有工具把英文错误直接送进了 TTS（应走 `ToolResult.message`，中文面向用户，`error` 只进日志）② 数字被丢 → 检查 TTS 模型目录里 `number.fst` / `date.fst` / `phone.fst` 是否存在（引擎会把它们作为 `rule_fsts` 传入） |
 | 说「打开记事本」被拒绝 | 应用名按中文标签/英文 id/近似拼写解析（`记事本`、`notepad`、`Notpa` 都能命中）；不在白名单内的（微信/QQ）仍会拒绝。若要新增，改 `ALLOWED_APPS` + `APP_SPEECH` |
+| 关得掉记事本却关不掉代码编辑器（VS Code） | **已修复（2026-09-27）**：`ALLOWED_APPS["vscode"]` 存的是**启动命令** `code`（App Paths/PATH shim），而 `close_app` 与验证器把它当**进程名**用——不以 `.exe` 结尾直接进「我关不掉」分支。现在新增 `APP_PROCESS_IMAGES`（`vscode` → `Code.exe`）区分启动命令与进程映像，关闭与验证都盯真实进程。回归：`pytest tests/unit/test_close_app_safety.py` |
 | 说「关机」没有反应 / 回「没实现」 | 规则层 `system_power` 触发词：`关机/重启/重新启动/睡眠/休眠/锁屏/锁定屏幕/注销/退出登录`（「怎么关机」是问句，走问答）。执行需主人声纹 + 口头「确认」；关机/重启带 5 秒缓冲（`shutdown /a` 可中止）。日志 `confirmation_armed tool=system_power` |
 | 说「打开谷歌浏览器」回「我没找到…的安装位置」 | 程序既不在 `PATH`、也不在 `App Paths` 注册表里。查 `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe`（Chrome/Edge/VS Code 安装时都会写这个键）；绿色版/免安装版需要手动加进 `PATH`。**这是如实回答**：旧版拿裸名字 `Popen(..., shell=True)` 启动，`chrome.exe` 不在 `PATH` 时 cmd.exe 只打印「不是内部或外部命令」，而工具照样报成功 |
 | 说「关闭记事本」回「好像没有在运行」 | `taskkill` 退出码非 0（128 = 没找到该进程）：现在是如实回答，旧版无论有没有关掉都说「已经关闭」。系统设置是 URI 不是进程，会回「我关不掉系统设置。」 |

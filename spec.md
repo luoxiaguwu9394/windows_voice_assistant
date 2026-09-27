@@ -811,7 +811,7 @@ measured before the switch; the Matcha figures are the new default.
 | Test suite | 489 passed, 1 skipped (plus the 19 documented `tmp_path` sandbox errors) | — |
 | First audio, 46-character reply | **248 ms** | 289 ms |
 | Per-segment synthesis | 196–247 ms per 14–17 character segment | 262–324 ms |
-| Speech rate | **176–239 ms per char at speed 1.0; ≈ 250 ms/char at the configured 0.75** (240 chars ≈ 60 s) | 262–315 ms per char at 1.0 (≈ 60 s); ≈ 369 ms/char at 0.75 (≈ 90 s) |
+| Speech rate | **176–239 ms per char at speed 1.0; ≈ 208 ms/char at the configured 0.9** (240 chars ≈ 50 s) | 262–315 ms per char at 1.0 (≈ 60 s); ≈ 331 ms/char at 0.9 (≈ 79 s) |
 | Edge silence per `generate()` | lead 60–90 ms, tail 60–110 ms | lead 0–120 ms, tail 180–210 ms |
 | Noise floor | 0.24–1.68 % of peak | 0.78–1.74 % of peak |
 | Trimmed per segment | 72–98 ms | 172–279 ms |
