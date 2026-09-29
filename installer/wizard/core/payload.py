@@ -27,10 +27,20 @@ def payload_path(base_dir: Path) -> Path:
 
 
 def extract_payload(archive: Path, dest_dir: Path,
-                    on_progress: Optional[Callable[[int, int], None]] = None) -> int:
+                    on_progress: Optional[Callable[[int, int], None]] = None,
+                    on_member: Optional[Callable[[str], None]] = None) -> int:
     """
     Extract `archive` under `dest_dir`; returns the number of members.
+
     Progress is cumulative bytes / total bytes across all regular files.
+    `on_member` is told the archive-relative name about to be written, so the
+    UI can show *what* it is doing: writing 100 MB of executables can take a
+    while under a virus scanner, and a progress bar alone reads as a hang.
+
+    A file that cannot be written (in use by a running assistant or its
+    llama-server) is reported **by name**, with the remedy — `PermissionError`
+    used to escape as a bare OSError into a modal dialog, which is how an
+    upgrade came to look frozen at 92 %.
     """
     if not archive.is_file():
         raise PayloadError(f"找不到运行时载荷: {archive}")
@@ -48,10 +58,22 @@ def extract_payload(archive: Path, dest_dir: Path,
 
             _report()
             for member in members:
+                if on_member is not None and member.isfile():
+                    on_member(member.name)
                 try:
                     tar.extract(member, dest_dir, filter="data")
-                except TypeError:  # Python < 3.12 without the filter argument
-                    tar.extract(member, dest_dir)
+                except TypeError as error:
+                    raise PayloadError(
+                        "当前 Python 不支持安全解压过滤器；请重新下载新版安装器"
+                    ) from error
+                except OSError as error:
+                    raise PayloadError(
+                        f"写入失败：{member.name}\n"
+                        f"  {error}\n"
+                        f"  该文件正被占用（助手或它的 llama-server 还在运行）。"
+                        f"请关闭助手窗口，或在任务管理器里结束 "
+                        f"llama-server.exe / python.exe 后重试。"
+                    ) from error
                 if member.isfile():
                     done += member.size
                     _report()

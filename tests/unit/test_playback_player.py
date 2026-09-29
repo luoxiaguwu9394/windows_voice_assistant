@@ -673,3 +673,49 @@ async def test_the_null_player_counts_what_it_was_given() -> None:
     assert player.stats.pause_ms == 140
     assert player.stats.frames_written == 800
     assert player.stats.interrupted == 1
+
+
+# ──────────────────────────────────────────────────────────────
+# Device invalidation mid-playback (AUDCLNT_E_DEVICE_INVALIDATED)
+# ──────────────────────────────────────────────────────────────
+
+
+class InvalidatedFirstStream(FakeStream):
+    """A stream the endpoint is torn out from under: first write dies."""
+
+    def __init__(self, rate: int) -> None:
+        super().__init__(rate)
+        self.failed = False
+
+    def write(self, data: np.ndarray) -> None:
+        if not self.failed:
+            self.failed = True
+            raise OSError(
+                "Unanticipated host error [PaErrorCode -9999]: "
+                "'AUDCLNT_E_DEVICE_INVALIDATED'"
+            )
+        super().write(data)
+
+
+async def test_an_invalidated_device_recovers_and_keeps_speaking() -> None:
+    """
+    Windows can tear the endpoint down mid-playback (device change, driver
+    reset, effects pipeline reloading — observed on a second machine's
+    built-in speakers). Dying there used to silence the assistant until the
+    next app start: `_disabled` was set on the first failure. The stream is
+    rebuilt instead, and the session keeps talking.
+    """
+    first = InvalidatedFirstStream(DEVICE_RATE)
+    second = FakeStream(DEVICE_RATE)
+    calls = iter([(first, DEVICE_RATE), (second, DEVICE_RATE)])
+    player = make_player(first, stream_open=lambda rate, blocksize: next(calls))
+    try:
+        await player.enqueue(pcm(200, DEVICE_RATE), DEVICE_RATE)
+        await player.enqueue(pcm(200, DEVICE_RATE), DEVICE_RATE)
+        await player.wait_drained()
+    finally:
+        await player.close()
+
+    assert first.failed, "the scenario did not run"
+    assert second.written_ms >= 190, "the rebuilt stream never spoke"
+    assert not player.disabled, "the player disabled itself on a transient"

@@ -223,9 +223,10 @@ test, config generation, wake-word setup, optional DSH agent layer and cloud
 keys, speaker enrollment, and a full `--check` — then creates the desktop
 shortcut. No Python, no pip, no compiling.
 
-Re-running the same exe detects an existing install and offers upgrade /
-repair (models and config are preserved). Updates are discovered from new
-release assets automatically. Details: `installer/README.md`.
+Re-running the copied exe detects the install in its own directory and offers
+upgrade / repair (models and config are preserved), including when you chose a
+custom install location. Updates are discovered from new release assets
+automatically. Details: `installer/README.md`.
 
 ### Requirements
 

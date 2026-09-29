@@ -797,6 +797,11 @@ optional DSH bridge and cloud keys, speaker enrollment, `--check` gate, shortcut
 an install marker; re-running upgrades/repairs in place and the wizard discovers newer
 releases.
 
+Re-entry resolves the selected install directory from its marker; an update
+download carries that directory into the new setup process. Upgrade process
+ownership uses path containment, and deferred uninstall uses a literal-path
+PowerShell helper.
+
 ### Not implemented
 > `UNIMPLEMENTED.md` is the working backlog for these: it carries the per-item constraints,
 > code anchors and acceptance criteria. Keep the two lists in step.

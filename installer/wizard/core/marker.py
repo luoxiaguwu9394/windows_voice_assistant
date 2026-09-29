@@ -22,6 +22,23 @@ def marker_path(install_dir: Path) -> Path:
     return install_dir / MARKER_NAME
 
 
+def discover_install_dir(default: Path, *, executable: Optional[Path] = None,
+                         override: Optional[str] = None) -> Path:
+    """Resolve the installation this setup executable should manage.
+
+    A command-line override is used when an update is launched from Downloads.
+    Otherwise, a copied setup executable next to a valid marker manages its
+    own installation; a freshly downloaded installer falls back to the default.
+    """
+    if override:
+        return Path(override).expanduser()
+    if executable is not None:
+        candidate = executable.resolve().parent
+        if read_marker(candidate) is not None:
+            return candidate
+    return default
+
+
 def read_marker(install_dir: Path) -> Optional[dict]:
     """The parsed marker, or None when `install_dir` is not an install."""
     path = marker_path(install_dir)

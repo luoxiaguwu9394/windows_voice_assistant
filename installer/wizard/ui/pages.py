@@ -8,25 +8,43 @@ page's `index` is assigned by the app and lets a page skip itself (DshPage).
 
 from __future__ import annotations
 
+import os
+import sys
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Dict, List, Optional
 
-from ..core import buildinfo, flow, marker, modelplan, systeminfo, update, wakewords
+from ..core import (
+    buildinfo,
+    flow,
+    marker,
+    modelplan,
+    processes,
+    systeminfo,
+    uninstall,
+    update,
+    wakewords,
+    wlog,
+)
 from ..core.payload import PayloadError, extract_payload, payload_path
 from ..core.shortcuts import (
     FOLDER_DESKTOP,
     FOLDER_STARTMENU,
     FOLDER_STARTUP,
+    SHORTCUT_NAME,
     create_shortcut,
     special_folder,
 )
 from .base import Page, base_dir
 from .widgets import EntryRow, LogBox, ProgressRow, make_note
 
-DEFAULT_INSTALL_DIR = Path.home() / "AppData" / "Local" / "WinVoice"
-SHORTCUT_NAME = "WinVoice 语音助手.lnk"
+_DEFAULT_INSTALL_DIR = Path.home() / "AppData" / "Local" / "WinVoice"
+DEFAULT_INSTALL_DIR = marker.discover_install_dir(
+    _DEFAULT_INSTALL_DIR,
+    executable=Path(sys.executable) if getattr(sys, "frozen", False) else None,
+    override=os.environ.get("WINVOICE_INSTALL_DIR"),
+)
 
 
 def _heading(parent, text: str) -> ttk.Label:
@@ -62,10 +80,29 @@ class WelcomePage(Page):
                 ("upgrade", "升级 / 修复此安装（保留模型和配置）"),
                 ("reconfig", "重新配置此安装（重新走一遍向导）"),
                 ("launch", "直接启动已安装的助手"),
+                ("uninstall", "卸载此安装（删除向导与运行时；模型与配置可选择保留）"),
             ):
                 ttk.Radiobutton(self._mode_row, text=label, value=value,
                                 variable=self._mode).pack(anchor="w")
         self._mode_row.pack(anchor="w", pady=(0, 6))
+
+        # Uninstall options, revealed by choosing that mode. Both default to
+        # *keeping* the user's data: deleting 2–3 GB of models is not something
+        # an uninstall should assume.
+        self._uninstall_row = ttk.Frame(self)
+        self._keep_models = tk.BooleanVar(value=True)
+        self._keep_config = tk.BooleanVar(value=True)
+        make_note(self._uninstall_row,
+                  "卸载会停止助手与 llama-server、删除运行时、快捷方式与安装标记。"
+                  "环境变量（DEEPSEEK_API_KEY 等）不会被删除。").pack(anchor="w")
+        ttk.Checkbutton(self._uninstall_row, text="保留已下载的模型（models/，2–3 GB）",
+                        variable=self._keep_models).pack(anchor="w")
+        ttk.Checkbutton(self._uninstall_row, text="保留配置文件（config/config.yaml）",
+                        variable=self._keep_config).pack(anchor="w")
+        self._uninstall_log = LogBox(self._uninstall_row, height=6)
+        self._uninstall_log.pack(fill="both", expand=True, pady=4)
+        self._mode.trace_add("write", lambda *_: self._sync_uninstall_row())
+        self._sync_uninstall_row()
 
         # Update banner (hidden until a newer release is found).
         self._update_row = ttk.Frame(self)
@@ -95,7 +132,10 @@ class WelcomePage(Page):
         self.post(lambda: self._facts.set(text))
 
     def _check_updates(self) -> None:
-        info = update.fetch_latest(buildinfo.VERSION)
+        info = update.fetch_latest(
+            buildinfo.VERSION,
+            on_error=lambda reason: wlog.log_event("update_check_failed", detail=reason),
+        )
         if info is None:
             return
         self._update_info = info
@@ -111,29 +151,110 @@ class WelcomePage(Page):
         self._update_progress.pack(anchor="w", pady=(10, 0), fill="x")
 
         def work():
-            dest = update.download_update(
-                info, Path.home() / "Downloads",
-                on_progress=lambda done, total: self.post(
-                    lambda d=done, t=total: self._update_progress.set_fraction(d, t)),
-            )
+            try:
+                dest = update.download_update(
+                    info, Path.home() / "Downloads",
+                    on_progress=lambda done, total: self.post(
+                        lambda d=done, t=total: self._update_progress.set_fraction(d, t)),
+                )
+            except Exception as exc:
+                failure = exc  # `except as` deletes the name at block exit — the
+                # lambda below runs later, on the Tk thread, after that del.
+                self.post(lambda: self._update_failed(failure))
+                return
             self.post(lambda: self._update_done(dest))
 
         self.run_bg(work)
 
+    def _update_failed(self, exc: Exception) -> None:
+        """Back to the banner with a readable reason — a failed download must
+        not surface as the generic run_bg error box, and the broken file (if
+        any) has already been removed by `download_update` itself."""
+        wlog.log_event("update_download_failed", detail=f"{type(exc).__name__}: {exc}")
+        self._update_progress.pack_forget()
+        self._update_row.pack(anchor="w", pady=(10, 0))
+        self._errorbox("下载失败", f"新版本安装器下载失败：\n{exc}\n\n详情见 "
+                                    f"{wlog.log_path()}")
+
     def _update_done(self, dest: Path) -> None:
+        wlog.log_event("update_downloaded", detail=str(dest))
         self._update_progress.pack_forget()
         if messagebox.askyesno("更新已下载",
                                f"新版安装器已保存到：\n{dest}\n\n"
                                "现在运行它吗？（本向导将先关闭）", parent=self.app.root):
             import subprocess
 
-            subprocess.Popen([str(dest)], close_fds=True)
+            subprocess.Popen(
+                [str(dest), "--install-dir", str(DEFAULT_INSTALL_DIR)], close_fds=True
+            )
             self.app.root.destroy()
+
+    def _sync_uninstall_row(self) -> None:
+        if self._existing and self._mode.get() == "uninstall":
+            self._uninstall_row.pack(anchor="w", pady=(6, 0), fill="both", expand=True)
+        else:
+            self._uninstall_row.pack_forget()
+
+    def _uninstall(self) -> None:
+        """Ask for confirmation, then remove the installation on this thread."""
+        install_dir = DEFAULT_INSTALL_DIR
+        keep_models = self._keep_models.get()
+        keep_config = self._keep_config.get()
+        kept = [name for name, keep in (("models/", keep_models),
+                                        ("config/config.yaml", keep_config)) if keep]
+        text = (
+            f"将卸载 {install_dir}\n\n"
+            "• 停止助手与 llama-server\n"
+            "• 删除运行时（python/、tools/、.pylibs/、winvoice/、scripts/）\n"
+            "• 删除桌面 / 开始菜单 / 启动 快捷方式\n"
+            "• 删除安装标记与可能残留的 logs/、runtime/、snapshots/\n"
+        )
+        text += f"• 保留 {'、'.join(kept)}\n" if kept else "• 删除 models/ 与 config/（含已下载的模型）\n"
+        text += "\n此操作不可撤销。确定继续吗？"
+        if not messagebox.askyesno("确认卸载", text, parent=self.app.root, default="no"):
+            return
+
+        self.set_nav(busy=True)
+        self._uninstall_log.append("开始卸载…")
+
+        def work() -> None:
+            summary = uninstall.uninstall(
+                install_dir,
+                keep_models=keep_models,
+                keep_config=keep_config,
+                log=lambda line: self.post(lambda: self._uninstall_log.append(line)),
+            )
+            self.post(lambda: self._uninstall_finished(summary))
+
+        self.run_bg(work)
+
+    def _uninstall_finished(self, summary: dict) -> None:
+        if summary["failed"]:
+            messagebox.showwarning(
+                "卸载未完成",
+                "有文件无法删除（多半仍被占用）：\n\n"
+                + "\n".join(summary["failed"][:10]),
+                parent=self.app.root,
+            )
+            self.set_nav(busy=False, next_=False, hint="卸载未完成 — 关闭助手后可重试")
+            return
+        if summary["deferred"]:
+            messagebox.showinfo(
+                "卸载完成",
+                "安装目录将在本窗口关闭后自动删除（向导自身就在其中）。",
+                parent=self.app.root,
+            )
+        else:
+            messagebox.showinfo("卸载完成", "已保留你勾选的用户数据。", parent=self.app.root)
+        self.app.root.destroy()
 
     def can_proceed(self) -> bool:
         if self._existing and self._mode.get() == "launch":
             flow.launch_assistant(DEFAULT_INSTALL_DIR)
             self.app.root.destroy()
+            return False
+        if self._existing and self._mode.get() == "uninstall":
+            self._uninstall()
             return False
         return True
 
@@ -257,6 +378,9 @@ class ExtractPage(Page):
                        "（不联网；模型与已生成的配置不受影响）。").pack(anchor="w", pady=(0, 10))
         self._progress = ProgressRow(self, label="解压")
         self._progress.pack(fill="x", pady=4)
+        self._file_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self._file_var, foreground="#555555",
+                  wraplength=620, justify="left").pack(anchor="w")
         self._log = LogBox(self, height=10)
         self._log.pack(fill="both", expand=True, pady=6)
         self._done = False
@@ -270,11 +394,26 @@ class ExtractPage(Page):
         try:
             archive = payload_path(base_dir())
             self.post(lambda: self._log.append(f"载荷：{archive}"))
+
+            # A running assistant — or the llama-server it reuses but never
+            # owns — holds `tools\...\llama-server.exe` open, and re-extracting
+            # over it stalls at 92 % (the byte offset where `tools/` starts, and
+            # the reason the upgrade looked frozen). Stop them first and say so,
+            # instead of dying on a locked file.
+            self.post(lambda: self._log.append("检查是否有助手 / llama-server 正在运行…"))
+            processes.stop_occupants(
+                self.state.install_dir,
+                log=lambda line: self.post(lambda: self._log.append(line)),
+            )
+
             extract_payload(
                 archive, self.state.install_dir,
                 on_progress=lambda done, total: self.post(
                     lambda d=done, t=total: self._progress.set_fraction(d, t)),
+                on_member=lambda name: self.post(
+                    lambda n=name: self._file_var.set(f"正在写入：{n}")),
             )
+            self.post(lambda: self._file_var.set(""))
             self.post(lambda: self._log.append("运行时已释放。"))
             flow.write_default_config(self.state.install_dir)
             self.post(lambda: self._log.append("默认配置已写入 config/config.yaml。"))
@@ -282,11 +421,12 @@ class ExtractPage(Page):
             self._done = True
             self.post(lambda: self.set_nav(busy=False, next_=True))
         except (PayloadError, flow.FlowError) as error:
+            self.post(lambda: self._file_var.set(""))
             self.post(lambda: self._log.append(f"[失败] {error}"))
             self.post(lambda: self._errorbox("解压失败", str(error)))
             self.post(lambda: self.set_nav(
                 busy=False, next_=False,
-                hint="解压失败 — 可返回上一步检查安装目录，重新进入本页即重试"))
+                hint="解压失败 — 关闭助手后返回上一步，重新进入本页即重试"))
 
 
 class ModelsPage(Page):

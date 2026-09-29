@@ -492,6 +492,51 @@ class SpeechPlayer:
                     logger.warning("audio_restart_failed", error=str(error))
         self._reopen()
 
+    def _recover_stream(self) -> bool:
+        """
+        Rebuild the output stream after the device invalidated it mid-write.
+
+        `AUDCLNT_E_DEVICE_INVALIDATED` fires when Windows tears the endpoint
+        down underneath the stream (device change, driver reset, an effects
+        pipeline reloading — observed on a second machine's built-in speakers).
+        The stream object is dead but the device usually is not: close, reopen,
+        and keep speaking. One retry with a short delay covers a reset that is
+        still settling; `_disabled` stays with the caller so a recovered player
+        is never silenced by a transient.
+        """
+        for attempt, delay in enumerate((0.0, 0.25)):
+            if delay:
+                time.sleep(delay)
+            old, self._stream = self._stream, None
+            if old is not None:
+                try:
+                    old.close()
+                except Exception:  # pragma: no cover - device teardown
+                    pass
+            try:
+                if self._stream_open is not None:
+                    stream, rate = self._stream_open(self.out_rate, self.blocksize_ms)
+                else:
+                    stream, rate = open_output_stream(
+                        self.out_rate,
+                        self.blocksize_ms,
+                        device=self.device,
+                        host_api=self.host_api,
+                        latency=self.latency_s,
+                    )
+            except Exception as error:
+                logger.warning(
+                    "audio_output_recover_failed",
+                    attempt=attempt,
+                    error=str(error),
+                )
+                continue
+            self._stream = stream
+            self.out_rate = int(rate or self.out_rate)
+            logger.info("audio_output_recovered", sample_rate=self.out_rate)
+            return True
+        return False
+
     def _reopen(self) -> None:
         """Last resort: a stream that will not restart is replaced."""
         old, self._stream = self._stream, None
@@ -597,9 +642,20 @@ class SpeechPlayer:
                 self._drained.clear()
         try:
             stream.write(samples)
-        except Exception as error:  # a device that dies mid-utterance must not kill the thread
-            logger.warning("audio_write_failed", error=str(error))
-            self._disabled = True
+        except Exception as error:
+            # An endpoint can be invalidated underneath us mid-playback
+            # (AUDCLNT_E_DEVICE_INVALIDATED: device change, driver reset, an
+            # effects pipeline reloading). Dying here would silence the
+            # assistant until the next app start, so the stream is rebuilt and
+            # the session continues — `_disabled` only after recovery fails
+            # repeatedly.
+            logger.warning(
+                "audio_write_failed",
+                error=str(error),
+                recovery="reopen",
+            )
+            if not self._recover_stream():
+                self._disabled = True
             return
         if self._diag_file is not None:
             try:

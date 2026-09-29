@@ -11,9 +11,12 @@ broken — these tests catch that drift without running the wizard.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import shutil
 import sys
 import tarfile
+import urllib.error
 import uuid
 from pathlib import Path
 
@@ -27,7 +30,7 @@ if str(INSTALLER_DIR) not in sys.path:
 
 from wizard.core import flow, marker, modelplan, payload, progress, systeminfo  # noqa: E402
 from wizard.core import template as template_mod  # noqa: E402
-from wizard.core import update, wakewords  # noqa: E402
+from wizard.core import update, wakewords, wlog  # noqa: E402
 from wizard.core.state import InstallState, default_config_values  # noqa: E402
 from wizard.core.runner import OperationCancelled, run_streaming  # noqa: E402
 
@@ -289,6 +292,342 @@ class TestUpdate:
     def test_parse_release_without_asset_is_none(self):
         assert update.parse_release({"tag_name": "v9.9.9", "assets": []}, "0.1.0") is None
 
+    def test_a_prerelease_is_an_update(self):
+        """
+        The regression this pins: this project marks its dev builds as
+        pre-releases, and GitHub's `/releases/latest` excludes those — it 404s
+        on a pre-release-only repo (measured), which made the update banner a
+        silent no-op. Listing releases and filtering drafts instead means a
+        pre-release is a perfectly ordinary update.
+        """
+        listed = [
+            {
+                "tag_name": "v0.1.1-dev",
+                "prerelease": True,
+                "draft": False,
+                "assets": [{"name": "WinVoice-Setup-0.1.1-dev.exe",
+                            "browser_download_url": "http://x/WinVoice-Setup-0.1.1-dev.exe"}],
+            }
+        ]
+
+        info = update.parse_releases(listed, current_version="0.1.0-dev")
+
+        assert info is not None
+        assert info.version == "0.1.1-dev"
+
+    def test_the_newest_listed_release_wins(self):
+        def release(version: str, *, draft: bool = False) -> dict:
+            return {
+                "tag_name": f"v{version}",
+                "draft": draft,
+                "assets": [{"name": f"WinVoice-Setup-{version}.exe",
+                            "browser_download_url": f"http://x/{version}.exe"}],
+            }
+
+        listed = [release("0.2.0"), release("0.3.0"), release("0.1.5")]
+
+        info = update.parse_releases(listed, current_version="0.1.0")
+
+        assert info is not None and info.version == "0.3.0"
+
+    def test_drafts_and_stale_entries_are_skipped(self):
+        listed = [
+            {"tag_name": "v0.4.0", "draft": True,
+             "assets": [{"name": "WinVoice-Setup-0.4.0.exe", "browser_download_url": "http://x/d.exe"}]},
+            {"tag_name": "v0.1.0", "draft": False,
+             "assets": [{"name": "WinVoice-Setup-0.1.0.exe", "browser_download_url": "http://x/o.exe"}]},
+            {"tag_name": "v9.9.9", "draft": False, "assets": []},
+        ]
+
+        assert update.parse_releases(listed, current_version="0.1.0") is None
+
+    def test_the_list_endpoint_is_derived_from_the_latest_url(self):
+        """`fetch_latest` must not query `/releases/latest` (it 404s here)."""
+        asked: list[str] = []
+
+        class _Response:
+            def read(self) -> bytes:
+                return b"[]"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc) -> None:
+                return None
+
+        def fake_urlopen(request, timeout=None):
+            asked.append(request.full_url)
+            return _Response()
+
+        original = update.urllib.request.urlopen
+        update.urllib.request.urlopen = fake_urlopen
+        try:
+            update.fetch_latest("0.1.0-dev",
+                                api_url="https://api.github.com/repos/o/r/releases/latest")
+        finally:
+            update.urllib.request.urlopen = original
+
+        assert asked and "/releases?" in asked[0]
+        assert "/releases/latest" not in asked[0]
+
+    def test_release_listing_follows_pages(self):
+        asked: list[str] = []
+
+        class _Response:
+            def __init__(self, body: bytes):
+                self.body = body
+
+            def read(self) -> bytes:
+                return self.body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc) -> None:
+                return None
+
+        def fake_urlopen(request, timeout=None):
+            asked.append(request.full_url)
+            page = 2 if request.full_url.endswith("page=2") else 1
+            rows = ([{"page": 1}] * 100) if page == 1 else [{"page": 2}]
+            return _Response(json.dumps(rows).encode())
+
+        original = update.urllib.request.urlopen
+        update.urllib.request.urlopen = fake_urlopen
+        try:
+            releases = update.fetch_release_pages(
+                "https://api.github.com/repos/o/r/releases/latest"
+            )
+        finally:
+            update.urllib.request.urlopen = original
+
+        assert len(releases) == 101
+        assert len(asked) == 2 and "page=2" in asked[1]
+
+
+class _FakeResponse:
+    """Stands in for `urlopen` results: chunked reads, dict headers."""
+
+    def __init__(self, data: bytes, content_length: int | None = None):
+        self._data = data
+        self.headers = {"Content-Length": str(
+            len(data) if content_length is None else content_length)}
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            data, self._data = self._data, b""
+        else:
+            data, self._data = self._data[:size], self._data[size:]
+        return data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        return None
+
+
+class TestChecksummedDownload:
+    """The sha256 sidecar ride-along: a broken installer must never survive
+    its own download — a truncated 150+ MB exe sitting in Downloads is one
+    accidental double-click away from "the update broke my machine"."""
+
+    @staticmethod
+    def _info(**overrides) -> update.UpdateInfo:
+        values = {"version": "0.2.0", "download_url": "http://x/setup.exe",
+                  "sha256_url": "http://x/setup.exe.sha256"}
+        values.update(overrides)
+        return update.UpdateInfo(**values)
+
+    def test_parse_release_picks_the_checksum_sidecar(self):
+        info = update.parse_release(
+            {
+                "tag_name": "v0.2.0",
+                "assets": [
+                    {"name": "WinVoice-Setup-0.2.0.exe",
+                     "browser_download_url": "http://x/WinVoice-Setup-0.2.0.exe"},
+                    {"name": "WinVoice-Setup-0.2.0.exe.sha256",
+                     "browser_download_url": "http://x/WinVoice-Setup-0.2.0.exe.sha256"},
+                ],
+            },
+            current_version="0.1.0",
+        )
+        assert info is not None
+        assert info.sha256_url == "http://x/WinVoice-Setup-0.2.0.exe.sha256"
+
+    def test_parse_release_without_sidecar_leaves_sha256_url_none(self):
+        info = update.parse_release(
+            {"assets": [{"name": "WinVoice-Setup-0.2.0.exe",
+                         "browser_download_url": "http://x/WinVoice-Setup-0.2.0.exe"}]},
+            current_version="0.1.0",
+        )
+        assert info is not None and info.sha256_url is None
+
+    def test_newest_published_version_ignores_drafts_and_assetless(self):
+        def release(version: str, *, draft: bool = False, assets: bool = True) -> dict:
+            return {
+                "tag_name": f"v{version}", "draft": draft,
+                "assets": [{"name": f"WinVoice-Setup-{version}.exe",
+                            "browser_download_url": "http://x/e.exe"}] if assets else [],
+            }
+
+        listed = [release("0.4.0", draft=True), release("0.3.0"), release("0.2.0", assets=False)]
+
+        assert update.newest_published_version(listed) == "0.3.0"
+        assert update.newest_published_version([]) is None
+
+    def test_download_update_verifies_the_sidecar_checksum(self, work):
+        payload = b"MZ" + b"\x00" * 4096
+        expected = hashlib.sha256(payload).hexdigest()
+        calls: list[str] = []
+        responses = [
+            _FakeResponse(payload),
+            _FakeResponse(f"{expected}  WinVoice-Setup-0.2.0.exe\n".encode()),
+        ]
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request.full_url)
+            return responses.pop(0)
+
+        original = update.urllib.request.urlopen
+        update.urllib.request.urlopen = fake_urlopen
+        try:
+            dest = update.download_update(self._info(), work / "dl")
+        finally:
+            update.urllib.request.urlopen = original
+
+        assert dest.read_bytes() == payload
+        assert calls == ["http://x/setup.exe", "http://x/setup.exe.sha256"]
+
+    def test_download_update_hash_mismatch_deletes_the_file(self, work):
+        responses = [
+            _FakeResponse(b"corrupted download"),
+            _FakeResponse(("0" * 64 + "  WinVoice-Setup-0.2.0.exe\n").encode()),
+        ]
+
+        def fake_urlopen(request, timeout=None):
+            return responses.pop(0)
+
+        original = update.urllib.request.urlopen
+        update.urllib.request.urlopen = fake_urlopen
+        try:
+            with pytest.raises(update.UpdateError, match="校验和") as excinfo:
+                update.download_update(self._info(), work / "dl")
+        finally:
+            update.urllib.request.urlopen = original
+
+        assert not (work / "dl" / "WinVoice-Setup-0.2.0.exe").exists()
+        assert "期望" in str(excinfo.value) and "实际" in str(excinfo.value)
+
+    def test_download_update_without_sidecar_downloads_as_before(self, work):
+        payload = b"an older release without a sidecar"
+        calls: list[str] = []
+
+        def fake_urlopen(request, timeout=None):
+            calls.append(request.full_url)
+            return _FakeResponse(payload)
+
+        original = update.urllib.request.urlopen
+        update.urllib.request.urlopen = fake_urlopen
+        try:
+            dest = update.download_update(self._info(sha256_url=None), work / "dl")
+        finally:
+            update.urllib.request.urlopen = original
+
+        assert dest.read_bytes() == payload
+        assert calls == ["http://x/setup.exe"]
+
+    def test_download_update_truncation_removes_the_partial_file(self, work):
+        def fake_urlopen(request, timeout=None):
+            return _FakeResponse(b"short", content_length=10_000)
+
+        original = update.urllib.request.urlopen
+        update.urllib.request.urlopen = fake_urlopen
+        try:
+            with pytest.raises(update.UpdateError, match="截断"):
+                update.download_update(self._info(sha256_url=None), work / "dl")
+        finally:
+            update.urllib.request.urlopen = original
+
+        assert not (work / "dl" / "WinVoice-Setup-0.2.0.exe").exists()
+
+    def test_download_update_transport_error_removes_the_partial_file(self, work):
+        class BrokenResponse(_FakeResponse):
+            def read(self, size: int = -1) -> bytes:
+                if self._data:
+                    data, self._data = self._data, b""
+                    return data
+                raise OSError("connection reset")
+
+        original = update.urllib.request.urlopen
+        update.urllib.request.urlopen = lambda request, timeout=None: BrokenResponse(b"partial")
+        try:
+            with pytest.raises(OSError, match="connection reset"):
+                update.download_update(self._info(sha256_url=None), work / "dl")
+        finally:
+            update.urllib.request.urlopen = original
+
+        assert not (work / "dl" / "WinVoice-Setup-0.2.0.exe").exists()
+
+    def test_fetch_latest_reports_check_failures_to_on_error(self):
+        def fake_urlopen(request, timeout=None):
+            raise urllib.error.URLError("name resolution failed")
+
+        errors: list[str] = []
+        original = update.urllib.request.urlopen
+        update.urllib.request.urlopen = fake_urlopen
+        try:
+            result = update.fetch_latest(
+                "0.1.0-dev", api_url="https://api.github.com/repos/o/r/releases/latest",
+                on_error=errors.append,
+            )
+        finally:
+            update.urllib.request.urlopen = original
+
+        assert result is None
+        assert errors and "name resolution failed" in errors[0]
+
+    def test_fetch_latest_survives_a_raising_on_error(self):
+        """`on_error` is a logging hook — it must never turn a silent check
+        into a crashed one."""
+
+        def fake_urlopen(request, timeout=None):
+            raise urllib.error.URLError("down")
+
+        def boom(_reason: str) -> None:
+            raise RuntimeError("logging must never break the check")
+
+        original = update.urllib.request.urlopen
+        update.urllib.request.urlopen = fake_urlopen
+        try:
+            assert update.fetch_latest(
+                "0.1.0-dev", api_url="https://api.github.com/repos/o/r/releases/latest",
+                on_error=boom,
+            ) is None
+        finally:
+            update.urllib.request.urlopen = original
+
+
+class TestWlog:
+    def test_log_event_appends_json_lines(self, work, monkeypatch):
+        target = work / "wizard-log" / "setup-wizard.jsonl"
+        monkeypatch.setattr(wlog, "log_path", lambda: target)
+
+        wlog.log_event("update_check_failed", detail="网络不可达")
+        wlog.log_event("update_downloaded")
+
+        lines = target.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2
+        assert '"event": "update_check_failed"' in lines[0]
+        assert "网络不可达" in lines[0]
+
+    def test_log_event_never_raises_on_an_unusable_sink(self, work, monkeypatch):
+        blocker = work / "blocked"
+        blocker.write_text("a file where a directory should go", encoding="utf-8")
+        monkeypatch.setattr(wlog, "log_path", lambda: blocker / "log.jsonl")
+
+        wlog.log_event("update_check_failed", detail="boom")  # must not raise
+
 
 # ──────────────────────────────────────────────────────────────
 # Install marker
@@ -309,6 +648,22 @@ class TestMarker:
         directory.mkdir(parents=True)
         (directory / marker.MARKER_NAME).write_text("not json", encoding="utf-8")
         assert marker.read_marker(directory) is None
+
+    def test_copied_setup_discovers_its_custom_install(self, work):
+        install = work / "custom-install"
+        marker.write_marker(install, version="0.2.0")
+        resolved = marker.discover_install_dir(
+            work / "default", executable=install / "WinVoice-Setup.exe"
+        )
+        assert resolved == install
+
+    def test_update_override_selects_the_original_install(self, work):
+        original = work / "custom-install"
+        resolved = marker.discover_install_dir(
+            work / "default", executable=work / "Downloads" / "WinVoice-Setup.exe",
+            override=str(original),
+        )
+        assert resolved == original
 
 
 # ──────────────────────────────────────────────────────────────
