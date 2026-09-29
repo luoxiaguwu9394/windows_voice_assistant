@@ -6,9 +6,10 @@ import os
 from pathlib import Path
 from typing import Optional
 
-# The one shortcut name the installer creates (Desktop / Start Menu /
-# Startup) and the uninstaller deletes; kept here so both agree.
+# The two shortcut names the installer creates and the uninstaller deletes;
+# kept here so both agree. The settings entry opens the web-based config UI.
 SHORTCUT_NAME = "WinVoice 语音助手.lnk"
+SETTINGS_SHORTCUT_NAME = "WinVoice 设置.lnk"
 
 FOLDER_DESKTOP = "Desktop"
 FOLDER_STARTMENU = "StartMenu"

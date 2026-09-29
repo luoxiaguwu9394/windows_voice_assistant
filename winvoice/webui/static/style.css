@@ -1,0 +1,108 @@
+/* WinVoice 设置 — 深浅色跟随系统,单文件,无构建。 */
+
+:root {
+  --bg: #101418;
+  --panel: #171d24;
+  --panel-2: #1e262f;
+  --text: #e6ebf0;
+  --muted: #8a97a5;
+  --accent: #4da3ff;
+  --accent-2: #2f7fd4;
+  --ok: #3ecf8e;
+  --warn: #e5b567;
+  --danger: #e57373;
+  --border: #2a3441;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f4f6f8;
+    --panel: #ffffff;
+    --panel-2: #eef1f4;
+    --text: #1c2530;
+    --muted: #5d6b7a;
+    --border: #d4dbe2;
+  }
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto; max-width: 880px; padding: 0 16px 48px;
+  background: var(--bg); color: var(--text);
+  font-family: "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+  font-size: 14px;
+}
+
+header { display: flex; align-items: center; justify-content: space-between; padding: 14px 0; }
+h1 { font-size: 18px; margin: 0; }
+h2 { font-size: 14px; margin: 20px 0 8px; }
+.header-actions { display: flex; align-items: center; gap: 12px; }
+.status { color: var(--muted); min-width: 200px; text-align: right; }
+.status.ok { color: var(--ok); }
+.status.err { color: var(--danger); }
+
+#tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); }
+#tabs button {
+  background: none; border: none; color: var(--muted); cursor: pointer;
+  font: inherit; padding: 8px 14px; border-bottom: 2px solid transparent;
+}
+#tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+
+main { padding-top: 14px; }
+.tab { display: none; }
+.tab.active { display: block; }
+.hint { color: var(--muted); line-height: 1.6; margin: 6px 0 14px; }
+
+button {
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; cursor: pointer; font: inherit; padding: 6px 14px;
+}
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent-2); border-color: var(--accent-2); color: #fff; }
+button.danger { color: var(--danger); }
+
+input[type="text"], select, textarea {
+  background: var(--panel); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; font: inherit; padding: 6px 10px; width: 100%;
+}
+textarea { font-family: inherit; line-height: 1.7; resize: vertical; }
+input[type="range"] { width: 260px; accent-color: var(--accent); }
+
+table { border-collapse: collapse; width: 100%; }
+th, td { border-bottom: 1px solid var(--border); padding: 8px 10px; text-align: left; vertical-align: middle; }
+th { color: var(--muted); font-weight: normal; }
+td input { width: 100%; }
+td .delete { background: none; border: none; color: var(--danger); cursor: pointer; font-size: 16px; }
+
+.badge {
+  border-radius: 10px; display: inline-block; font-size: 12px; padding: 1px 8px;
+}
+.badge.hot { background: rgba(62, 207, 142, .15); color: var(--ok); }
+.badge.restart { background: rgba(229, 181, 103, .15); color: var(--warn); }
+.badge.builtin { background: var(--panel-2); color: var(--muted); }
+
+.row-actions { display: flex; gap: 8px; margin: 10px 0 16px; }
+.check-row { align-items: center; display: flex; gap: 12px; margin: 14px 0; }
+.field-row { align-items: center; display: flex; gap: 12px; margin: 14px 0; }
+.field-row input { max-width: 240px; }
+.slider-row { align-items: center; display: flex; gap: 14px; margin: 16px 0; }
+.slider-row label { min-width: 160px; }
+.slider-row output { color: var(--accent); font-variant-numeric: tabular-nums; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.chip {
+  align-items: center; background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 14px; display: inline-flex; gap: 6px; padding: 3px 10px;
+}
+.chip button { background: none; border: none; color: var(--danger); padding: 0; }
+
+#select-row { margin: 10px 0; }
+#sensitive-add { max-width: 280px; }
+
+.modal { align-items: center; background: rgba(0,0,0,.45); display: flex;
+  inset: 0; justify-content: center; position: fixed; }
+.modal.hidden { display: none; }
+.modal-card { background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; max-height: 70vh; max-width: 640px; overflow: auto; padding: 18px 22px; width: 90%; }
+.scan-results { display: flex; flex-direction: column; gap: 4px; margin: 12px 0; max-height: 320px; overflow: auto; }
+.scan-results label { display: flex; gap: 8px; align-items: center; padding: 4px 2px; }
+.scan-results .path { color: var(--muted); font-size: 12px; }

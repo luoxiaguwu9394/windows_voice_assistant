@@ -9,7 +9,7 @@ finish page, so this list is the same one the installer creates):
 | runtime trees | `python/`, `winvoice/`, `scripts/`, `tools/`, `.pylibs/`, `config/config.template.yaml` |
 | copied setup exe | `<install>/WinVoice-Setup-<version>.exe` |
 | install marker | `<install>/.winvoice-install.json` |
-| shortcuts | `WinVoice 语音助手.lnk` on Desktop, in the Start Menu, and in Startup when autostart was ticked |
+| shortcuts | `WinVoice 语音助手.lnk` and `WinVoice 设置.lnk` on Desktop and in the Start Menu, plus a Startup `WinVoice 语音助手.lnk` when autostart was ticked |
 | user data | `models/` (2–3 GB), `config/config.yaml`, `logs/`, `runtime/`, `snapshots/` |
 
 The last row is the user's, so it is a **choice**: `keep_models` and
@@ -35,7 +35,14 @@ from typing import Callable, Optional
 
 from . import processes
 from .marker import MARKER_NAME
-from .shortcuts import FOLDER_DESKTOP, FOLDER_STARTMENU, FOLDER_STARTUP, SHORTCUT_NAME, special_folder
+from .shortcuts import (
+    FOLDER_DESKTOP,
+    FOLDER_STARTMENU,
+    FOLDER_STARTUP,
+    SETTINGS_SHORTCUT_NAME,
+    SHORTCUT_NAME,
+    special_folder,
+)
 
 # Never delete these: they are the user's, even when nothing is kept.
 _USER_DATA = ("models", "config")
@@ -67,18 +74,21 @@ def removable_children(install_dir: Path, *, keep_models: bool, keep_config: boo
 def _remove_shortcuts(log: Callable[[str], None]) -> list[str]:
     """Delete the shortcuts the installer created; report the ones that existed."""
     removed: list[str] = []
+    names = (SHORTCUT_NAME, SETTINGS_SHORTCUT_NAME)
     for folder in (FOLDER_DESKTOP, FOLDER_STARTMENU, FOLDER_STARTUP):
         try:
-            path = special_folder(folder) / SHORTCUT_NAME
+            folder_path = special_folder(folder)
         except Exception:
             continue
-        try:
-            if path.is_file():
-                path.unlink()
-                removed.append(str(path))
-                log(f"已删除快捷方式：{path}")
-        except OSError as error:
-            log(f"快捷方式删除失败（{path}）：{error}")
+        for name in names:
+            path = folder_path / name
+            try:
+                if path.is_file():
+                    path.unlink()
+                    removed.append(str(path))
+                    log(f"已删除快捷方式：{path}")
+            except OSError as error:
+                log(f"快捷方式删除失败（{path}）：{error}")
     return removed
 
 

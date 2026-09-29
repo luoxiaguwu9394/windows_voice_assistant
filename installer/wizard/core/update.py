@@ -55,6 +55,24 @@ class UpdateInfo:
     sha256_url: Optional[str] = None
 
 
+@dataclass
+class UpdateCheckResult:
+    """
+    The three outcomes a welcome-page update check must be able to tell apart.
+
+    `info` set            → a newer release exists (banner).
+    both None             → the check ran and found nothing newer — without
+                            this state a healthy "已是最新" is indistinguishable
+                            from a failed check, which users report as
+                            「检测不到最新版本号」.
+    `error` set           → the check itself failed (network, API); the reason
+                            is user-displayable.
+    """
+
+    info: Optional[UpdateInfo] = None
+    error: Optional[str] = None
+
+
 def version_tuple(version: str) -> tuple:
     """'0.2.1-dev' -> (0, 2, 1); anything unparseable sorts as (0, 0, 0)."""
     match = _VERSION_RE.search(version or "")
@@ -177,39 +195,42 @@ def fetch_release_pages(api_url: str = UPDATE_API_URL,
         page += 1
 
 
-def fetch_latest(current_version: str, api_url: str = UPDATE_API_URL,
-                 timeout: float = 6.0,
-                 on_error: Optional[Callable[[str], None]] = None) -> Optional[UpdateInfo]:
+def check_for_update(current_version: str, api_url: str = UPDATE_API_URL,
+                     timeout: float = 6.0) -> UpdateCheckResult:
     """
-    Ask GitHub what the newest release carrying a setup exe is.
+    Ask GitHub what the newest release carrying a setup exe is, and report
+    *why* when the question cannot be answered — see `UpdateCheckResult`.
 
     The **list** endpoint is queried rather than `/releases/latest`, for the
     reason spelled out in `parse_releases`: a pre-release-only repo (this one)
     404s on `latest`, which turns the whole update path into a silent no-op.
-    Any failure returns None — a missing banner, never an error dialog. The
-    `on_error` callback (if given) receives a one-line reason first, so the
-    failure can reach a log; it must never raise, and is guarded regardless.
     """
-
-    def emit(message: str) -> None:
-        if on_error is None:
-            return
-        try:
-            on_error(message)
-        except Exception:
-            pass
-
     try:
         payload = fetch_release_pages(api_url, timeout)
     except Exception as exc:
-        emit(f"{type(exc).__name__}: {exc}")
-        return None
+        return UpdateCheckResult(error=f"{type(exc).__name__}: {exc}")
     if isinstance(payload, list):
-        return parse_releases(payload, current_version)
+        return UpdateCheckResult(info=parse_releases(payload, current_version))
     if isinstance(payload, dict):  # an API url pointing straight at one release
-        return parse_release(payload, current_version)
-    emit(f"unexpected payload type: {type(payload).__name__}")
-    return None
+        return UpdateCheckResult(info=parse_release(payload, current_version))
+    return UpdateCheckResult(error=f"unexpected payload type: {type(payload).__name__}")
+
+
+def fetch_latest(current_version: str, api_url: str = UPDATE_API_URL,
+                 timeout: float = 6.0,
+                 on_error: Optional[Callable[[str], None]] = None) -> Optional[UpdateInfo]:
+    """
+    `check_for_update` reduced to the legacy boolean-ish contract: the newer
+    release, or None on "none found" *and* on failure — failures additionally
+    go to `on_error`, which must never raise and is guarded regardless.
+    """
+    result = check_for_update(current_version, api_url, timeout)
+    if result.error is not None and on_error is not None:
+        try:
+            on_error(result.error)
+        except Exception:
+            pass
+    return result.info
 
 
 def _file_sha256(path: Path) -> str:

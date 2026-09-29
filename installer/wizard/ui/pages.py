@@ -32,6 +32,7 @@ from ..core.shortcuts import (
     FOLDER_DESKTOP,
     FOLDER_STARTMENU,
     FOLDER_STARTUP,
+    SETTINGS_SHORTCUT_NAME,
     SHORTCUT_NAME,
     create_shortcut,
     special_folder,
@@ -64,6 +65,12 @@ class WelcomePage(Page):
                        "生成配置、注册声纹并自检。完成后从桌面快捷方式即可启动。"
                   ).pack(anchor="w", pady=(0, 10))
 
+        # The wizard's own version, always visible: with no install on the
+        # machine and no newer release out there, this page would otherwise
+        # show not a single version number at all.
+        ttk.Label(self, text=f"安装器版本：v{buildinfo.VERSION}",
+                  foreground="#666666").pack(anchor="w")
+
         self._facts = tk.StringVar(value="正在收集系统信息…")
         ttk.Label(self, textvariable=self._facts, foreground="#333333",
                   justify="left").pack(anchor="w")
@@ -76,6 +83,9 @@ class WelcomePage(Page):
             make_note(self, f"检测到已安装版本 v{self._existing.get('version', '?')}"
                             f"（{DEFAULT_INSTALL_DIR}）。升级会保留模型与配置。"
                       ).pack(anchor="w", pady=(10, 4))
+        else:
+            make_note(self, f"未检测到已安装的 WinVoice（{DEFAULT_INSTALL_DIR}）"
+                            "——将执行全新安装。").pack(anchor="w", pady=(10, 4))
             for value, label in (
                 ("upgrade", "升级 / 修复此安装（保留模型和配置）"),
                 ("reconfig", "重新配置此安装（重新走一遍向导）"),
@@ -113,6 +123,18 @@ class WelcomePage(Page):
                    command=self._download_update).pack(side="left", padx=8)
         self._update_progress = ProgressRow(self, label="下载新版本")
 
+        # What the check concluded when it did NOT find a newer release. Both
+        # 「已是最新」 and 「检查失败」 must be visible, or the silence reads
+        # as 「检测不到最新版本号」 — a failed check previously surfaced only
+        # in the jsonl log.
+        self._check_note_var = tk.StringVar(value="")
+        self._check_note = ttk.Frame(self)
+        ttk.Label(self._check_note, textvariable=self._check_note_var,
+                  foreground="#666666", wraplength=620,
+                  justify="left").pack(side="left")
+        self._retry_btn = ttk.Button(self._check_note, text="重试",
+                                     command=self._recheck)
+
         self.run_bg(self._collect_facts)
         if self._check_updates_enabled():
             self.run_bg(self._check_updates)
@@ -132,16 +154,34 @@ class WelcomePage(Page):
         self.post(lambda: self._facts.set(text))
 
     def _check_updates(self) -> None:
-        info = update.fetch_latest(
-            buildinfo.VERSION,
-            on_error=lambda reason: wlog.log_event("update_check_failed", detail=reason),
-        )
-        if info is None:
+        result = update.check_for_update(buildinfo.VERSION)
+        if result.error is not None:
+            wlog.log_event("update_check_failed", detail=result.error)
+            self.post(lambda: self._check_failed(result.error))
             return
-        self._update_info = info
-        self.post(lambda: self._update_var.set(
-            f"发现新版本 v{info.version}（当前 v{buildinfo.VERSION}）"))
-        self.post(lambda: self._update_row.pack(anchor="w", pady=(10, 0)))
+        info = result.info
+        if info is not None:
+            self._update_info = info
+            self.post(lambda: self._update_var.set(
+                f"发现新版本 v{info.version}（当前 v{buildinfo.VERSION}）"))
+            self.post(lambda: self._update_row.pack(anchor="w", pady=(10, 0)))
+        else:
+            self.post(lambda: self._check_note_var.set(
+                f"已检查更新：当前 v{buildinfo.VERSION} 已是最新版本。"))
+            self.post(lambda: self._check_note.pack(anchor="w", pady=(10, 0)))
+
+    def _check_failed(self, reason: str) -> None:
+        self._check_note_var.set(
+            f"更新检查失败（{reason}）。不影响安装；如需检查升级，"
+            "配置系统代理后点「重试」。")
+        self._retry_btn.configure(state="normal")
+        self._retry_btn.pack(side="left", padx=8)
+        self._check_note.pack(anchor="w", pady=(10, 0))
+
+    def _recheck(self) -> None:
+        self._retry_btn.configure(state="disabled")
+        self._check_note.pack_forget()
+        self.run_bg(self._check_updates)
 
     def _download_update(self) -> None:
         info = self._update_info
@@ -418,6 +458,14 @@ class ExtractPage(Page):
             flow.write_default_config(self.state.install_dir)
             self.post(lambda: self._log.append("默认配置已写入 config/config.yaml。"))
             flow.copy_setup_exe(self.state.install_dir)
+            # Stamp the install marker as soon as the runtime is down, not at
+            # the finish page: a wizard closed mid-flow (a failed DSH step, a
+            # cancelled check) must re-enter as 升级/修复 instead of reading
+            # as 「未检测到已安装版本」. The finish page re-stamps it.
+            marker.write_marker(self.state.install_dir, buildinfo.VERSION)
+            self.post(lambda: self._log.append(
+                f"安装标记已写入（v{buildinfo.VERSION}）——中途退出后重新打开"
+                "向导可续装或修复。"))
             self._done = True
             self.post(lambda: self.set_nav(busy=False, next_=True))
         except (PayloadError, flow.FlowError) as error:
@@ -892,6 +940,12 @@ class FinishPage(Page):
                                 arguments="-m winvoice", workdir=workdir,
                                 icon_path=target, description="WinVoice 语音助手")
                 created += 1
+                if folder != FOLDER_STARTUP:
+                    # The settings UI never autostarts: it is opened on demand.
+                    create_shortcut(special_folder(folder) / SETTINGS_SHORTCUT_NAME, target,
+                                    arguments="-m winvoice.webui", workdir=workdir,
+                                    icon_path=target, description="WinVoice 设置")
+                    created += 1
             except Exception as error:  # noqa: BLE001 - collect and show all
                 errors.append(f"{folder}: {error}")
         # Unticking autostart removes an existing startup shortcut, so the

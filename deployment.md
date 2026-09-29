@@ -261,6 +261,10 @@ python scripts/install_dsh_bridge.py --install
 #   [OK] mcp-winvoice is present in the composed configuration
 ```
 
+> 安装版（内嵌解释器）里请加 `--prefer-bundled`：跳过 PATH 上的 `dsh`，
+> 强制走 `.pylibs` 里随安装器分发的运行时——版本与向导验证过的插件语法一致，
+> 也避免 PATH 上旧版 `dsh` 写出不兼容的配置。
+
 **3) 打开配置**（`config/config.yaml`）：
 
 ```yaml
@@ -423,11 +427,28 @@ llm:
 tools:
   confirm_timeout_s: 15                     # 写文件/跑脚本的确认等待窗口
   search_web_confirm: true                  # 「搜索 X」先问一句再开浏览器
+  apps: []                                  # 设置界面写入的自定义应用（id/label/command/image/guest）
+  sensitive_apps: ["cmd", "powershell"]     # 访客一律禁开（设置界面可改）
 ```
 
-> `weather.*`、`llm.ask.*`、`tools.confirm_timeout_s`、`tools.search_web_confirm`
+> `weather.*`、`llm.ask.*`、`tools.confirm_timeout_s`、`tools.search_web_confirm`、
+> `tools.apps`、`tools.sensitive_apps`
 > 每次调用/挂起时重新读取，改完**不用重启**（引擎类配置只在启动时读一次，
 > 其余配置项基本都要重启才生效）。
+
+### 5.1b WinVoice 设置（配置界面）
+
+双击桌面/开始菜单的「**WinVoice 设置**」快捷方式（即
+`python\python.exe -m winvoice.webui`，工作目录必须是安装目录）：
+
+- 只绑 127.0.0.1 + 每次启动的随机 token;关掉网页几分钟后服务自动退出。
+- 可改：应用白名单（含「扫描本机程序」）、访客禁开名单、唤醒词、TTS 语速/音调、天气城市与开关。
+- 生效方式在每项旁边如实标注：城市与白名单**即时生效**（watchdog 0.5 s 内重载）;
+  **唤醒词与 TTS 语速/音调需要重启助手**（引擎只在启动时读一次）。
+- 排障：窗口空白/打不开 → 看 `logs/main.jsonl` 里的 `settings_server_*` 事件;
+  已有一个设置窗口在跑时再开会直接复用（`runtime/webui.json` 握手）。
+- 保存采用**原子写 + 注释保留**：config.yaml 里的注释不会丢;若结构被手工改坏,
+  会退化为整文件重写（值保留、注释丢失）并在界面提示。
 
 ### 5.2 设置环境变量 (仅云端启用时需要)
 
@@ -879,8 +900,10 @@ python scripts/calibrate_tts_pauses.py
 | **播报有咔哒声 / 断续** | 1) 日志 `player_utterance_done` 里的 `underruns`（饿死补静音）与 `dropped_blocks`（设备卡死丢块）：前者大说明合成跟不上，调小 `tts.clause_max_chars` 或加大 `audio.output_prebuffer_ms`；后者大说明输出设备有问题 2) 确认 `audio_output_started` 的 `sample_rate` 等于设备原生率（本机 44100）3) 换输出设备试试：`audio.output_device` |
 | **没有声音 / `audio_output_unavailable`** | 输出设备打不开（被独占、被拔掉、驱动问题）。播放层会逐级回退（WASAPI 共享 → WASAPI auto-convert → 系统默认/MME），全失败就降级为静音继续跑，并把每条路由的失败原因写进 `error`。先看设备是否可见：`python -c "import sounddevice as sd; print(sd.query_devices())"` |
 | **打断之后就没声音了** | 不应该发生：`abort()` 撞上正在 `write()` 的喂音线程时，某些驱动会拒绝立刻 `start()`，播放层会重试（0/20/50/100 ms）并最终**重开流**（日志 `audio_restart_failed` → `audio_output_reopened`）。若真出现无声，看这两条日志与 `player_utterance_done` 的 `frames` |
+| **回答中途「卡一下」再继续（日志 `underruns` > 0）** | 不是设备问题，是**合成追不上实时**：弱 CPU（如 0.5B 档位的机器）上 Matcha 合成可达 90–100 ms/字（2 线程），上一段音频放完时下一段还没合成完，喂音线程只能垫静音（每次记一个 `underruns`）。修复：`tts.num_threads` 2 → **4**（实测约减半，2026-09-29 起为默认值），改完**要重启**；确认方法：同样的句子跑一遍，`audio_playback_done` 的 `underruns` 应为 0。仍大于 0 就把 `tts.first_chunk_max_chars`/`clause_max_chars` 调小（段越短、越早有下一段接上） |
 | **安装器/升级卡在 92 %** | 实测该偏移正是载荷里 `tools/` 的起点（91.9 %）。原因是 `tools\...\llama-server.exe` 正被占用——助手**复用但不持有** llama-server，所以助手退了它还在。2026-09-28 起向导会在解压前自动停掉安装目录内的进程（日志「已停止 llama-server…」）；若仍卡住，先手动结束 `llama-server.exe` / 该安装目录下的 `python.exe` 再重试。解压进度条下会显示当前写入的文件名，慢盘或杀软扫描时属正常等待 |
 | **自定义安装目录无法升级/卸载** | 请从该目录内双击 `WinVoice-Setup-<版本>.exe`；向导按相邻安装标记识别目录。若从更新提示下载后启动，新安装器会继承原安装路径。旧版已复制的向导可能仍只识别默认 `%LOCALAPPDATA%\WinVoice`，请从原自定义目录里的向导启动新版 |
+| **在别的机器上取证（杂音/异常时）** | 三条通道，按需取：①**应用写入设备的数据**（最能定性「是我们还是设备」）——先删掉旧的 `runtime\diag.pcm`，然后运行：`cd $env:LOCALAPPDATA\WinVoice; $env:WINVOICE_DIAG_PLAYBACK="runtime\diag.pcm"; .\python\python.exe -m winvoice 2>&1 | Tee-Object -FilePath runtime\console.log`，复现问题后正常关闭窗口；②**控制台日志**（上一条命令已存进 `runtime\console.log`，含 `audio_write_failed`/`audio_output_recovered`/`underruns`/路由）；③**声学录音**（设备到底发出了什么）——最优是内嵌运行时装 `soundcard` 后跑 `scripts\diagnose_playback.py`（`cd $env:LOCALAPPDATA\WinVoice; .\python\python.exe -m pip install soundcard; .\python\python.exe scripts\diagnose_playback.py`，需联网；实测内嵌 pip 可用 26.2.1）；没网就用手机对着扬声器录一段，或在「声音设置 → 录制 → 显示禁用的设备」里启用**立体声混音**后用 Windows 录音机录。打包发送：`Compress-Archive -Path runtime\diag.pcm, runtime\console.log, logs\main.jsonl -DestinationPath runtime\diag-bundle.zip -Force`。**注意 `diag.pcm` 是整段会话的原始 PCM（44.1 kHz 单声道 int16，约 5 MB/分钟），每次取证前先删旧文件** |
 | **想彻底卸载** | 双击安装目录里的 `WinVoice-Setup-<版本>.exe` → 欢迎页选「卸载此安装」→ 确认。会停止助手与 llama-server、删除运行时与三个快捷方式；`models/`（2–3 GB）与 `config/config.yaml` 默认保留，可勾选删除。环境变量（`DEEPSEEK_API_KEY` 等）不会被删除；安装目录在向导窗口关闭后由后台 PowerShell 清理 |
 | **走的是 MME 还是 WASAPI？** | 启动日志 `audio_output_route route=…`：`wasapi shared` 最好（低延迟），`wasapi auto-convert` 次之（Windows 做重采样），`system default` 表示 WASAPI 打不开、退回 MME（延迟最差）。`audio.output_host_api` 可强制 `wasapi` 或 `default` |
 | **发音太快 / 换模型后比以前快很多** | 默认模型从 8 kHz VITS（≈277 ms/字）换成了 Matcha（speed 1.0 时 ≈193 ms/字，快 45 %）。调 `tts.speed`：时长 ∝ 1/speed，默认 0.9 ≈ 208 ms/字（4.8 字/秒）；嫌快往 0.8（≈241）、嫌慢往 0.95–1.0（≈193，播报腔）。**该键引擎只在启动时读一次，改完要重启**（`pause_*`/`chunk_*` 才是热生效的）。先排除播放链路问题：`audio_output_started` 的 `sample_rate` 应为设备原生率、`audio_playback_done` 的 `audio_ms` 应 ≈ 字数 × ms/字 |

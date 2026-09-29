@@ -53,6 +53,13 @@ def bundled_dsh_command() -> list[str] | None:
     installed DSH with `pip install --target .pylibs` — the documented manual
     flow, and what the setup wizard bundles — has no `dsh` on PATH, but this
     runs the identical command grammar through the identical code.
+
+    The vendor dir travels as an argv entry rather than being baked into the
+    -c code or a PYTHONPATH: the child is a *fresh* interpreter that cannot
+    see this process's `sys.path` surgery (`_vendor.ensure` appends `.pylibs`
+    here, not there), and the embedded runtime's `python3xx._pth` enables
+    isolated mode, where PYTHONPATH is ignored. Appending it at the end keeps
+    site-packages priority, matching the in-process resolution.
     """
     try:
         from winvoice import _vendor
@@ -61,14 +68,25 @@ def bundled_dsh_command() -> list[str] | None:
         import deepseek_harness_runtime  # noqa: F401
     except ImportError:
         return None
-    return [sys.executable, "-c", "from deepseek_harness_runtime import main; main()"]
+    bootstrap = (
+        "import sys; sys.path.append(sys.argv.pop(1)); "
+        "from deepseek_harness_runtime import main; main()"
+    )
+    return [sys.executable, "-c", bootstrap, str(_vendor.vendor_dir())]
 
 
-def resolve_dsh_command() -> list[str] | None:
-    """PATH `dsh` first (npm install), then the bundled runtime entry point."""
-    dsh_bin = find_dsh()
-    if dsh_bin:
-        return [dsh_bin]
+def resolve_dsh_command(prefer_bundled: bool = False) -> list[str] | None:
+    """
+    PATH `dsh` first (npm install), then the bundled runtime entry point.
+
+    `prefer_bundled` skips the PATH lookup entirely: the setup wizard passes
+    it because the runtime it staged is the version the plugin grammar was
+    validated against — a `dsh` found on the user's PATH could be any version.
+    """
+    if not prefer_bundled:
+        dsh_bin = find_dsh()
+        if dsh_bin:
+            return [dsh_bin]
     return bundled_dsh_command()
 
 
@@ -105,6 +123,9 @@ def main() -> int:
     parser.add_argument("--verify", action="store_true", help="check that the row is present in the composed config")
     parser.add_argument("--profile", default=None, help="DSH profile (default: dsh.local.profile)")
     parser.add_argument("--dsh-home", default=None, help="DSH home (default: dsh.local.dsh_home)")
+    parser.add_argument("--prefer-bundled", action="store_true",
+                        help="ignore any dsh on PATH and use the runtime bundled in .pylibs "
+                             "(what the setup wizard passes)")
     args = parser.parse_args()
 
     settings = load_settings()
@@ -127,7 +148,7 @@ def main() -> int:
     print(f"tool server   : {sys.executable} -m winvoice.mcp_server")
     print(f"tools appear  : mcp__{settings.bridge.server_name}__<tool>")
 
-    dsh_command = resolve_dsh_command()
+    dsh_command = resolve_dsh_command(prefer_bundled=args.prefer_bundled)
     install_cmd = ["plugin", "--profile", profile, "add", f"file:{bundle.as_posix()}"]
 
     if not dsh_command:

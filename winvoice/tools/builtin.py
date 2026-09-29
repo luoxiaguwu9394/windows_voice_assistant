@@ -24,6 +24,7 @@ import os
 import shutil
 import subprocess
 import webbrowser
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -82,50 +83,122 @@ def _speakable(value: Any, fallback: str = "") -> str:
 # App Control
 # ──────────────────────────────────────────────────────────────
 
-ALLOWED_APPS = {
-    "notepad": "notepad.exe",
-    "calculator": "calc.exe",
-    "explorer": "explorer.exe",
-    "cmd": "cmd.exe",
-    "powershell": "powershell.exe",
-    "vscode": "code",
-    "chrome": "chrome.exe",
-    "edge": "msedge.exe",
-    "settings": "ms-settings:",
+@dataclass(frozen=True)
+class AppEntry:
+    """One openable application: how to launch it, how to say it, how to kill it."""
+
+    id: str                       # stable internal id (latin; never spoken)
+    label: str                    # how TTS says it (Chinese)
+    command: str                  # launch: absolute path, App Paths/PATH exe name, or URI
+    image: Optional[str] = None   # process image when it differs from command (code shim → Code.exe)
+    guest: bool = True            # custom apps default host-only; built-ins keep the old behaviour
+
+    @property
+    def process_image(self) -> str:
+        """
+        The process name `taskkill /im` and the verifiers match on.
+
+        An explicit `image` wins (VS Code launches via the `code` shim but
+        runs as `Code.exe`); an .exe command is its own image basename; a URI
+        (`ms-settings:`) has no process and comes back unchanged.
+        """
+        if self.image:
+            return self.image
+        return Path(self.command).name if self.command.lower().endswith(".exe") else self.command
+
+
+# The nine built-ins. They cannot be shadowed or removed by config entries
+# (see `current_apps`), and their launch resolution (App Paths → PATH) is what
+# makes them machine-adaptive: chrome/edge/vscode are found wherever their
+# installers registered them, and a missing install is reported honestly
+# instead of launched blind.
+BUILTIN_APPS: Dict[str, AppEntry] = {
+    "notepad":    AppEntry("notepad", "记事本", "notepad.exe"),
+    "calculator": AppEntry("calculator", "计算器", "calc.exe"),
+    "explorer":   AppEntry("explorer", "资源管理器", "explorer.exe"),
+    "cmd":        AppEntry("cmd", "命令提示符", "cmd.exe"),
+    "powershell": AppEntry("powershell", "命令行窗口", "powershell.exe"),
+    "vscode":     AppEntry("vscode", "代码编辑器", "code", image="Code.exe"),
+    "chrome":     AppEntry("chrome", "谷歌浏览器", "chrome.exe"),
+    "edge":       AppEntry("edge", "微软浏览器", "msedge.exe"),
+    "settings":   AppEntry("settings", "系统设置", "ms-settings:"),
 }
 
-# The process image each app *runs as*, when it differs from the launch command
-# above. VS Code launches through the `code` shim (App Paths `Code.exe`, or the
-# PATH `code.cmd`), but the process the user sees — and the one `close_app`
-# kills and the verifier watches — is `Code.exe`. Keeping this as a separate
-# table (instead of overloading ALLOWED_APPS) is what lets the launch keep its
-# shim resolution while the close stops answering 「我关不掉代码编辑器。」 with
-# a handler that never even built a `taskkill` command (live report
-# 2026-09-27: VS Code could be opened but not closed). Apps absent here launch
-# and close under the same name.
-APP_PROCESS_IMAGES = {
-    "vscode": "Code.exe",
-}
-
-# How each allowlisted app is *said*. The TTS model is Chinese-only, so the
-# English ids and executable names above must never reach the speaker.
-APP_SPEECH = {
-    "notepad": "记事本",
-    "calculator": "计算器",
-    "explorer": "资源管理器",
-    "cmd": "命令提示符",
-    "powershell": "命令行窗口",
-    "vscode": "代码编辑器",
-    "chrome": "谷歌浏览器",
-    "edge": "微软浏览器",
-    "settings": "系统设置",
-}
+# Historical name, kept alive for readers and old imports: the launch command
+# of each *built-in*. The openable set today is `current_apps()` — built-ins
+# plus the settings UI's `tools.apps`, resolved fresh on every call.
+ALLOWED_APPS = {app_id: entry.command for app_id, entry in BUILTIN_APPS.items()}
 
 
-# A short, representative sample derived from APP_SPEECH. Reciting all nine
-# allowlisted apps takes ~20 s of speech, far too long for a refusal the user
-# then has to talk over.
-_ALLOWLIST_EXAMPLES = "、".join(APP_SPEECH[k] for k in ("notepad", "calculator", "chrome")) + "这类程序"
+def _config_apps() -> list:
+    """`tools.apps` entries, read fresh so the settings UI's changes are hot."""
+    try:
+        from winvoice.config import get_config
+
+        raw = get_config().get("tools.apps")
+    except Exception:  # no config yet (unit tests, early init) — built-ins only
+        return []
+    return raw if isinstance(raw, list) else []
+
+
+def current_apps() -> Dict[str, AppEntry]:
+    """
+    Built-ins merged with `tools.apps`, resolved on every call.
+
+    The settings UI writes the config file; the watchdog reloads it within
+    0.5 s and the next utterance sees the new table — no restart. A config
+    entry may not shadow a built-in id (redefining `cmd` must not be able to
+    repoint `close_app` at an unrelated binary); such entries are skipped.
+    """
+    apps = dict(BUILTIN_APPS)
+    for raw in _config_apps():
+        if not isinstance(raw, dict):
+            logger.warning("config_app_entry_ignored", reason="not a mapping")
+            continue
+        app_id = str(raw.get("id") or "").strip().lower()
+        command = str(raw.get("command") or "").strip()
+        if not app_id or not command:
+            logger.warning("config_app_entry_ignored", reason="missing id or command", id=app_id)
+            continue
+        if app_id in apps:
+            logger.warning("config_app_entry_ignored", reason="cannot shadow a built-in", id=app_id)
+            continue
+        label = str(raw.get("label") or "").strip() or "这个程序"
+        image = str(raw.get("image") or "").strip() or None
+        apps[app_id] = AppEntry(
+            id=app_id, label=label, command=command, image=image,
+            guest=bool(raw.get("guest", False)),
+        )
+    return apps
+
+
+def sensitive_app_ids() -> set:
+    """
+    The ids `tools.sensitive_apps` names — never openable below the full tier.
+
+    Read fresh like the app table. When the config is unavailable or the key
+    is missing, the shipped default stands, so the gate fails closed.
+    """
+    default = {"cmd", "powershell"}
+    try:
+        from winvoice.config import get_config
+
+        raw = get_config().get("tools.sensitive_apps")
+    except Exception:
+        return default
+    if not isinstance(raw, list):
+        return default
+    return {str(item).strip().lower() for item in raw if str(item).strip()} or default
+
+
+def _allowlist_examples() -> str:
+    """
+    A short, spoken sample of what can be opened. Reciting the whole table
+    takes ~20 s of speech — far too long for a refusal the user then has to
+    talk over.
+    """
+    labels = [entry.label for entry in list(current_apps().values())[:3]]
+    return "、".join(labels) + "这类程序"
 
 
 def _speakable_name(value: str) -> str:
@@ -139,8 +212,9 @@ def _speakable_name(value: str) -> str:
     return _speakable(value, "这个程序")
 
 
-# Spoken synonyms pinning the user's words onto an allowlisted id. The Chinese
-# labels from APP_SPEECH and the raw ids are registered automatically below.
+# Spoken synonyms pinning the user's words onto a built-in id. The Chinese
+# labels and the raw ids are registered automatically by `resolve_app`;
+# custom apps are reachable by id and label alone.
 _EXTRA_APP_ALIASES = {
     # notepad
     "笔记本": "notepad", "记事薄": "notepad", "便笺": "notepad", "文本编辑器": "notepad",
@@ -161,10 +235,6 @@ _EXTRA_APP_ALIASES = {
     "设置": "settings", "系统设置面板": "settings",
 }
 
-APP_ALIASES: Dict[str, str] = {**{app_id: app_id for app_id in ALLOWED_APPS},
-                               **{label: app_id for app_id, label in APP_SPEECH.items()},
-                               **_EXTRA_APP_ALIASES}
-
 
 def resolve_app(name: str) -> Optional[str]:
     """
@@ -173,7 +243,9 @@ def resolve_app(name: str) -> Optional[str]:
     Handles the three things ASR and the rule layer actually produce: a Chinese
     label ("记事本"), a raw English id ("notepad"), or a close-but-wrong spelling
     of either ("Notpa" — seen in the live log). Exact matches win, then a fuzzy
-    match with a high cutoff so unrelated words are still refused.
+    match with a high cutoff so unrelated words are still refused. The alias
+    table is rebuilt from `current_apps()` on every call, so an app the user
+    just enabled in the settings UI is reachable on the next utterance.
     """
     import difflib
 
@@ -181,16 +253,26 @@ def resolve_app(name: str) -> Optional[str]:
     if not candidate:
         return None
 
+    apps = current_apps()
+    aliases: Dict[str, str] = {}
+    for app_id, entry in apps.items():
+        aliases[app_id.lower()] = app_id
+        if entry.label:
+            aliases[entry.label] = app_id
+    for synonym, app_id in _EXTRA_APP_ALIASES.items():
+        if app_id in apps:
+            aliases[synonym] = app_id
+
     # Exact, case-insensitive, ignoring a trailing particle ("记事本吧") and
     # spaces inside an English name ("vs code").
     normalized = candidate.lower().replace(" ", "")
     for particle in ("吧", "呢", "啊", "呀"):
         normalized = normalized.removesuffix(particle)
-    if normalized in APP_ALIASES:
-        return APP_ALIASES[normalized]
+    if normalized in aliases:
+        return aliases[normalized]
 
-    matches = difflib.get_close_matches(normalized, list(APP_ALIASES), n=1, cutoff=0.75)
-    return APP_ALIASES[matches[0]] if matches else None
+    matches = difflib.get_close_matches(normalized, list(aliases), n=1, cutoff=0.75)
+    return aliases[matches[0]] if matches else None
 
 
 def _app_paths_entry(exe_name: str) -> Optional[str]:
@@ -290,42 +372,56 @@ def _launch(command: str) -> None:
         subprocess.Popen([command])
 
 
+def _resolve_launch_target(entry: AppEntry) -> Optional[str]:
+    """
+    The on-disk program (or URI) to launch for `entry`, or None when absent.
+
+    An absolute command from the settings UI is used as-is when it exists —
+    that is how a per-user install like WeChat is reached regardless of where
+    it was installed. Anything else goes through App Paths → PATH, the same
+    machine-adaptive chain the built-ins rely on.
+    """
+    if entry.command.startswith("ms-"):
+        return entry.command  # URI-style: launched through `start`
+    if Path(entry.command).is_absolute():
+        return entry.command if Path(entry.command).exists() else None
+    return resolve_app_command(entry.command)
+
+
 def open_app(args: Dict[str, Any]) -> Dict[str, Any]:
     """Open an application from the allowlist, by Chinese or English name."""
     spoken = str(args.get("app", ""))
     app = resolve_app(spoken)
-    if app is None:
-        logger.info("open_app_rejected", app=spoken, allowed=list(ALLOWED_APPS))
+    entry = current_apps().get(app) if app else None
+    if entry is None:
+        logger.info("open_app_rejected", app=spoken)
         return {
             "success": False,
-            "error": f"App not allowed: {spoken}. Allowed: {list(ALLOWED_APPS)}",
-            "message": f"{_speakable_name(spoken)}不在我能打开的名单里。我能打开{_ALLOWLIST_EXAMPLES}。",
+            "error": f"App not allowed: {spoken}",
+            "message": f"{_speakable_name(spoken)}不在我能打开的名单里。我能打开{_allowlist_examples()}。",
         }
 
-    cmd = ALLOWED_APPS[app]
     try:
-        if cmd.startswith("ms-"):
-            # URI-style targets (e.g. ms-settings:) must go through `start`.
-            subprocess.run(["cmd", "/c", "start", "", cmd], check=True, capture_output=True)
-            return {"success": True, "message": f"已经打开{APP_SPEECH[app]}了。"}
-
-        path = resolve_app_command(cmd)
-        if path is None:
-            logger.warning("open_app_not_found", app=app, command=cmd)
+        target = _resolve_launch_target(entry)
+        if target is None:
+            logger.warning("open_app_not_found", app=app, command=entry.command)
             return {
                 "success": False,
-                "error": f"Cannot locate {cmd}: not on PATH and not in App Paths",
-                "message": f"我没找到{APP_SPEECH[app]}的安装位置。",
+                "error": f"Cannot locate {entry.command}: not on PATH and not in App Paths",
+                "message": f"我没找到{entry.label}的安装位置。",
             }
-
-        _launch(path)
+        if target.startswith("ms-"):
+            # URI-style targets (e.g. ms-settings:) must go through `start`.
+            subprocess.run(["cmd", "/c", "start", "", target], check=True, capture_output=True)
+        else:
+            _launch(target)
         # Nothing beyond "the OS accepted the start": Chrome exits immediately
         # when an instance is already running, so polling the process would
         # report failures for launches that worked.
-        return {"success": True, "message": f"已经打开{APP_SPEECH[app]}了。"}
+        return {"success": True, "message": f"已经打开{entry.label}了。"}
     except Exception as e:
         logger.warning("open_app_failed", app=app, error=str(e))
-        return {"success": False, "error": str(e), "message": f"打开{APP_SPEECH[app]}的时候出错了。"}
+        return {"success": False, "error": str(e), "message": f"打开{entry.label}的时候出错了。"}
 
 
 def close_app(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -348,18 +444,19 @@ def close_app(args: Dict[str, Any]) -> Dict[str, Any]:
     spoken = str(args.get("app", ""))
     force = bool(args.get("force", False))
     app = resolve_app(spoken)
-    if app is None:
-        logger.info("close_app_rejected", app=spoken, allowed=list(ALLOWED_APPS))
+    entry = current_apps().get(app) if app else None
+    if entry is None:
+        logger.info("close_app_rejected", app=spoken)
         return {
             "success": False,
             "error": f"App not allowed: {spoken}",
-            "message": f"{_speakable_name(spoken)}不在我能关闭的名单里。我能关闭{_ALLOWLIST_EXAMPLES}。",
+            "message": f"{_speakable_name(spoken)}不在我能关闭的名单里。我能关闭{_allowlist_examples()}。",
         }
 
     # What `taskkill` matches is the process image, not the launch command:
     # VS Code launches via the `code` shim but runs as `Code.exe`
-    # (see `APP_PROCESS_IMAGES`).
-    exe = APP_PROCESS_IMAGES.get(app, ALLOWED_APPS[app])
+    # (`process_image`). A URI target has no process here to kill.
+    exe = entry.process_image
 
     # ── the shell: close its windows, never its process ───────────
     if app == "explorer":
@@ -391,7 +488,7 @@ def close_app(args: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "success": False,
             "error": f"{exe} is a protected system process and is never killed",
-            "message": f"{APP_SPEECH[app]}是系统进程，我不能关掉它。",
+            "message": f"{entry.label}是系统进程，我不能关掉它。",
         }
 
     if not exe.lower().endswith(".exe"):
@@ -402,7 +499,7 @@ def close_app(args: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "success": False,
             "error": f"{app} has no process to kill ({exe})",
-            "message": f"我关不掉{APP_SPEECH[app]}。",
+            "message": f"我关不掉{entry.label}。",
         }
 
     command = ["taskkill"]
@@ -420,10 +517,10 @@ def close_app(args: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "success": False,
             "error": f"taskkill did not return within {CLOSE_TIMEOUT_S:.0f}s",
-            "message": f"{APP_SPEECH[app]}好像在等你确认，可能有没保存的内容。",
+            "message": f"{entry.label}好像在等你确认，可能有没保存的内容。",
         }
     except OSError as e:
-        return {"success": False, "error": str(e), "message": f"关闭{APP_SPEECH[app]}的时候出错了。"}
+        return {"success": False, "error": str(e), "message": f"关闭{entry.label}的时候出错了。"}
 
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
@@ -436,12 +533,12 @@ def close_app(args: Dict[str, Any]) -> Dict[str, Any]:
             "success": False,
             "error": detail[:400] or f"taskkill exit {proc.returncode}",
             "message": (
-                f"{APP_SPEECH[app]}好像没有在运行。"
+                f"{entry.label}好像没有在运行。"
                 if not_running
-                else f"我没能关掉{APP_SPEECH[app]}。"
+                else f"我没能关掉{entry.label}。"
             ),
         }
-    return {"success": True, "message": f"已经关闭{APP_SPEECH[app]}了。"}
+    return {"success": True, "message": f"已经关闭{entry.label}了。"}
 
 
 # ──────────────────────────────────────────────────────────────

@@ -142,7 +142,8 @@ tts:
   # 即整体降调（连共振峰一起降），引擎再用 speed/pitch 补偿语速——speed 管语速、
   # pitch 管音高，两个旋钮互不影响。同 speed：只在 initialize() 读一次，改完要重启。
   pitch: 1.0
-  num_threads: 2
+  # 合成线程数。弱 CPU 上合成会追不上实时播放——实测一台机器 90–100 ms/字（2 线程），第一段放完时第二段还没合成完，中途断粮（underruns，听感即回答中途卡一下）。4 线程约减半。引擎只在 initialize() 读一次，改完要重启。
+  num_threads: 4
 
   # ── Segmentation and pauses ──────────────────────────────────
   # These numbers are what the listener hears. The model contributes no pause of
@@ -189,25 +190,20 @@ tts:
   internal_gap_keep_ms: 30
 
 tools:
-  whitelist:
-    - "open_app"
-    - "close_app"
-    - "set_volume"
-    - "media_control"
-    - "search_web"
-    - "read_file"
-    - "list_dir"
-    - "write_file"
-    - "run_script"
-    - "system_power"
-    - "get_time"
-    - "get_weather"
-  guest_denied:
-    - "read_file"
-    - "list_dir"
-    - "write_file"
-    - "run_script"
-    - "system_power"
+  # ── 语音可打开的应用 ──
+  # 内置 9 个(记事本/计算器/资源管理器/命令提示符/命令行窗口/代码编辑器/
+  # 谷歌浏览器/微软浏览器/系统设置)始终可用,且按 App Paths/PATH 自适应机器。
+  # 此表由设置界面(winvoice.webui)写入,追加自定义应用;内置 id 不可覆盖。
+  #   id      内部标识(小写英文;语音里用 label,这里主要用于日志与 sensitive_apps)
+  #   label   语音里怎么称呼(中文,TTS 只能念中文)
+  #   command 启动命令:绝对路径(如微信装在自定义位置),或 App Paths/PATH 里的 exe 名
+  #   image   进程映像名(启动命令≠进程映像时必填,如 Weixin.exe);省略则从 command 推断
+  #   guest   true = 访客也可以打开(默认 false;内置应用不受此项控制)
+  apps: []
+  # 访客一律禁开的应用(即使 guest=true 或属于内置),设置界面可改。
+  sensitive_apps:
+    - "cmd"
+    - "powershell"
   destructive:
     - "write_file"
     - "run_script"
