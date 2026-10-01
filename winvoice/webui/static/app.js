@@ -230,6 +230,7 @@ function renderGeneral() {
 
 /* ── 保存:点铅笔,静默落盘(成功不打扰,错误才说话)──────────── */
 
+let saving = false;
 let errorTimer = null;
 
 function showError(text) {
@@ -271,12 +272,15 @@ $("pen").addEventListener("click", async () => {
       clearTimeout(errorTimer);
       errorTimer = setTimeout(() => setStatus(""), 2600);
     }
-    await load();
   } catch (error) {
     const details = (error.payload && error.payload.errors || []).join("; ");
     showError("没写进去:" + (details || error.message));
+  } finally {
+    // 无论成败必须释放:否则一次失败(如服务重启瞬间的网络错误)会让
+    // saving 永远为 true,之后每次点铅笔都被静默吞掉——实测踩过。
+    saving = false;
   }
-  saving = false;
+  await load().catch(() => setStatus("已保存,但刷新视图失败——请手动刷新页面", "err"));
 });
 
 /* ── 心跳:页面开着,服务器就活着 ──────────────────────────────── */

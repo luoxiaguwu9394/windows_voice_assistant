@@ -201,7 +201,12 @@ tools:
   #   command 启动命令:绝对路径(如微信装在自定义位置),或 App Paths/PATH 里的 exe 名
   #   image   进程映像名(启动命令≠进程映像时必填,如 Weixin.exe);省略则从 command 推断
   #   guest   true = 访客也可以打开(默认 false;内置应用不受此项控制)
-  apps: []
+  apps:
+    - id: wechat
+      command: C:\Program Files\Tencent\Weixin\Weixin.exe
+      label: 微信
+      image: Weixin.exe
+      guest: false
   # 访客一律禁开的应用(即使 guest=true 或属于内置),设置界面可改。
   sensitive_apps:
     - "cmd"

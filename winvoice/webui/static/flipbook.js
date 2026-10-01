@@ -36,8 +36,6 @@ const Flipbook = (() => {
         const wobble = Math.sin(own * Math.PI * 3.5) * 1.6 * envelope;
         const lift = Math.sin(own * Math.PI * 2) * 5;
         tf += ` rotateZ(${wobble.toFixed(2)}deg) translateZ(${lift.toFixed(1)}px)`;
-        // 弯曲扫影的位置:高光-阴影带从纸的外缘扫向书脊(封面侧)/反向(背面)
-        sheets[i].style.setProperty("--curl-x", ((1 - own) * 125 - 12).toFixed(1) + "%");
       }
       sheets[i].style.transform = tf;
       // 落影 = 自己翻动的主阴影 与 上一张纸翻过来投在自己身上的影,取强者。
@@ -45,6 +43,15 @@ const Flipbook = (() => {
       const cast = clamp01(motion.progress - (i - 1));
       const shade = Math.max(Math.sin(own * Math.PI), Math.sin(cast * Math.PI) * 0.6);
       sheets[i].style.setProperty("--flip-shade", shade.toFixed(3));
+      // 弯曲带:每帧只写 transform(合成器路径,渐变本身不重绘)
+      const sweep = flipping ? ((0.62 - own * 1.1) * 160).toFixed(1) + "%" : "160%";
+      for (const face of sheets[i].querySelectorAll(".face")) {
+        const curl = face.__curl;
+        if (curl) {
+          curl.style.opacity = flipping ? "1" : "0";
+          curl.style.transform = `translateX(${sweep})`;
+        }
+      }
       sheets[i].style.zIndex = flipping ? (SHEET_COUNT + 10)
         : (own >= 0.999 ? 10 + i : SHEET_COUNT - i);
     }
@@ -138,6 +145,15 @@ const Flipbook = (() => {
     book = document.getElementById("book");
     stage = document.getElementById("stage");
     sheets = [...book.querySelectorAll(".sheet")];
+    // 每个面挂一条预渲染的弯曲带(翻页时只动 transform,不触发重绘)
+    for (const sheet of sheets) {
+      for (const face of sheet.querySelectorAll(".face")) {
+        const curl = document.createElement("div");
+        curl.className = "curl";
+        face.appendChild(curl);
+        face.__curl = curl;
+      }
+    }
     fitStage();
     motion.shift = -pageWidth / 2;   // 合上的书居中
     applyProgress();
