@@ -237,6 +237,10 @@ a local web UI for the settings you will actually keep changing —
   finds them from the Start Menu and App Paths, so WeChat works wherever it was
   installed), set the spoken Chinese name, the process image, and whether a
   guest may open it. Say 「打开微信」 on the next utterance — no restart.
+  名字不必说得一字不差:只说一部分(「网易云」)、多说几个字(「微信电脑版」)、
+  或听错一个字都能对上,回复里会念出实际打开的应用;应用名里带「播放/搜索/
+  音量」这类词也不会被别的功能抢走——「打开百度网盘」就是打开网盘。
+  倒装说法同样有效:「把微信打开」。
 * **访客禁开名单** (`tools.sensitive_apps`, default: cmd/powershell).
 * **唤醒词** — takes effect after restarting the assistant.
 * **主人/访客语速、音调** — takes effect after restarting the assistant.
