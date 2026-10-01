@@ -13,7 +13,7 @@
 "use strict";
 
 const Flipbook = (() => {
-  const SHEET_COUNT = 5;
+  const SHEET_COUNT = 6;
   const clamp01 = (v) => Math.max(0, Math.min(1, v));
   const clamp = (v, low, high) => Math.max(low, Math.min(high, v));
 
@@ -28,13 +28,21 @@ const Flipbook = (() => {
   function applyProgress() {
     for (let i = 0; i < sheets.length; i++) {
       const own = clamp01(motion.progress - i);
-      sheets[i].style.transform = `rotateY(${(own * -180).toFixed(2)}deg)`;
+      // 翻动中的纸:主翻转 + 自然抖动(幅度被 sin 包络,起翻/落定时归零)
+      const flipping = own > 0.001 && own < 0.999;
+      let tf = `rotateY(${(own * -180).toFixed(2)}deg)`;
+      if (flipping) {
+        const envelope = Math.sin(own * Math.PI);
+        const wobble = Math.sin(own * Math.PI * 3.5) * 1.6 * envelope;
+        const lift = Math.sin(own * Math.PI * 2) * 5;
+        tf += ` rotateZ(${wobble.toFixed(2)}deg) translateZ(${lift.toFixed(1)}px)`;
+      }
+      sheets[i].style.transform = tf;
       // 落影 = 自己翻动的主阴影 与 上一张纸翻过来投在自己身上的影,取强者。
       // 两者都是 sin 曲线,落定时自然归零,与静止状态无缝衔接。
       const cast = clamp01(motion.progress - (i - 1));
       const shade = Math.max(Math.sin(own * Math.PI), Math.sin(cast * Math.PI) * 0.6);
       sheets[i].style.setProperty("--flip-shade", shade.toFixed(3));
-      const flipping = own > 0.001 && own < 0.999;
       sheets[i].style.zIndex = flipping ? (SHEET_COUNT + 10)
         : (own >= 0.999 ? 10 + i : SHEET_COUNT - i);
     }

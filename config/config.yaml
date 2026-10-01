@@ -393,8 +393,8 @@ dsh:
 
 
 weather:
-  enabled: true                # false → 「天气查询没有打开。」 (no request is made)
-  city: "北京"                  # used when the sentence does not name a city
+  enabled: true  # false → 「天气查询没有打开。」 (no request is made)
+  city: 北京  # used when the sentence does not name a city
   # Hard limit for the wttr.in request (wttr.in needs no API key). Keep it
   # small: the assistant says nothing at all until the answer arrives.
   # Read fresh on every call, so editing this needs no restart.

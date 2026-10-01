@@ -228,31 +228,23 @@ function renderGeneral() {
   $("weather-enabled").checked = !!state.values["weather.enabled"];
 }
 
-/* ── 保存:提笔 → 在书上书写 → 落墨成文 ─────────────────────── */
+/* ── 保存:点铅笔,静默落盘(成功不打扰,错误才说话)──────────── */
 
-let saving = false;
+let errorTimer = null;
 
-function inkReveal() {
-  const ink = $("ink");
-  ink.classList.add("writing");
-  const paths = [...ink.querySelectorAll("path")];
-  paths.forEach((p) => {
-    const len = p.getTotalLength();
-    p.style.strokeDasharray = len;
-    p.style.strokeDashoffset = len;
-  });
-  const tl = gsap.timeline();
-  paths.forEach((p, i) => tl.to(p, { strokeDashoffset: 0, duration: 0.30, ease: "none" }, i * 0.26));
-  return new Promise((resolve) => tl.eventCallback("onComplete", resolve));
+function showError(text) {
+  setStatus(text, "err");
+  clearTimeout(errorTimer);
+  errorTimer = setTimeout(() => setStatus(""), 3500);
 }
 
 $("pen").addEventListener("click", async () => {
   if (saving) return;
   const words = kwsFromInput();
-  if (words.length > 8) { $("kws-error").textContent = "唤醒词最多 8 个。"; return setStatus("唤醒词最多 8 个。", "err"); }
+  if (words.length > 8) { $("kws-error").textContent = "唤醒词最多 8 个。"; return showError("唤醒词最多 8 个。"); }
   if (words.some((word) => word.length < 2 || word.length > 12)) {
     $("kws-error").textContent = "每个唤醒词需要 2–12 个字。";
-    return setStatus("每个唤醒词需要 2–12 个字。", "err");
+    return showError("每个唤醒词需要 2–12 个字。");
   }
   $("kws-error").textContent = "";
 
@@ -268,36 +260,14 @@ $("pen").addEventListener("click", async () => {
   };
 
   saving = true;
-  const pen = $("pen");
-  const penR = pen.getBoundingClientRect();
-  const bookR = $("book").getBoundingClientRect();
-  const k = window.__stageScale || 1;
-  const dx = (bookR.left + bookR.width * 0.56 - (penR.left + penR.width / 2)) / k;
-  const dy = (bookR.top + bookR.height * 0.38 - (penR.top + penR.height / 2)) / k;
-
-  setStatus("正在书写…");
-  gsap.to(pen, { x: dx, y: dy, rotation: -36, duration: 0.55, ease: "power2.inOut" });
-  await new Promise((resolve) => setTimeout(resolve, 620));
-
-  const writing = inkReveal();
   try {
-    const payload = await api("/api/v1/config", { method: "POST", headers, body: JSON.stringify({ changes }) });
-    await writing;
-    const details = Object.entries(payload.effects)
-      .map(([key, effect]) => key + (effect === "hot" ? "(即时)" : "(重启后)"))
-      .join("、");
-    if (payload.mode === "full") {
-      setStatus("已写入(配置结构无法原位编辑,注释已丢失)。 " + details, "ok");
-    } else {
-      setStatus("已写入。 " + details, "ok");
-    }
+    await api("/api/v1/config", { method: "POST", headers, body: JSON.stringify({ changes }) });
+    setStatus("");  // 写成了,什么都不说——本子自己知道
     await load();
   } catch (error) {
     const details = (error.payload && error.payload.errors || []).join("; ");
-    setStatus("没写进去:" + (details || error.message), "err");
+    showError("没写进去:" + (details || error.message));
   }
-  gsap.to(pen, { x: 0, y: 0, rotation: 0, duration: 0.5, ease: "power2.inOut", delay: 0.2 });
-  setTimeout(() => $("ink").classList.remove("writing"), 700);
   saving = false;
 });
 
