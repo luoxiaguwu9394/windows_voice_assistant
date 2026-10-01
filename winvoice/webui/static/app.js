@@ -213,6 +213,10 @@ function kwsFromInput() {
   return $("kws-input").value.split("\n").map((line) => line.trim()).filter(Boolean);
 }
 
+// 输入即标脏——漏了这一行,唤醒词的改动就永远进不了保存 payload
+// (点笔只会显示「本子还没有改动」,其他输入都有对应的一句,唯独这里漏了)。
+$("kws-input").addEventListener("input", () => markDirty("kws.keywords"));
+
 /* ── 语音 ─────────────────────────────────────────────────────── */
 
 function bindSlider(id, out, key) {
@@ -250,18 +254,29 @@ function showError(text) {
 
 $("pen").addEventListener("click", async () => {
   if (saving) return;
-  const words = kwsFromInput();
-  if (words.length > 8) { $("kws-error").textContent = "唤醒词最多 8 个。"; return showError("唤醒词最多 8 个。"); }
-  if (words.some((word) => word.length < 2 || word.length > 12)) {
-    $("kws-error").textContent = "每个唤醒词需要 2–12 个字。";
-    return showError("每个唤醒词需要 2–12 个字。");
+  // 唤醒词只在真正改过时校验:没动过的旧词不该挡住其他键的保存
+  if (dirty.has("kws.keywords")) {
+    const words = kwsFromInput();
+    if (!words.length) { $("kws-error").textContent = "唤醒词至少要 1 个。"; return showError("唤醒词至少要 1 个。"); }
+    if (words.length > 8) { $("kws-error").textContent = "唤醒词最多 8 个。"; return showError("唤醒词最多 8 个。"); }
+    if (words.some((word) => word.length < 2 || word.length > 12)) {
+      $("kws-error").textContent = "每个唤醒词需要 2–12 个字。";
+      return showError("每个唤醒词需要 2–12 个字。");
+    }
   }
   $("kws-error").textContent = "";
 
+  // 缺「启动命令」的卡片报错而不是静默丢弃——保存过的东西必须看得见地活着
+  const rawApps = appEntries();
+  const apps = rawApps.filter((entry) => entry.id && entry.command);
+  if (dirty.has("tools.apps") && apps.length !== rawApps.length) {
+    return showError("有应用卡片还没填「启动命令」,补上再保存。");
+  }
+
   const all = {
-    "tools.apps": appEntries().filter((entry) => entry.id && entry.command),
+    "tools.apps": apps,
     "tools.sensitive_apps": state.values["tools.sensitive_apps"] || [],
-    "kws.keywords": words,
+    "kws.keywords": kwsFromInput(),
     "tts.speed": Number($("speed").value),
     "tts.guest_speed": Number($("guest-speed").value),
     "tts.pitch": Number($("pitch").value),
