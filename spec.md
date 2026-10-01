@@ -815,6 +815,7 @@ PowerShell helper.
 | Hot-reload fan-out to running engines | config watcher → engines |
 | Prometheus metrics, disk quota, anchor check | §10, §9.2 (model integrity ✅ sealed 2026-09-27) |
 | Password/phrase fallback, threshold-tuning UI, PySide6 UI | §4.3, §4.4, §14 |
+| Per-app spoken aliases for custom apps (they resolve by exact id/label plus difflib ≥0.75 only; the 9 built-ins have a fixed synonym table) | `winvoice/tools/builtin.resolve_app` + settings UI |
 | Code signing for the setup exe, silent background auto-update | `installer/` |
 
 ### Known defects
@@ -825,6 +826,7 @@ PowerShell helper.
 | Tick-loop failures are logged with `error=str(e)` only — ✅ **fixed 2026-09-26** for the message half (`exc_info` + `error_type`, and background turns log `turn_failed`); per-state counting is still missing | tracebacks are no longer lost, but "the same error is repeating" is still invisible |
 | TTS speech is Chinese-only (§8) | English in any spoken string is dropped |
 | A guest's voice is the owner's voice at a different pace (single-speaker Matcha model) | the tier is not audible as a different voice (§8.2) |
+| Opening a custom app whose name contains another intent's keyword is claimed by that intent — `打开百度网盘` searches the web for 「网盘」, `打开VLC media player` presses play, `打开音量控制台` raises the volume, `打开文件管理器` answers 「没有找到这个文件」; the inverse 把微信打开 carries no name (UNIMPLEMENTED.md §2.6) | the wrong action runs silently instead of opening the app |
 
 ### Verified numbers (2026-09-19, this machine)
 | Metric | Value |
