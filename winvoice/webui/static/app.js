@@ -11,6 +11,11 @@ const state = {
   values: { "tools.apps": [], "tools.sensitive_apps": [], "kws.keywords": [] },
 };
 
+// 脏键:只保存用户真正改过的键——页面没碰过的键不写回,
+// 这样配置文件在别处(脚本/手工)的改动不会被旧状态覆盖。
+const dirty = new Set();
+const markDirty = (key) => dirty.add(key);
+
 const $ = (id) => document.getElementById(id);
 
 async function api(path, options) {
@@ -63,25 +68,25 @@ function appCard(entry, index) {
   const main = document.createElement("div");
   main.className = "app-main";
   const labelInput = textInput(entry.label || "", "说名(微信)");
-  labelInput.addEventListener("input", () => { appEntries()[index].label = labelInput.value; });
+  labelInput.addEventListener("input", () => { appEntries()[index].label = labelInput.value; markDirty("tools.apps"); });
   const commandInput = textInput(entry.command || "", "启动命令(C:\\...\\Weixin.exe)");
-  commandInput.addEventListener("input", () => { appEntries()[index].command = commandInput.value; });
+  commandInput.addEventListener("input", () => { appEntries()[index].command = commandInput.value; markDirty("tools.apps"); });
   main.append(labelInput, commandInput);
 
   const extra = document.createElement("div");
   extra.className = "app-extra";
   const imageInput = textInput(entry.image || "", "进程映像名(可选,Weixin.exe)");
-  imageInput.addEventListener("input", () => { appEntries()[index].image = imageInput.value; });
+  imageInput.addEventListener("input", () => { appEntries()[index].image = imageInput.value; markDirty("tools.apps"); });
   const guestLabel = document.createElement("label");
   guestLabel.className = "guest-label";
   const guestCheck = document.createElement("input");
   guestCheck.type = "checkbox"; guestCheck.checked = !!entry.guest;
-  guestCheck.addEventListener("change", () => { appEntries()[index].guest = guestCheck.checked; });
+  guestCheck.addEventListener("change", () => { appEntries()[index].guest = guestCheck.checked; markDirty("tools.apps"); });
   guestLabel.append(guestCheck, document.createTextNode("访客可开"));
   const deleteButton = document.createElement("button");
   deleteButton.className = "delete"; deleteButton.type = "button";
   deleteButton.title = "删除"; deleteButton.textContent = "✕";
-  deleteButton.addEventListener("click", () => { state.values["tools.apps"].splice(index, 1); renderApps(); renderSensitive(); });
+  deleteButton.addEventListener("click", () => { state.values["tools.apps"].splice(index, 1); markDirty("tools.apps"); renderApps(); renderSensitive(); });
   extra.append(imageInput, guestLabel, deleteButton);
 
   card.append(main, extra);
@@ -95,6 +100,7 @@ function textInput(value, placeholder) {
 }
 
 function addAppEntry(entry) {
+  markDirty("tools.apps");
   state.values["tools.apps"].push({
     id: entry.id || "app" + Date.now().toString(36),
     label: entry.label || "", command: entry.command || "", image: entry.image || "", guest: false,
@@ -167,6 +173,7 @@ function renderSensitive() {
     remove.type = "button"; remove.textContent = "✕"; remove.title = "移除";
     remove.addEventListener("click", () => {
       state.values["tools.sensitive_apps"] = state.values["tools.sensitive_apps"].filter((x) => x !== id);
+      markDirty("tools.sensitive_apps");
       renderSensitive();
     });
     chip.appendChild(remove);
@@ -191,7 +198,7 @@ $("sensitive-add").addEventListener("change", () => {
   const id = $("sensitive-add").value;
   if (!id) return;
   const list = state.values["tools.sensitive_apps"] || [];
-  if (!list.includes(id)) state.values["tools.sensitive_apps"] = [...list, id];
+  if (!list.includes(id)) { state.values["tools.sensitive_apps"] = [...list, id]; markDirty("tools.sensitive_apps"); }
   renderSensitive();
 });
 
@@ -212,7 +219,7 @@ function bindSlider(id, out, key) {
   const slider = $(id);
   slider.value = state.values[key];
   $(out).textContent = Number(state.values[key]).toFixed(2);
-  slider.addEventListener("input", () => { $(out).textContent = Number(slider.value).toFixed(2); });
+  slider.addEventListener("input", () => { $(out).textContent = Number(slider.value).toFixed(2); markDirty(key); });
 }
 
 function renderVoice() {
@@ -227,6 +234,8 @@ function renderGeneral() {
   $("city").value = state.values["weather.city"] || "";
   $("weather-enabled").checked = !!state.values["weather.enabled"];
 }
+$("city").addEventListener("input", () => markDirty("weather.city"));
+$("weather-enabled").addEventListener("change", () => markDirty("weather.enabled"));
 
 /* ── 保存:点铅笔,静默落盘(成功不打扰,错误才说话)──────────── */
 
@@ -249,7 +258,7 @@ $("pen").addEventListener("click", async () => {
   }
   $("kws-error").textContent = "";
 
-  const changes = {
+  const all = {
     "tools.apps": appEntries().filter((entry) => entry.id && entry.command),
     "tools.sensitive_apps": state.values["tools.sensitive_apps"] || [],
     "kws.keywords": words,
@@ -259,10 +268,19 @@ $("pen").addEventListener("click", async () => {
     "weather.city": $("city").value.trim() || "北京",
     "weather.enabled": $("weather-enabled").checked,
   };
+  // 只写脏键:页面没碰过的键不进 payload,别的来源改的值不会被覆盖
+  const changes = {};
+  for (const key of dirty) if (all[key] !== undefined) changes[key] = all[key];
+  if (!Object.keys(changes).length) {
+    setStatus("本子还没有改动。");
+    setTimeout(() => setStatus(""), 2000);
+    return;
+  }
 
   saving = true;
   try {
     const payload = await api("/api/v1/config", { method: "POST", headers, body: JSON.stringify({ changes }) });
+    Object.keys(payload.effects || {}).forEach((key) => dirty.delete(key));
     if (payload.mode === "full") {
       setStatus("已写入(配置结构无法原位编辑,注释已丢失)。", "ok");
       clearTimeout(errorTimer);
@@ -283,9 +301,19 @@ $("pen").addEventListener("click", async () => {
   await load().catch(() => setStatus("已保存,但刷新视图失败——请手动刷新页面", "err"));
 });
 
-/* ── 心跳:页面开着,服务器就活着 ──────────────────────────────── */
+/* ── 心跳 + 配置同步 ──────────────────────────────────────────── */
 
 setInterval(() => { api("/api/v1/ping").catch(() => {}); }, 30000);
+
+// 没有未保存改动时,窗口获焦/定时拉取磁盘最新配置——别处的改动
+// (脚本、手工编辑、另一台设备的写入)会被捡回来,而不是被旧状态覆盖
+async function syncIfClean() {
+  if (document.hidden || saving || dirty.size) return;
+  try { await load(); } catch (e) { /* 服务不在了,铅笔会报错 */ }
+}
+window.addEventListener("focus", syncIfClean);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) syncIfClean(); });
+setInterval(syncIfClean, 60000);
 
 Flipbook.init();
 load().then(() => setStatus("")).catch((error) => setStatus("加载失败:" + error.message, "err"));

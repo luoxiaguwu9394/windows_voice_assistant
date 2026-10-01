@@ -207,6 +207,11 @@ tools:
       label: 微信
       image: Weixin.exe
       guest: false
+    - id: appmupkpuq5
+      command: C:\Program Files\NetEase\CloudMusic\cloudmusic.exe
+      label: 网易云音乐
+      image: cloudmusic.exe
+      guest: false
   # 访客一律禁开的应用(即使 guest=true 或属于内置),设置界面可改。
   sensitive_apps:
     - "cmd"
