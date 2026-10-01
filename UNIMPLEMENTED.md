@@ -165,24 +165,9 @@ SEARCH_WEB 弱动词之前），pipeline 在 `_run_turn` 里**先于 agent 拦�
   sherpa-onnx **不暴露每次命中的分数**，所以只能这样离线标定。
 - **验收**：脚本给出阈值建议表；用建议值重跑，唤醒率可复现；把结论写进 `deployment.md` §5.3。
 
-### 2.6 自定义应用的说法覆盖与规则抢道（加应用后才暴露）
+### 2.6 自定义应用的说法覆盖与规则抢道 —— ✅ 已实现，条目下线（2026-10-01）
 
-- **现状**（2026-10-01 实测，探针逐句跑 `match_rules` / `resolve_app`）：规则层**不认应用名**——任何「打开 X」都以 `open_app` 放行，X 原样进工具层；工具层名单 `current_apps()` **每次说话现查**（内置 9 个 + `tools.apps`），设置界面保存后**下一句即可用、无需重启**。所以「新加的应用规则层检测不到」这个担心本身不会发生。
-- **会发生的两个问题**：
-  1. **名字解析失败** → 播报「X不在我能打开的名单里。我能打开…」。`resolve_app` = 精确（id / 说名 / 内置别名 `_EXTRA_APP_ALIASES` 23 条）+ difflib ≥0.75 模糊。实测：`微信`✓、`localsend` / `Local Send`✓（大小写靠模糊兜住——`aliases[entry.label]` 未小写化是个隐患）、`微信电脑版`✗、`weixin`✗。**自定义应用没有别名机制**：只有一个说名 + 内部 id；拼音、英文、简称、ASR 近似都会落空。
-  2. **规则抢道**（更隐蔽：多数不说"没法执行"，而是**执行成别的**）——实测表：
-
-     | 说的 | 实际路由 | 结果 |
-     |---|---|---|
-     | 打开百度网盘 | search_web("网盘") | 浏览器搜"网盘" |
-     | 打开文件管理器 / 打开文件资源管理器 | read_file("管理器") | 「没有找到这个文件。」（内置别名 explorer 都没轮到） |
-     | 打开VLC media player | media_control(play) | 按播放键（"Player"里含"play"） |
-     | 打开音量控制台 | set_volume(+10) | 音量变大 |
-     | 打开天气预报 | get_weather(city="打开") | 拿"打开"当城市去查 |
-     | 把微信打开 | open_app（无名字） | 「这个程序不在我能打开的名单里」 |
-
-- **修复方向**：① `match_rules` 给 OPEN_APP 一个受控优先判定——句子以 打开/启动 开头**且**剩余部分能精确/模糊解析到已知应用时抢先路由（注意别破坏「打开浏览器搜索天气」这类真搜索；名字未知时保持原顺序，交分类器兜底）；② 别名：`image` 词干自动入别名表、`entry.label` 小写化、设置界面加「别名」输入；③ `_weather_city` 的噪音词表补 打开/关闭 一类动词。
-- **验收**：上表逐句变成 `open_app`（或给出合理回应）；`微信电脑版` / `weixin` 能打开微信；新增回归测试 `tests/unit/test_rules_app_names.py`。
+（做法：① `match_rules` 前置「应用名感知」判定——句子以 打开/启动 开头（含「帮我打开…」「把…打开（吧/一下）」倒装）且名字按**严格模式** `resolve_app(..., partial=False)` 能解析时抢先路由为 `open_app`；强搜索词（搜索/搜一下/google/用浏览器）让路，「打开浏览器搜索天气」仍是搜索；「打开文件」仍是 READ_FILE（严格模式不做包含匹配，防「文件」→文件夹 抢道，`test_intent_rules_qa.py` 钉住）。② `resolve_app` 鲁棒化：大小写/空格归一、**镜像名词干**入别名（weixin→微信）、**包含匹配**（「网易云」⊂网易云音乐、「微信电脑版」⊃微信；短边≥2 且覆盖≥40%）、**单字符滑错**（「记事版」→记事本、「Notpa」→notepad）。歧义取长度最接近者，且回复念出实际打开的应用名——错选可听、可纠正。③ `_weather_city` 补动词开头噪音：「打开天气预报」不再拿「打开」当城市，开封/嘉峪关等真实地名不受影响。④ `open_app`/`close_app` 空名字不再说"不在名单"，改问「要打开哪个程序？」。验收：`tests/unit/test_rules_app_names.py`（覆盖原实测表逐句）+ 探针复测全表转绿；`test_app_name_resolution.py` 加 hermetic fixture——它原来直接读环境配置，用户加的微信条目会翻转负例、其中一条甚至真实启动了微信（实测踩到）。剩余（有意不做）：没有"手动别名"输入框，自动匹配已覆盖镜像名/部分名/滑错；若将来有名字仍旧打不中再加。）
 
 ---
 
@@ -225,6 +210,7 @@ SEARCH_WEB 弱动词之前），pipeline 在 `_run_turn` 里**先于 agent 拦�
 | 日期 | 动作 |
 |---|---|
 | 2026-10-01 | **设置界面加应用与规则层的交互探针**（用户问「加了应用会不会规则层检测不到、说我没法执行」）：结论——规则层只认动词、工具层名单热查（`current_apps()` 每句现算），`tools.apps` 保存后下一句即可用；真实缺口是**名字覆盖**（自定义应用无别名，`微信电脑版`/`weixin` 播报不在名单）与**规则抢道**（名字含 播放/音量/文件/百度/天气 等词时被别的意图抢先，实测 6 例，详见 §2.6）。待修。 |
+| 2026-10-01 | **§2.6 落地（同日修复）**：规则层前置「应用名感知」判定（严格模式解析；强搜索词、`READ_FILE` 边界、「重新启动」全部让路）、`resolve_app` 鲁棒化（大小写/空格归一、镜像名词干入别名、包含匹配 ≥40%、单字符滑错；歧义取最接近者并把实际打开的应用名念出来）、`_weather_city` 动词噪音、`open_app`/`close_app` 空名字话术。新增 `tests/unit/test_rules_app_names.py`（覆盖原实测表逐句）；`test_app_name_resolution.py` 加 hermetic fixture——它原来直接读环境配置，用户条目会翻转负例、其中一条甚至真实启动了微信（实测踩到）。全套单测除 11 项 `test_sv_thresholds`（沙盒 worktree 无声纹模型，环境性）外全绿；探针全表转绿。 |
 | 2026-09-29 | **第二台机器杂音定案：合成饥饿（与并行会话的 0.1.3 发版互不影响）**。用户取证包（diag.pcm + console.log）实锤：路由 wasapi shared@48000、无端点作废、`audio_playback_done underruns=2`；时间线——seg0 合成 719 ms（7 字）/音频 1486 ms，seg1 合成 **1891 ms**（21 字）：该机（0.5B 档、弱 CPU）合成 ≈90–100 ms/字，比开发机慢 7–8 倍，**seg0 放完时 seg1 还没合成完**，喂音线程垫静音 → 回答中断一截（用户听感的「卡一下」）。黑匣子印证：1470 ms 处 310 ms 静音 = 设计停顿 140 ms + 垫片，无重播、无重复片段——数据层行为符合设计，根因是**合成速度追不上实时**。修复：`tts.num_threads` 默认 2 → **4**（config.yaml + config.template.yaml，弱 CPU 上约减半；**随 v0.1.4-dev 发布**）。另修：config.py 未解析环境变量警告原走 stdlib logging → stderr，PowerShell 5.1 `2>&1|Tee` 把 stderr 行包成红色 `NativeCommandError`（用户被吓到）→ 改走项目 structlog（stdout；函数内懒导入——`logging.py` 顶层导入 `.config`，不能模块级反向导入）。 |
 | 2026-09-29 | **设置界面（winvoice.webui）+ 应用白名单配置化 + 敏感应用门**。用户需求：「UI 先负责配置的改动——白名单、地址、唤醒词、音调音速;开新分支」。**形态**:本地 Web UI（浏览器 `--app` 窗口）而非 tkinter/PySide6——零新依赖（stdlib ThreadingHTTPServer）、载荷几乎不变,前端是纯 HTML/CSS/JS 静态文件,**外观与复杂度上限由前端决定**,后续可平滑迁移 Tailwind/React。**配置写入**（`winvoice/config_edit.py`）:行级手术保注释 + 临时文件 `os.replace` 原子写（watchdog 读到半个 YAML 会让观察线程静默死亡,这是硬约束）;定位失败回退 `yaml.safe_dump` 全量写并在 UI 明示。踩坑:`yaml.safe_dump` 标量根带 `...` 文档结束符、默认按键排序、列表块必须保留键行本身、标量的切片终点是 `key_index+1` 而非 None。**白名单配置化**:内置 9 个应用改为 `BUILTIN_APPS`/`AppEntry`（id/label/command/image/guest）,`current_apps()` 每次调用合并 `tools.apps`（热生效,内置 id 不可覆盖——重定义 `cmd` 不能把 close_app 指向别的二进制）,进程映像推断收敛为 `AppEntry.process_image`;`verifier._expected_image` 与 close_app 共用一张表。**敏感门**:`tools.sensitive_apps`（默认 `[cmd, powershell]`）在 `validate_call` 拦截 `tier != full` 的 open/close（177 行缺口就此下线,顺带删掉死键 `tools.whitelist`/`tools.guest_denied`——全仓零读者）。**应用发现**（`winvoice/tools/appdiscovery.py`）:开始菜单 .lnk（COM 解析真目标,注意 CoInitialize）+ App Paths,过滤 unins000 卸载器族（正则是 `unins` 不是 `uninst`——Inno Setup 的命名）。**后端**（`winvoice/webui/server.py`）:127.0.0.1 + 随机 token（恒时比较）、`MANAGED_KEYS` 白名单（`${VAR}` 密钥永不外泄）、状态文件单实例握手、页面心跳停止后 180s 自杀退出。**前端**:四标签（应用/唤醒词/语音/常规）+ 每键生效徽标（即时/重启后,按 HOT_RELOADABLE 如实标注）。**快捷方式**:新增「WinVoice 设置.lnk」（`-m winvoice.webui`,Desktop+开始菜单,不进 Startup）,卸载器删两个名字。**实测**:浏览器全流程（添加微信→保存→磁盘验证→注释保留）通过;期间修掉 static_dir 相对路径导致 404 的真 bug（`is_relative_to` 前必须 resolve,已加回归）。全套 **785 passed, 1 skipped**（新增 46 项）。已知限制:`import winvoice` 拉起 sherpa 栈,窗口开 2–5s;同日二次迭代:前端改版为**可翻动的书**——仿 howtotalktowhitekidsaboutracism.com 的交互架构(GSAP 时间线 + 拖拽擦洗/箭头/键盘三驱动,时长缓动沿用其实测值,vendor/ 内置 gsap.min.js;CSS 3D 硬纸页:布纹封面、灯光池、首字下沉、页缘堆叠、书签印章保存钮)。实测修掉一个真 bug:pointer capture 会把合成 hover 事件(buttons=0)重定向进拖拽路径,一次点击因此连翻三页——pointermove 必须要求 buttons!==0,封面合着时只响应点击。服务端仅 meta 增 version 字段(封底显示)。TTS 音调/语速与唤醒词需重启（引擎启动读一次,如实标注）。 |
 | 2026-09-29 | **发版链路加固：SHA256 校验 + 版本陷阱构建期守卫 + 更新检查可诊断**。①**安装包校验**——`build_installer.py` 出 exe 后生成 sha256sum 格式的 `.exe.sha256` 旁车文件（发版检查单要求两个资产一起传）；`update.py` 的 `parse_release` 同 release 内配对 `.sha256` 资产填进 `UpdateInfo.sha256_url`，`download_update` 下载完流式哈希比对，**不匹配即删除坏文件并抛新异常 `UpdateError`**（截断同样删文件改抛 `UpdateError`）——残缺的 150+ MB exe 不能躺在下载目录等人误双击；无旁车的旧 Release 行为不变。旧向导挑资产的 `startswith+endswith(".exe")` 过滤不会误认 `.sha256` 资产，兼容。②**版本陷阱守卫**——按 196 行开的药方：`pyproject.toml` 与 `winvoice/__init__.py` 的 `__version__` 不一致拒绝构建（正则读，不 import 包）；查 Releases 列表发现最新已发布版本 == 本次版本即拒绝，`--allow-same-version` 显式放行，离线降级为大声警告；新增纯函数 `newest_published_version`。③**更新检查可诊断**——新增 `core/wlog.py`（append-only JSONL → `%LOCALAPPDATA%\WinVoice\logs\setup-wizard.jsonl`，永不抛）；`fetch_latest` 增可选 `on_error` 回调带出失败原因（回调自身被护住，永不把静默检查变成崩溃），欢迎页接 `wlog`；下载失败从「冒泡进 run_bg 通用错误框」改为专属弹窗 + 横幅恢复。**检查失败仍然零打扰**（横幅不出现、不弹窗），只是留下了痕迹。新增 12 项测试（`TestChecksummedDownload` 10 项 + `TestWlog` 2 项），全套 734 passed（含安装目录继承等 5 项后续补充）。同步 `installer/README.md`（发版检查单 + 产物表 + 向导日志路径）。 |

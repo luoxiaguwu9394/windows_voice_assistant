@@ -24,6 +24,16 @@ import pytest
 from winvoice.tools import builtin
 
 
+@pytest.fixture(autouse=True)
+def builtin_apps_only(monkeypatch):
+    """Hermetic: this file pins the contract against the nine built-ins.
+
+    Without the isolation the ambient config leaks in — the user's own 微信
+    entry (added through the settings UI) flips the negative cases below and
+    one of them even launches a real program."""
+    monkeypatch.setattr(builtin, "current_apps", lambda: dict(builtin.BUILTIN_APPS))
+
+
 @pytest.mark.parametrize(
     "spoken,expected",
     [

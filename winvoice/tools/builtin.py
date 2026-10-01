@@ -213,8 +213,10 @@ def _speakable_name(value: str) -> str:
 
 
 # Spoken synonyms pinning the user's words onto a built-in id. The Chinese
-# labels and the raw ids are registered automatically by `resolve_app`;
-# custom apps are reachable by id and label alone.
+# labels, the raw ids and each entry's process-image stem are registered
+# automatically by `resolve_app`; this table is for the words that appear in
+# neither (「浏览器」 for chrome). Custom apps are additionally reachable by
+# partial name and one-character slips — see `resolve_app`.
 _EXTRA_APP_ALIASES = {
     # notepad
     "笔记本": "notepad", "记事薄": "notepad", "便笺": "notepad", "文本编辑器": "notepad",
@@ -236,16 +238,69 @@ _EXTRA_APP_ALIASES = {
 }
 
 
-def resolve_app(name: str) -> Optional[str]:
+def _normalize_app_name(value: str) -> str:
+    """The comparison key for a spoken or registered name: lowercase, no
+    spaces, trailing particle removed (「记事本吧」 → 记事本)."""
+    normalized = str(value or "").strip().lower().replace(" ", "")
+    for particle in ("吧", "呢", "啊", "呀"):
+        normalized = normalized.removesuffix(particle)
+    return normalized
+
+
+def _one_edit_apart(a: str, b: str) -> bool:
+    """True when a and b differ by one substitution, insertion or deletion.
+
+    Covers the single-character slips real ASR makes on Chinese names
+    (「记事版」 for 记事本); a two-character name may only be substituted
+    (「威信」 for 微信), never stretched, so 「ps4」 cannot become powershell.
+    """
+    if a == b:
+        return True
+    if len(a) == len(b):
+        return sum(1 for x, y in zip(a, b) if x != y) == 1
+    if len(a) != len(b) + 1:
+        if len(b) != len(a) + 1:
+            return False
+        a, b = b, a  # a is the longer one from here
+    if len(b) < 3:
+        return False
+    index_a = index_b = 0
+    skipped = False
+    while index_b < len(b):
+        if a[index_a] != b[index_b]:
+            if skipped:
+                return False
+            skipped = True
+            index_a += 1
+            continue
+        index_a += 1
+        index_b += 1
+    return True
+
+
+def resolve_app(name: str, *, partial: bool = True) -> Optional[str]:
     """
     Map a spoken app name onto an allowlisted id, or None if it is not one.
 
-    Handles the three things ASR and the rule layer actually produce: a Chinese
-    label ("记事本"), a raw English id ("notepad"), or a close-but-wrong spelling
-    of either ("Notpa" — seen in the live log). Exact matches win, then a fuzzy
-    match with a high cutoff so unrelated words are still refused. The alias
-    table is rebuilt from `current_apps()` on every call, so an app the user
-    just enabled in the settings UI is reachable on the next utterance.
+    Deliberately forgiving, because real ASR and real users are both imprecise.
+    Exact matches win; then a *containment* match (「网易云」→ 网易云音乐,
+    「微信电脑版」→ 微信); then a single-character slip (「记事版」→ 记事本,
+    「Notpa」→ notepad — seen in the live log). Names are case- and
+    space-insensitive, and every app also answers to its process-image stem
+    (「weixin」 → 微信). The alias table is rebuilt from `current_apps()` on
+    every call, so an app the user just enabled in the settings UI is
+    reachable on the next utterance.
+
+    Containment needs the shorter side to be at least two characters and to
+    cover at least 40 % of the longer one — 「网易云」 ⊂ 网易云音乐 passes, a
+    single stray character does not. Two apps can both contain what was said
+    (「音乐」 in 网易云音乐 and QQ音乐); the closer-length candidate wins and
+    the reply names the app actually opened, so a wrong pick is audible and
+    correctable instead of silent.
+
+    `partial=False` is the stricter contract the rule tier's pre-check uses:
+    no containment, and fuzzy/edit matches need three characters. 「文件」 must
+    not resolve to 「文件夹」 there, or 「打开文件」 stops meaning READ_FILE.
     """
     import difflib
 
@@ -255,24 +310,46 @@ def resolve_app(name: str) -> Optional[str]:
 
     apps = current_apps()
     aliases: Dict[str, str] = {}
+
+    def register(key: str, app_id: str) -> None:
+        normalized = _normalize_app_name(key)
+        if normalized:
+            aliases.setdefault(normalized, app_id)
+
     for app_id, entry in apps.items():
-        aliases[app_id.lower()] = app_id
-        if entry.label:
-            aliases[entry.label] = app_id
+        register(app_id, app_id)
+        register(entry.label, app_id)
+        image = entry.process_image
+        if image.lower().endswith(".exe"):
+            register(image[:-4], app_id)  # weixin.exe → weixin
     for synonym, app_id in _EXTRA_APP_ALIASES.items():
         if app_id in apps:
-            aliases[synonym] = app_id
+            register(synonym, app_id)
 
-    # Exact, case-insensitive, ignoring a trailing particle ("记事本吧") and
-    # spaces inside an English name ("vs code").
-    normalized = candidate.lower().replace(" ", "")
-    for particle in ("吧", "呢", "啊", "呀"):
-        normalized = normalized.removesuffix(particle)
-    if normalized in aliases:
-        return aliases[normalized]
+    spoken = _normalize_app_name(candidate)
+    if not spoken:
+        return None
+    if spoken in aliases:
+        return aliases[spoken]
 
-    matches = difflib.get_close_matches(normalized, list(aliases), n=1, cutoff=0.75)
-    return aliases[matches[0]] if matches else None
+    best_id: Optional[str] = None
+    best_score = 0.0
+    for key, app_id in aliases.items():
+        shorter, longer = sorted((len(spoken), len(key)))
+        score = 0.0
+        if partial and shorter >= 2 and (spoken in key or key in spoken):
+            # The closer the two lengths are, the more of the name was said.
+            score = 0.55 + 0.3 * (shorter / longer) if shorter / longer >= 0.4 else 0.0
+        if not score and (partial or len(spoken) >= 3):
+            ratio = difflib.SequenceMatcher(None, spoken, key).ratio()
+            if ratio >= 0.75:
+                score = ratio
+            elif _one_edit_apart(spoken, key):
+                score = 0.72
+        if score > best_score:
+            best_score = score
+            best_id = app_id
+    return best_id
 
 
 def _app_paths_entry(exe_name: str) -> Optional[str]:
@@ -391,6 +468,15 @@ def _resolve_launch_target(entry: AppEntry) -> Optional[str]:
 def open_app(args: Dict[str, Any]) -> Dict[str, Any]:
     """Open an application from the allowlist, by Chinese or English name."""
     spoken = str(args.get("app", ""))
+    if not spoken.strip():
+        # The classifier lost the name (「把微信打开」 before the rule tier
+        # learned the inverted form) — ask for it instead of claiming it is
+        # not on a list the user never named.
+        return {
+            "success": False,
+            "error": "No app named",
+            "message": "要打开哪个程序？可以说「打开记事本」「打开浏览器」。",
+        }
     app = resolve_app(spoken)
     entry = current_apps().get(app) if app else None
     if entry is None:
@@ -443,6 +529,12 @@ def close_app(args: Dict[str, Any]) -> Dict[str, Any]:
     """
     spoken = str(args.get("app", ""))
     force = bool(args.get("force", False))
+    if not spoken.strip():
+        return {
+            "success": False,
+            "error": "No app named",
+            "message": "要关闭哪个程序？可以说「关闭记事本」「关闭浏览器」。",
+        }
     app = resolve_app(spoken)
     entry = current_apps().get(app) if app else None
     if entry is None:
