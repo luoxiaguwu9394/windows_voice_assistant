@@ -25,6 +25,7 @@ from typing import Any
 import numpy as np
 
 from winvoice.audio.playback import (
+    OUT_CHANNELS,
     NullSpeechPlayer,
     SpeechPlayer,
     open_output_stream,
@@ -36,8 +37,9 @@ DEVICE_RATE = 44100
 class FakeStream:
     """Records writes instead of playing them."""
 
-    def __init__(self, rate: int, *, write_delay_s: float = 0.0) -> None:
+    def __init__(self, rate: int, *, write_delay_s: float = 0.0, channels: int = OUT_CHANNELS) -> None:
         self.samplerate = rate
+        self.channels = channels
         self.write_delay_s = write_delay_s
         self.writes: list[np.ndarray] = []
         self.aborts = 0
@@ -64,14 +66,15 @@ class FakeStream:
     # ── assertions helpers ──
     @property
     def written_frames(self) -> int:
-        return sum(int(chunk.size) for chunk in self.writes)
+        """Device frames (not interleaved samples) — the unit `written_ms` needs."""
+        return sum(int(chunk.size) for chunk in self.writes) // self.channels
 
     @property
     def written_ms(self) -> float:
         return self.written_frames / self.samplerate * 1000
 
     def non_silent_ms(self) -> float:
-        frames = sum(int(np.count_nonzero(chunk)) for chunk in self.writes)
+        frames = sum(int(np.count_nonzero(chunk)) for chunk in self.writes) // self.channels
         return frames / self.samplerate * 1000
 
 
@@ -114,6 +117,49 @@ async def test_the_stream_is_opened_once_for_two_utterances() -> None:
 
     assert len(opened) == 1, "the device was re-opened per utterance"
     assert stream.closed
+
+
+async def test_the_device_is_never_opened_with_a_single_channel() -> None:
+    """
+    A mono stream makes the engine upmix it, and on some machines that upmix
+    destroys the audio (measured 2026-10-01: one utterance, one endpoint,
+    `channels=1` broken, `channels=2` clean). Speech stays mono; the *device*
+    format does not.
+    """
+    assert OUT_CHANNELS == 2
+
+    stream = FakeStream(DEVICE_RATE)
+    player = make_player(stream)
+    try:
+        await player.enqueue(pcm(100, DEVICE_RATE), DEVICE_RATE)
+        await player.wait_drained()
+    finally:
+        await player.close()
+
+    written = stream.writes[0]
+    assert written.ndim == 2, (
+        "a multi-channel PortAudio stream rejects a flat buffer with "
+        "'number of channels must match' (measured on a real device); it needs (frames, channels)"
+    )
+    assert written.shape[1] == OUT_CHANNELS
+    left = written[:, 0]
+    right = written[:, 1]
+    assert np.array_equal(left, right), "the mono speech was not replicated to both channels"
+
+
+async def test_a_single_channel_player_keeps_the_old_byte_stream() -> None:
+    """`out_channels=1` must still write bare mono — the archived black boxes
+    are mono, and a regression diagnosis compares against them."""
+    stream = FakeStream(DEVICE_RATE, channels=1)
+    player = make_player(stream, out_channels=1)
+    original = pcm(100, DEVICE_RATE)
+    try:
+        await player.enqueue(original, DEVICE_RATE)
+        await player.wait_drained()
+    finally:
+        await player.close()
+
+    assert np.array_equal(stream.writes[0], np.frombuffer(original, dtype=np.int16))
 
 
 async def test_a_device_that_cannot_open_degrades_to_silence() -> None:
@@ -409,7 +455,13 @@ async def test_a_matching_rate_is_passed_through_untouched() -> None:
     finally:
         await player.close()
 
-    assert np.array_equal(stream.writes[0], np.frombuffer(original, dtype=np.int16))
+    # Untouched apart from the channel replication the device format requires:
+    # every device frame carries the same sample in both channels.
+    mono = np.frombuffer(original, dtype=np.int16)
+    written = stream.writes[0]
+    assert written.size == mono.size * OUT_CHANNELS
+    assert np.array_equal(written.reshape(-1, OUT_CHANNELS)[:, 0], mono)
+    assert np.array_equal(written.reshape(-1, OUT_CHANNELS)[:, 1], mono)
 
 
 # ──────────────────────────────────────────────────────────────

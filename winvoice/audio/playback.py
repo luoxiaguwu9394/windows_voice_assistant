@@ -55,6 +55,20 @@ SILENCE_PAD_MS = 60
 QUEUE_BLOCKS = 512  # ~5 s at 20 ms blocks
 DRAIN_POLL_S = 0.01
 
+# Channels the output device is opened with. Speech is mono in this project, so
+# this is NOT "how many channels of speech there are" — it is the *device*
+# format, and the same mono samples go to every channel.
+#
+# It has to be 2. Opening a Windows endpoint with `channels=1` makes the audio
+# engine run its mono→stereo upmix on the render path, which some machines
+# process destructively: measured 2026-10-01 on a Windows 11 VM, one and the
+# same 6 s utterance played through one and the same endpoint (WASAPI shared,
+# 48 kHz, device index 8) came out broken with `channels=1` and clean with
+# `channels=2`, while mono with `auto_convert=True` and stereo over MME were
+# both clean too — the channel count was the only variable. Every ordinary media
+# player opens 2 channels for exactly this reason.
+OUT_CHANNELS = 2
+
 
 class AudioOutputUnavailable(RuntimeError):
     """No output device could be opened at any rate or host API."""
@@ -103,6 +117,24 @@ class _Utterance:
 
 def _default_output_device(device: Any) -> Any:
     return None if device in ("", "default", None, "None") else device
+
+
+def _to_device_frames(samples: np.ndarray, channels: int) -> np.ndarray:
+    """
+    The buffer to hand the device: mono speech replicated across every channel.
+
+    The shape matters as much as the count. PortAudio accepts a flat `(N,)`
+    buffer only for a **mono** stream; a multi-channel stream needs an explicit
+    `(frames, channels)` array and rejects a flat one with "number of channels
+    must match" — measured on a real device, 2026-10-01.
+
+    Returning `samples` unchanged for a single-channel stream keeps the
+    diagnostics byte-identical to what older builds wrote, which is what makes
+    a new black box comparable with the archived ones.
+    """
+    if channels <= 1 or samples.size == 0:
+        return samples
+    return np.repeat(samples.reshape(-1, 1), channels, axis=1)
 
 
 def _device_default_rate(device: Any) -> int:
@@ -163,6 +195,10 @@ def open_output_stream(
     with `auto_convert` (Windows resamples — worse than ours, but it always
     opens), then the system default. The rate that was actually opened is
     returned, because the resampler has to match it.
+
+    The stream is always opened with `OUT_CHANNELS` channels, never one: a mono
+    stream makes the engine upmix it on the render path, and on some machines
+    that upmix destroys the audio (see `OUT_CHANNELS`).
     """
     import sounddevice as sd
 
@@ -189,7 +225,7 @@ def open_output_stream(
             blocksize = max(64, int(rate * blocksize_ms / 1000))
             stream = sd.OutputStream(
                 samplerate=rate,
-                channels=1,
+                channels=OUT_CHANNELS,
                 dtype="int16",
                 blocksize=blocksize,
                 latency=latency,
@@ -228,6 +264,7 @@ class SpeechPlayer:
         prebuffer_ms: int = DEFAULT_PREBUFFER_MS,
         silence_pad_ms: int = SILENCE_PAD_MS,
         queue_blocks: int = QUEUE_BLOCKS,
+        out_channels: Optional[int] = None,
         stream_open: Optional[Callable[[int, int], tuple[Any, int]]] = None,
     ) -> None:
         self.requested_rate = int(sample_rate or 0)
@@ -238,6 +275,9 @@ class SpeechPlayer:
         self.prebuffer_ms = max(0, int(prebuffer_ms))
         self.silence_pad_ms = max(0, int(silence_pad_ms))
         self.queue_blocks = max(2, int(queue_blocks))
+        # Device channels — the format the stream is opened with, not a property
+        # of the speech (which is mono). See `OUT_CHANNELS`.
+        self.out_channels = max(1, int(out_channels or OUT_CHANNELS))
 
         self.stats = PlaybackStats()
         self.out_rate = self.requested_rate
@@ -641,7 +681,7 @@ class SpeechPlayer:
                 ) * 1000.0
                 self._drained.clear()
         try:
-            stream.write(samples)
+            stream.write(_to_device_frames(samples, self.out_channels))
         except Exception as error:
             # An endpoint can be invalidated underneath us mid-playback
             # (AUDCLNT_E_DEVICE_INVALIDATED: device change, driver reset, an

@@ -8,20 +8,23 @@ it is clear, then compare the verdicts:
     python scripts/diagnose_playback.py
 
 It synthesises a fixed reply through the real engine and the real output
-device, while recording what the speaker actually emits (WASAPI loopback —
-needs `pip install soundcard`). Both signals are saved under
+device, while recording the Windows WASAPI render mix (loopback — needs
+`pip install soundcard`). This is a digital endpoint capture, not an acoustic
+recording of the physical speaker. Both signals are saved under
 `runtime/playback_diag/` and analysed:
 
 * **our data** — repeated fragments, per-segment resample seams, write stalls;
-* **the device output** — stuck-buffer repeats (the driver replaying the same
+* **the WASAPI loopback** — stuck-buffer repeats (the driver replaying the same
   fragment: frame-to-frame correlation ≈ 1.0), glitches, timeline fidelity.
 
-If our data is clean but the device output shows stuck repeats, the artifact
+If our data is clean but the WASAPI loopback shows stuck repeats, the artifact
 is produced below the application (driver state, another stream on the
 endpoint, Bluetooth profile switch, enhancements) — no code change fixes that,
 and the recording pair is the evidence to bring to the next session.
 
-No microphone is needed; the reply is synthesised, not captured.
+No microphone is needed; the reply is synthesised. This check cannot identify
+acoustic-only clicks introduced by the speaker, room, or a phone microphone,
+and its 20 ms repeat checks do not rule out sub-millisecond transients.
 """
 
 from __future__ import annotations
@@ -112,6 +115,12 @@ async def main() -> int:
         def samplerate(self) -> int:
             return self.inner.samplerate
 
+        @property
+        def channels(self) -> int:
+            """The player writes a device buffer, so the wrapper must report the
+            device's channel count — the speech is mono, the stream is not."""
+            return int(getattr(self.inner, "channels", 1))
+
         def write(self, data: np.ndarray) -> None:
             self.writes.append(np.array(data, copy=True))
             self.inner.write(data)
@@ -166,6 +175,12 @@ async def main() -> int:
     tape.join(timeout=10)
 
     written = np.concatenate(box["tee"].writes).astype(np.float32) / 32767.0
+    # The stream is opened multi-channel and each mono sample was replicated, so
+    # unwrap one channel before analysing: the reports and both saved arrays are
+    # mono and stay comparable with the archived diagnostics.
+    channels = int(getattr(box["tee"], "channels", 1))
+    if channels > 1:
+        written = written[: (written.size // channels) * channels].reshape(-1, channels)[:, 0]
     device_out = np.concatenate(captured).astype(np.float32)
     np.save(out_dir / "written.npy", written)
     np.save(out_dir / "device_out.npy", device_out)
