@@ -1,10 +1,13 @@
-/* WinVoice 翻页书引擎(第二版:GSAP 驱动)。
+/* WinVoice 翻页书引擎(第三版:GSAP + 居中开书 + 连续落影)。
  *
- * 交互架构整体搬自 howtotalktowhitekidsaboutracism.com:一条 progress 时间线,
- * 每张纸翻转占 1 单位,拖拽实时 scrub、箭头/键盘 tween 跳页。原站用
- * GSAP timeline + WebGL;这里页面是 DOM(表单要活着),所以 GSAP 只驱动
- * CSS rotateY,时长与缓动沿用原站实测值(跳页 1.5s power3.inOut、
- * 封面 hover 微开、拖拽松手吸附)。GSAP 本体在 vendor/,可自由使用。
+ * 交互架构仿 howtotalktowhitekidsaboutracism.com:一条 progress 时间线
+ * (每张纸翻转占 1 单位),拖拽实时 scrub、箭头/键盘 tween 跳页;GSAP 本体
+ * 在 vendor/(原站同款库)。本版新增:
+ *  - 合上的书居中;点开后先平移到书脊对中,再翻开(progress 与 shift 同一时间线);
+ *  - 落影连续:翻动的纸投在下一张纸上的阴影按翻页角度实时计算(= sin 曲线),
+ *    与落定状态无缝衔接,不再突变;
+ *  - pointermove 要求 buttons !== 0:pointer capture 会把合成 hover 事件
+ *    重定向进拖拽路径,一次 (0,0) 合成移动曾把书"擦"出去三页(实测)。
  */
 
 "use strict";
@@ -17,55 +20,72 @@ const Flipbook = (() => {
   let sheets = [];
   let book, stage;
   let pageWidth = 420;
-  const state = { progress: 0 };      // GSAP tween 的目标对象(原站 flipTimeline 同型)
+  let scale = 1;                       // 窄窗整体缩放比(笔动画要用)
+  // motion 双轨:progress 翻页,shift 平移(合上时书居中 = -pageWidth/2)
+  const motion = { progress: 0, shift: 0 };
   let drag = null;
 
   function applyProgress() {
     for (let i = 0; i < sheets.length; i++) {
-      const t = clamp01(state.progress - i);
-      sheets[i].style.transform = `rotateY(${(t * -180).toFixed(2)}deg)`;
-      sheets[i].style.setProperty("--flip-shade", (Math.sin(t * Math.PI) * 0.45).toFixed(3));
-      // 堆叠:右侧未翻的纸 i 小者在上;左侧已翻的后翻者在上;翻动中的压住所有人
-      const flipping = t > 0.001 && t < 0.999;
+      const own = clamp01(motion.progress - i);
+      sheets[i].style.transform = `rotateY(${(own * -180).toFixed(2)}deg)`;
+      // 落影 = 自己翻动的主阴影 与 上一张纸翻过来投在自己身上的影,取强者。
+      // 两者都是 sin 曲线,落定时自然归零,与静止状态无缝衔接。
+      const cast = clamp01(motion.progress - (i - 1));
+      const shade = Math.max(Math.sin(own * Math.PI), Math.sin(cast * Math.PI) * 0.6);
+      sheets[i].style.setProperty("--flip-shade", shade.toFixed(3));
+      const flipping = own > 0.001 && own < 0.999;
       sheets[i].style.zIndex = flipping ? (SHEET_COUNT + 10)
-        : (t >= 0.999 ? 10 + i : SHEET_COUNT - i);
+        : (own >= 0.999 ? 10 + i : SHEET_COUNT - i);
     }
-    book.dataset.state = state.progress < 0.5 ? "closed" : "open";
+    book.style.transform = `translateX(${motion.shift.toFixed(1)}px)`;
+    stage.style.setProperty("--progress", motion.progress.toFixed(3));
+    book.dataset.state = motion.progress < 0.5 ? "closed" : "open";
     const left = document.getElementById("nav-left");
     const right = document.getElementById("nav-right");
-    if (left) left.style.visibility = state.progress > 0.03 ? "visible" : "hidden";
-    if (right) right.style.visibility = state.progress < SHEET_COUNT - 0.97 ? "visible" : "hidden";
+    if (left) left.style.visibility = motion.progress > 0.03 ? "visible" : "hidden";
+    if (right) right.style.visibility = motion.progress < SHEET_COUNT - 0.97 ? "visible" : "hidden";
   }
 
   function turnTo(page) {
     page = clamp(page, 0, SHEET_COUNT);
-    if (Math.abs(page - state.progress) < 0.002) return;
-    // 原站实测:箭头/菜单跳页 1.5s power3.inOut
-    gsap.to(state, {
+    if (Math.abs(page - motion.progress) < 0.002) return;
+    // 原站实测:跳页 1.5s power3.inOut
+    gsap.to(motion, {
       progress: page,
-      duration: Math.min(1.7, 0.55 + 0.42 * Math.abs(page - state.progress)),
+      duration: Math.min(1.7, 0.55 + 0.42 * Math.abs(page - motion.progress)),
       ease: "power3.inOut",
       onUpdate: applyProgress,
       onComplete: applyProgress,
     });
   }
 
-  /* ── 拖拽擦洗(原站:拖动 = 擦洗时间线,松手吸附)──────────── */
+  // 合上/打开:progress 与 shift 走同一条时间线 —— 书先归位再合上(或反之)。
+  // onUpdate 必须挂在时间线上:两个子 tween 各自只改数值,画面统一在这里重绘
+  // (漏掉它,progress 走完了画面却冻在原地——实测踩过)。
+  function setOpen(open) {
+    const targetProgress = open ? 1 : 0;
+    const targetShift = open ? 0 : -pageWidth / 2;
+    gsap.timeline({ onUpdate: applyProgress, onComplete: applyProgress })
+      .to(motion, { shift: targetShift, duration: 1.0, ease: "power2.inOut" }, 0)
+      .to(motion, { progress: targetProgress, duration: 1.35, ease: "power3.inOut" }, open ? 0.35 : 0.1);
+  }
+
+  /* ── 拖拽擦洗 ─────────────────────────────────────────────── */
 
   function onPointerDown(event) {
     if (event.target.closest("input, textarea, select, button, label, a, .modal")) return;
-    if (state.progress < 0.05) return;  // 封面合着时只响应点击翻开,不进入擦洗
-    gsap.killTweensOf(state);
-    drag = { startX: event.clientX, startProgress: state.progress };
+    if (motion.progress < 0.05) return;  // 封面合着时只响应点击翻开
+    gsap.killTweensOf(motion);
+    drag = { startX: event.clientX, startProgress: motion.progress };
     book.setPointerCapture(event.pointerId);
     book.classList.add("dragging");
   }
 
   function onPointerMove(event) {
-    // buttons === 0 的 pointermove 是合成/悬停移动(capture 会把它重定向到书),
-    // 绝不能参与擦洗——一次 (0,0) 处的合成移动曾把书"擦"出去三页(实测)。
+    // buttons === 0 的 pointermove 是合成/悬停移动,绝不能参与擦洗
     if (!drag || event.buttons === 0) { if (!event.buttons) drag = null; return; }
-    state.progress = clamp(drag.startProgress + (drag.startX - event.clientX) / pageWidth, 0, SHEET_COUNT);
+    motion.progress = clamp(drag.startProgress + (drag.startX - event.clientX) / pageWidth, 0, SHEET_COUNT);
     applyProgress();
   }
 
@@ -73,17 +93,22 @@ const Flipbook = (() => {
     if (!drag) return;
     const vx = (event.clientX - drag.startX);
     const bias = clamp(-vx / pageWidth * 0.6, -0.49, 0.49);
-    const target = clamp(Math.round(state.progress + bias), 0, SHEET_COUNT);
+    const target = clamp(Math.round(motion.progress + bias), 0, SHEET_COUNT);
     drag = null;
     book.classList.remove("dragging");
     turnTo(target);
   }
 
   function fitStage() {
-    pageWidth = sheets[0].getBoundingClientRect().width || pageWidth;
+    // offsetWidth = 未变换的布局宽;getBoundingClientRect 会把舞台缩放算进去,
+    // 而且 --book-w 既参与布局又被测量,用 rect 会形成自反馈收缩循环。
+    pageWidth = sheets[0].offsetWidth || pageWidth;
     stage.style.setProperty("--book-w", pageWidth + "px");
-    const scale = Math.min(1, (window.innerWidth - 32) / 980, (window.innerHeight - 32) / 700);
+    scale = Math.min(1, (window.innerWidth - 32) / 980, (window.innerHeight - 32) / 700);
     stage.style.transform = scale < 1 ? `scale(${scale.toFixed(3)})` : "";
+    // 合上态的居中平移量跟随页宽
+    if (motion.progress < 0.05) { motion.shift = -pageWidth / 2; applyProgress(); }
+    window.__stageScale = scale;
   }
 
   function init() {
@@ -91,6 +116,7 @@ const Flipbook = (() => {
     stage = document.getElementById("stage");
     sheets = [...book.querySelectorAll(".sheet")];
     fitStage();
+    motion.shift = -pageWidth / 2;   // 合上的书居中
     applyProgress();
 
     book.addEventListener("pointerdown", onPointerDown);
@@ -98,39 +124,49 @@ const Flipbook = (() => {
     book.addEventListener("pointerup", onPointerUp);
     book.addEventListener("pointercancel", onPointerUp);
 
-    document.getElementById("nav-left").addEventListener("click", () => turnTo(Math.round(state.progress) - 1));
-    document.getElementById("nav-right").addEventListener("click", () => turnTo(Math.round(state.progress) + 1));
+    document.getElementById("nav-left").addEventListener("click", () => turnTo(Math.round(motion.progress) - 1));
+    document.getElementById("nav-right").addEventListener("click", () => turnTo(Math.round(motion.progress) + 1));
 
     document.addEventListener("keydown", (event) => {
       if (event.target.closest("input, textarea, select")) return;
-      if (event.key === "ArrowRight") turnTo(Math.round(state.progress) + 1);
-      if (event.key === "ArrowLeft") turnTo(Math.round(state.progress) - 1);
+      if (event.key === "ArrowRight") turnTo(Math.round(motion.progress) + 1);
+      if (event.key === "ArrowLeft") turnTo(Math.round(motion.progress) - 1);
     });
 
-    // 封面:合着时点击翻开(原站进场动作的简化版)
+    // 封面:点击 → 向中间平移 + 翻开;hover 微开一缝(原站 PI/32)。
+    // hover tween 与点击都会动 motion:点击必须先杀掉 hover tween,否则
+    // isTweening 为真会把打开动作整个跳过(实测:点封面没反应)。
     book.querySelector(".cover").addEventListener("click", () => {
-      if (state.progress < 0.5) turnTo(1);
+      if (motion.progress < 0.5) {
+        gsap.killTweensOf(motion);
+        setOpen(true);
+      }
     });
-    // 封面 hover 微开(原站:PI/32 的开缝)
     book.querySelector(".cover").addEventListener("mouseenter", () => {
-      if (state.progress < 0.05 && !gsap.isTweening(state)) {
-        gsap.to(state, { progress: 0.045, duration: 0.5, ease: "power2.out",
-                         onUpdate: applyProgress, overwrite: "auto" });
+      if (motion.progress < 0.05 && !gsap.isTweening(motion)) {
+        gsap.to(motion, { progress: 0.045, duration: 0.5, ease: "power2.out",
+                          onUpdate: applyProgress, overwrite: "auto" });
       }
     });
     book.querySelector(".cover").addEventListener("mouseleave", () => {
-      if (state.progress < 0.05 && state.progress > 0 && !gsap.isTweening(state)) {
-        gsap.to(state, { progress: 0, duration: 0.7, ease: "power2.inOut",
-                         onUpdate: applyProgress, overwrite: "auto" });
+      if (motion.progress < 0.05 && motion.progress > 0 && !gsap.isTweening(motion)) {
+        gsap.to(motion, { progress: 0, duration: 0.7, ease: "power2.inOut",
+                          onUpdate: applyProgress, overwrite: "auto" });
       }
     });
 
     const close = document.getElementById("close-book");
-    if (close) close.addEventListener("click", () => turnTo(0));
+    if (close) close.addEventListener("click", () => setOpen(false));
 
     window.addEventListener("resize", fitStage);
 
-    const api = { turnTo, sheetCount: SHEET_COUNT, get progress() { return state.progress; } };
+    const api = {
+      turnTo,
+      open: () => setOpen(true),
+      sheetCount: SHEET_COUNT,
+      get progress() { return motion.progress; },
+      get scale() { return scale; },
+    };
     window.Flipbook = api;
     return api;
   }

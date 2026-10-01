@@ -10,9 +10,10 @@
 <div class="desk">
   <div class="stage" id="stage">
 
-    <!-- 右侧静态底板:全书翻完后露出的封底木板 -->
+    <!-- 右侧底板:封底内衬(布面 + 衬纸),全书翻完后露出 -->
     <div class="back-board" aria-hidden="true">
-      <div class="board-brand">WinVoice</div>
+      <div class="endpaper"></div>
+      <div class="board-seal">声</div>
     </div>
 
     <div class="book" id="book">
@@ -20,6 +21,7 @@
       <!-- 第 0 张:封面 / 目录 -->
       <div class="sheet" data-index="0">
         <div class="face front cover">
+          <div class="band" aria-hidden="true"></div>
           <div class="cover-frame">
             <div class="cover-kicker">语音助手使用手册</div>
             <h1 class="cover-title">WinVoice<br>设置</h1>
@@ -157,10 +159,32 @@
     <button class="nav-arrow left" id="nav-left" aria-label="上一页">‹</button>
     <button class="nav-arrow right" id="nav-right" aria-label="下一页">›</button>
 
-    <!-- 书签绦带:保存与反馈 -->
-    <div class="ribbon" id="ribbon">
-      <button id="save" class="seal-button" type="button">保存</button>
+    <!-- 墨迹层:钢笔书写动画写在这层 -->
+    <svg id="ink" class="ink" viewBox="0 0 320 200" preserveAspectRatio="none" aria-hidden="true">
+      <path d="M20 40 C 80 28, 150 46, 300 34" />
+      <path d="M20 92 C 90 80, 160 98, 300 86" />
+      <path d="M20 144 C 70 132, 190 150, 262 138" />
+    </svg>
+
+    <!-- 笔:书旁的钢笔,点它保存 -->
+    <div class="pen-zone" id="pen-zone">
       <span id="status" class="status" role="status"></span>
+      <svg id="pen" class="pen" viewBox="0 0 240 44" aria-label="保存(点击后书写)">
+        <g>
+          <!-- 笔杆 -->
+          <rect x="86" y="12" width="120" height="16" rx="8" fill="#20304f"/>
+          <rect x="86" y="12" width="120" height="6" rx="3" fill="#31456e"/>
+          <!-- 笔环 -->
+          <rect x="128" y="11" width="6" height="18" rx="2" fill="#c9a86a"/>
+          <!-- 笔尖 -->
+          <path d="M86 12 L58 15 L46 20 L58 25 L86 28 Z" fill="#8a8f98"/>
+          <path d="M46 20 L58 15 L58 25 Z" fill="#d8b25f"/>
+          <circle cx="54" cy="20" r="1.6" fill="#5a4a20"/>
+          <!-- 笔帽 -->
+          <rect x="206" y="10" width="30" height="20" rx="9" fill="#182642"/>
+          <rect x="200" y="14" width="8" height="12" rx="3" fill="#c9a86a"/>
+        </g>
+      </svg>
     </div>
   </div>
 </div>

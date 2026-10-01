@@ -228,9 +228,26 @@ function renderGeneral() {
   $("weather-enabled").checked = !!state.values["weather.enabled"];
 }
 
-/* ── 保存 ─────────────────────────────────────────────────────── */
+/* ── 保存:提笔 → 在书上书写 → 落墨成文 ─────────────────────── */
 
-$("save").addEventListener("click", async () => {
+let saving = false;
+
+function inkReveal() {
+  const ink = $("ink");
+  ink.classList.add("writing");
+  const paths = [...ink.querySelectorAll("path")];
+  paths.forEach((p) => {
+    const len = p.getTotalLength();
+    p.style.strokeDasharray = len;
+    p.style.strokeDashoffset = len;
+  });
+  const tl = gsap.timeline();
+  paths.forEach((p, i) => tl.to(p, { strokeDashoffset: 0, duration: 0.30, ease: "none" }, i * 0.26));
+  return new Promise((resolve) => tl.eventCallback("onComplete", resolve));
+}
+
+$("pen").addEventListener("click", async () => {
+  if (saving) return;
   const words = kwsFromInput();
   if (words.length > 8) { $("kws-error").textContent = "唤醒词最多 8 个。"; return setStatus("唤醒词最多 8 个。", "err"); }
   if (words.some((word) => word.length < 2 || word.length > 12)) {
@@ -250,21 +267,38 @@ $("save").addEventListener("click", async () => {
     "weather.enabled": $("weather-enabled").checked,
   };
 
+  saving = true;
+  const pen = $("pen");
+  const penR = pen.getBoundingClientRect();
+  const bookR = $("book").getBoundingClientRect();
+  const k = window.__stageScale || 1;
+  const dx = (bookR.left + bookR.width * 0.56 - (penR.left + penR.width / 2)) / k;
+  const dy = (bookR.top + bookR.height * 0.38 - (penR.top + penR.height / 2)) / k;
+
+  setStatus("正在书写…");
+  gsap.to(pen, { x: dx, y: dy, rotation: -36, duration: 0.55, ease: "power2.inOut" });
+  await new Promise((resolve) => setTimeout(resolve, 620));
+
+  const writing = inkReveal();
   try {
     const payload = await api("/api/v1/config", { method: "POST", headers, body: JSON.stringify({ changes }) });
+    await writing;
     const details = Object.entries(payload.effects)
       .map(([key, effect]) => key + (effect === "hot" ? "(即时)" : "(重启后)"))
       .join("、");
     if (payload.mode === "full") {
-      setStatus("已保存(配置结构无法原位编辑,注释已丢失)。 " + details, "ok");
+      setStatus("已写入(配置结构无法原位编辑,注释已丢失)。 " + details, "ok");
     } else {
-      setStatus("已保存。 " + details, "ok");
+      setStatus("已写入。 " + details, "ok");
     }
     await load();
   } catch (error) {
     const details = (error.payload && error.payload.errors || []).join("; ");
-    setStatus("保存失败:" + (details || error.message), "err");
+    setStatus("没写进去:" + (details || error.message), "err");
   }
+  gsap.to(pen, { x: 0, y: 0, rotation: 0, duration: 0.5, ease: "power2.inOut", delay: 0.2 });
+  setTimeout(() => $("ink").classList.remove("writing"), 700);
+  saving = false;
 });
 
 /* ── 心跳:页面开着,服务器就活着 ──────────────────────────────── */
