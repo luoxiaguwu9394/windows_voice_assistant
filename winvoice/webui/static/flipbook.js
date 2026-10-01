@@ -36,6 +36,8 @@ const Flipbook = (() => {
         const wobble = Math.sin(own * Math.PI * 3.5) * 1.6 * envelope;
         const lift = Math.sin(own * Math.PI * 2) * 5;
         tf += ` rotateZ(${wobble.toFixed(2)}deg) translateZ(${lift.toFixed(1)}px)`;
+        // 弯曲扫影的位置:高光-阴影带从纸的外缘扫向书脊(封面侧)/反向(背面)
+        sheets[i].style.setProperty("--curl-x", ((1 - own) * 125 - 12).toFixed(1) + "%");
       }
       sheets[i].style.transform = tf;
       // 落影 = 自己翻动的主阴影 与 上一张纸翻过来投在自己身上的影,取强者。
@@ -59,24 +61,37 @@ const Flipbook = (() => {
     page = clamp(page, 0, SHEET_COUNT);
     if (Math.abs(page - motion.progress) < 0.002) return;
     // 原站实测:跳页 1.5s power3.inOut
+    const ms = Math.min(1700, 550 + 420 * Math.abs(page - motion.progress));
     gsap.to(motion, {
-      progress: page,
-      duration: Math.min(1.7, 0.55 + 0.42 * Math.abs(page - motion.progress)),
-      ease: "power3.inOut",
+      progress: page, duration: ms / 1000, ease: "power3.inOut",
       onUpdate: applyProgress,
-      onComplete: applyProgress,
+      onComplete: () => { motion.progress = page; applyProgress(); },
     });
+    // 后台标签 rAF 暂停,GSAP 不会 tick——用 setTimeout 兜底把终态落到位
+    setTimeout(() => {
+      if (document.hidden || motion.progress !== page) { motion.progress = page; applyProgress(); }
+    }, ms + 150);
   }
 
   // 合上/打开:progress 与 shift 走同一条时间线 —— 书先归位再合上(或反之)。
   // onUpdate 必须挂在时间线上:两个子 tween 各自只改数值,画面统一在这里重绘
   // (漏掉它,progress 走完了画面却冻在原地——实测踩过)。
+  // 后台 rAF 暂停的兜底同 turnTo。
   function setOpen(open) {
     const targetProgress = open ? 1 : 0;
     const targetShift = open ? 0 : -pageWidth / 2;
-    gsap.timeline({ onUpdate: applyProgress, onComplete: applyProgress })
+    const total = open ? 1700 : 1500;
+    gsap.timeline({
+      onUpdate: applyProgress,
+      onComplete: () => { motion.progress = targetProgress; motion.shift = targetShift; applyProgress(); },
+    })
       .to(motion, { shift: targetShift, duration: 1.0, ease: "power2.inOut" }, 0)
       .to(motion, { progress: targetProgress, duration: 1.35, ease: "power3.inOut" }, open ? 0.35 : 0.1);
+    setTimeout(() => {
+      if (document.hidden || motion.progress !== targetProgress) {
+        motion.progress = targetProgress; motion.shift = targetShift; applyProgress();
+      }
+    }, total + 150);
   }
 
   /* ── 拖拽擦洗 ─────────────────────────────────────────────── */
@@ -126,6 +141,11 @@ const Flipbook = (() => {
     fitStage();
     motion.shift = -pageWidth / 2;   // 合上的书居中
     applyProgress();
+
+    // 后台标签的 rAF 会被浏览器暂停,翻页动画在其间冻结;lagSmoothing(0)
+    // 让补间按真实流逝时间跳到正确位置——回到前台时书页直接落到应到处,
+    // 不会慢慢爬。注意:GSAP 3.12 没有 ticker.useRAF(实测),勿加。
+    gsap.ticker.lagSmoothing(0);
 
     book.addEventListener("pointerdown", onPointerDown);
     book.addEventListener("pointermove", onPointerMove);

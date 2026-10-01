@@ -51,7 +51,7 @@ logger = get_logger(__name__)
 STATE_FILE = Path("runtime/webui.json")
 CONFIG_FILE = Path("config/config.yaml")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-IDLE_EXIT_S = 180.0
+IDLE_EXIT_S = 900.0
 
 # The exact keys the frontend may read or write. Anything else is a 400 —
 # this list is also what keeps `${REMOTE_API_KEY}`-style secrets inside.

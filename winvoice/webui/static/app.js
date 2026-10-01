@@ -261,8 +261,16 @@ $("pen").addEventListener("click", async () => {
 
   saving = true;
   try {
-    await api("/api/v1/config", { method: "POST", headers, body: JSON.stringify({ changes }) });
-    setStatus("");  // 写成了,什么都不说——本子自己知道
+    const payload = await api("/api/v1/config", { method: "POST", headers, body: JSON.stringify({ changes }) });
+    if (payload.mode === "full") {
+      setStatus("已写入(配置结构无法原位编辑,注释已丢失)。", "ok");
+      clearTimeout(errorTimer);
+      errorTimer = setTimeout(() => setStatus(""), 3500);
+    } else {
+      setStatus("已保存 ✓", "ok");
+      clearTimeout(errorTimer);
+      errorTimer = setTimeout(() => setStatus(""), 2600);
+    }
     await load();
   } catch (error) {
     const details = (error.payload && error.payload.errors || []).join("; ");
