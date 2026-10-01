@@ -263,9 +263,11 @@ class SettingsServer:
                 elif path.startswith("/static/"):
                     self._static(path[len("/static/"):])
                 elif path == "/api/v1/meta":
+                    from winvoice import __version__
                     from winvoice.tools.builtin import BUILTIN_APPS
 
                     self._json(200, {
+                        "version": __version__,
                         "effects": {key: effect_of(key) for key in MANAGED_KEYS},
                         "idle_exit_s": IDLE_EXIT_S,
                         "builtin_apps": [
