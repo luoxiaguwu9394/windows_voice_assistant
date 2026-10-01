@@ -51,7 +51,8 @@ logger = get_logger(__name__)
 STATE_FILE = Path("runtime/webui.json")
 CONFIG_FILE = Path("config/config.yaml")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-IDLE_EXIT_S = 900.0
+# 空闲自退秒数;可用 WINVOICE_IDLE_EXIT_S 覆盖,<= 0 = 不自退
+IDLE_EXIT_S = float(os.environ.get('WINVOICE_IDLE_EXIT_S', '900'))
 
 # The exact keys the frontend may read or write. Anything else is a 400 —
 # this list is also what keeps `${REMOTE_API_KEY}`-style secrets inside.
@@ -183,7 +184,7 @@ class SettingsServer:
         self.config_path = Path(config_path).resolve()
         self.state_path = Path(state_path)
         self.static_dir = Path(static_dir).resolve()
-        self.token = secrets.token_urlsafe(16)
+        self.token = os.environ.get("WINVOICE_WEBUI_TOKEN") or secrets.token_urlsafe(16)
         self.httpd: Optional[ThreadingHTTPServer] = None
         self.url = ""
         self._last_seen = time.time()
@@ -191,8 +192,9 @@ class SettingsServer:
     # -- lifecycle -----------------------------------------------------------
 
     def bind(self) -> None:
-        """Bind to 127.0.0.1 on an ephemeral port and remember the URL."""
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), self._handler_factory())
+        """Bind to 127.0.0.1 (port/token 可用环境变量固定,便于重启后复用)."""
+        port = int(os.environ.get("WINVOICE_WEBUI_PORT") or 0)
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", port), self._handler_factory())
         self.url = f"http://127.0.0.1:{self.httpd.server_port}/?token={self.token}"
         logger.info("settings_server_bound", url=self.url.split("token=")[0])
 
@@ -213,6 +215,8 @@ class SettingsServer:
             threading.Thread(target=self.httpd.shutdown, daemon=True).start()
 
     def _idle_watchdog(self) -> None:
+        if IDLE_EXIT_S <= 0:
+            return  # 演示/调试场景:不自退
         while True:
             time.sleep(5)
             if time.time() - self._last_seen > IDLE_EXIT_S:
