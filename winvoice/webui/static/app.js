@@ -103,7 +103,11 @@ function addAppEntry(entry) {
   markDirty("tools.apps");
   state.values["tools.apps"].push({
     id: entry.id || "app" + Date.now().toString(36),
-    label: entry.label || "", command: entry.command || "", image: entry.image || "", guest: false,
+    label: entry.label || "",
+    // 扫描结果给的键是 path,手册里存的是 command——漏了这层映射,
+    // 扫描添加的卡片启动命令永远是空的(实测:加完点笔必报缺命令)。
+    command: entry.command || entry.path || "",
+    image: entry.image || "", guest: false,
   });
   renderApps();
   renderSensitive();
@@ -266,11 +270,21 @@ $("pen").addEventListener("click", async () => {
   }
   $("kws-error").textContent = "";
 
-  // 缺「启动命令」的卡片报错而不是静默丢弃——保存过的东西必须看得见地活着
+  // 卡片规则:完全空白的占位卡片(点过「手动添加」还没开始填)静默丢弃——
+  // 它不该变成卡住每一次保存的「老是报」;填了内容却缺「启动命令」的卡片
+  // 才点名报错,保存过的东西必须看得见地活着。
   const rawApps = appEntries();
   const apps = rawApps.filter((entry) => entry.id && entry.command);
   if (dirty.has("tools.apps") && apps.length !== rawApps.length) {
-    return showError("有应用卡片还没填「启动命令」,补上再保存。");
+    const isBlank = (entry) => !String(entry.label || "").trim()
+      && !String(entry.command || "").trim() && !String(entry.image || "").trim();
+    const stuck = rawApps.filter((entry) => !(entry.id && entry.command) && !isBlank(entry));
+    if (stuck.length) {
+      const names = stuck.map((entry) => (entry.label
+        ? "「" + entry.label + "」"
+        : "第 " + (rawApps.indexOf(entry) + 1) + " 张卡片")).join("、");
+      return showError(names + "还缺「启动命令」;不想要就点卡片上的 ✕ 删掉。");
+    }
   }
 
   const all = {
