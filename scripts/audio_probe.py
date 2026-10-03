@@ -108,7 +108,11 @@ def _chime(sample_rate: int, seconds: float = 1.6) -> np.ndarray:
 def play_test(device: Optional[str], host_api: str, rate: int) -> Dict[str, Any]:
     # Imported here (not at module top) so `list` works even if the playback
     # module's heavier import chain changes.
-    from winvoice.audio.playback import AudioOutputUnavailable, open_output_stream
+    from winvoice.audio.playback import (
+        AudioOutputUnavailable,
+        open_output_stream,
+        to_device_frames,
+    )
 
     device_arg: Any = None if device in ("", "default", None) else device
     try:
@@ -119,9 +123,14 @@ def play_test(device: Optional[str], host_api: str, rate: int) -> Dict[str, Any]
         return {"ok": False, "error": str(error), "sample_rate": 0}
 
     try:
-        pcm = _chime(actual_rate)
+        # The device stream is opened with OUT_CHANNELS (2) — see playback.py
+        # for why it must never be mono — and PortAudio rejects a flat mono
+        # array on a multi-channel stream ("number of channels must match"),
+        # so the chime has to be replicated per channel exactly like the
+        # player does before any of it reaches `stream.write`.
+        pcm = to_device_frames(_chime(actual_rate), getattr(stream, "channels", 1) or 1)
         block = max(64, int(actual_rate * 0.02))
-        for start in range(0, pcm.size, block):
+        for start in range(0, pcm.shape[0], block):
             stream.write(pcm[start : start + block])
             time.sleep(0)  # stream.write blocks at device rate; yield to be safe
         # Let the device drain its internal buffer before closing, or the chime

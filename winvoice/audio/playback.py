@@ -119,7 +119,7 @@ def _default_output_device(device: Any) -> Any:
     return None if device in ("", "default", None, "None") else device
 
 
-def _to_device_frames(samples: np.ndarray, channels: int) -> np.ndarray:
+def to_device_frames(samples: np.ndarray, channels: int) -> np.ndarray:
     """
     The buffer to hand the device: mono speech replicated across every channel.
 
@@ -131,6 +131,10 @@ def _to_device_frames(samples: np.ndarray, channels: int) -> np.ndarray:
     Returning `samples` unchanged for a single-channel stream keeps the
     diagnostics byte-identical to what older builds wrote, which is what makes
     a new black box comparable with the archived ones.
+
+    Public because the setup wizard's audio probe (scripts/audio_probe.py) plays
+    through the same real route logic and therefore the same rule applies to
+    whatever buffer it writes.
     """
     if channels <= 1 or samples.size == 0:
         return samples
@@ -681,7 +685,7 @@ class SpeechPlayer:
                 ) * 1000.0
                 self._drained.clear()
         try:
-            stream.write(_to_device_frames(samples, self.out_channels))
+            stream.write(to_device_frames(samples, self.out_channels))
         except Exception as error:
             # An endpoint can be invalidated underneath us mid-playback
             # (AUDCLNT_E_DEVICE_INVALIDATED: device change, driver reset, an

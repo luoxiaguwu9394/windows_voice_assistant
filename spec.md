@@ -823,6 +823,7 @@ PowerShell helper.
 | Tick-loop failures are logged with `error=str(e)` only — ✅ **fixed 2026-09-26** for the message half (`exc_info` + `error_type`, and background turns log `turn_failed`); per-state counting is still missing | tracebacks are no longer lost, but "the same error is repeating" is still invisible |
 | TTS speech is Chinese-only (§8) | English in any spoken string is dropped |
 | A guest's voice is the owner's voice at a different pace (single-speaker Matcha model) | the tier is not audible as a different voice (§8.2) |
+| Playback diagnostics see application PCM and WASAPI loopback, but not acoustic phone-mic clicks; the repeat check compares 20 ms frames | sub-ms transients can be averaged away; a phone recording alone cannot locate whether the speaker, room, or phone/mic produced the click |
 
 ### Verified numbers (2026-09-19, this machine)
 | Metric | Value |

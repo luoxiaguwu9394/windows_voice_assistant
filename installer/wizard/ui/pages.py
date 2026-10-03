@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -50,6 +52,30 @@ DEFAULT_INSTALL_DIR = marker.discover_install_dir(
 def _heading(parent, text: str) -> ttk.Label:
     return ttk.Label(parent, text=text, font=("Microsoft YaHei UI", 11, "bold"),
                      wraplength=620, justify="left")
+
+
+def _probe_install_dir(target: Path) -> None:
+    """Check create/write/delete access, retrying transient Windows file locks."""
+    fd, name = tempfile.mkstemp(prefix=".winvoice-write-test-", dir=target)
+    probe = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write("WinVoice install-directory check")
+    finally:
+        # Defender and other file scanners can briefly hold a newly-created
+        # file. Retry a few times instead of reporting that the whole directory
+        # is unusable on the first sharing violation.
+        for attempt, delay in enumerate((0.0, 0.05, 0.1, 0.2)):
+            if delay:
+                time.sleep(delay)
+            try:
+                probe.unlink(missing_ok=True)
+                break
+            except PermissionError as error:
+                if attempt == 3:
+                    raise OSError(
+                        f"安装目录测试文件暂时无法删除: {probe}（可能正被安全软件扫描）"
+                    ) from error
 
 
 class WelcomePage(Page):
@@ -282,18 +308,20 @@ class InstallDirPage(Page):
     def _validate(self, report: bool) -> bool:
         target = self._target()
         try:
-            target.mkdir(parents=True, exist_ok=True)
-            probe = target / ".wizard-write-test"
-            probe.write_text("", encoding="utf-8")
-            probe.unlink()
+            if report:
+                target.mkdir(parents=True, exist_ok=True)
+                _probe_install_dir(target)
         except Exception as error:
-            message = f"目录不可写：{error}"
+            message = f"无法验证安装目录：{error}"
             if report:
                 messagebox.showwarning("无法安装", message, parent=self.app.root)
             self._hint.configure(text=message, foreground="#b3261e")
             return False
         problems = []
-        disk = systeminfo.free_disk_gb(target)
+        disk_path = target
+        while not disk_path.is_dir() and disk_path != disk_path.parent:
+            disk_path = disk_path.parent
+        disk = systeminfo.free_disk_gb(disk_path)
         if disk < systeminfo.MIN_DISK_GB:
             problems.append(f"剩余空间仅 {disk:.1f} GB（建议 ≥ {systeminfo.MIN_DISK_GB:.0f} GB）")
         if any(ord(ch) > 127 for ch in str(target)):
@@ -785,25 +813,47 @@ class EnrollPage(Page):
         _heading(self, "注册主人的声音（8 遍引导朗读）。没有声纹档案时，"
                        "所有人都是访客权限——读文件、写文件等操作不可用。").pack(
             anchor="w", pady=(0, 8))
-        make_note(self, "点击「立即注册」会打开一个控制台窗口，按它的提示朗读即可。"
-                        "也可以以后补做：WinVoice 目录下运行 "
+        make_note(self, "点击「立即注册」会打开一个控制台窗口，按它的提示朗读即可；"
+                        "已注册过时会重新录制并覆盖旧档案。也可以以后补做：WinVoice 目录下运行 "
                         "python\\python.exe -m winvoice.enroll").pack(anchor="w", pady=(0, 8))
         ttk.Button(self, text="立即注册", command=self._start).pack(anchor="w")
         self._status = make_note(self, "")
         self._status.pack(anchor="w", pady=6)
+        self._proc = None
+        self._mtime_before = None
+
+    def on_enter(self) -> None:
+        # An upgraded install keeps the previous profile. Say so up front, or
+        # the success message below reads as a claim the user never earned.
+        if flow.enroll_profile_path(self.state.install_dir).is_file():
+            self._status.configure(
+                text="检测到已有声纹档案：当前档案仍然有效；"
+                     "点「立即注册」将重新录制并覆盖。",
+                foreground="#333333")
 
     def _start(self) -> None:
         try:
-            flow.start_enroll(self.state.install_dir)
+            self._proc = flow.start_enroll(self.state.install_dir)
         except Exception as error:  # noqa: BLE001
             self._errorbox("无法打开注册窗口", str(error))
             return
+        # Success is "the profile changed since this click", never "the file
+        # exists" — an upgrade keeps the old file, and only enroll_finalize
+        # writes it, at the very end of a successful session.
+        self._mtime_before = flow.profile_mtime_ns(self.state.install_dir)
         self._status.configure(text="已打开注册窗口，请按提示朗读…", foreground="#333333")
         self._poll_profile()
 
     def _poll_profile(self) -> None:
-        if flow.enroll_profile_path(self.state.install_dir).is_file():
+        mtime = flow.profile_mtime_ns(self.state.install_dir)
+        if mtime is not None and mtime != self._mtime_before:
             self._status.configure(text="✓ 声纹档案已生成。", foreground="#0a7d32")
+            return
+        if self._proc is not None and self._proc.poll() is not None:
+            message = "注册窗口已关闭，但没有生成新的声纹档案（请把窗口里的报错记下来）。"
+            if self._mtime_before is not None:
+                message += "旧档案仍保留、继续有效，可重试。"
+            self._status.configure(text=message, foreground="#b3261e")
             return
         self.app.root.after(1000, self._poll_profile)
 

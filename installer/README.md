@@ -64,7 +64,9 @@ Release 资产名 `WinVoice-Setup-<版本>.exe` 对比版本，发版时保持�
 6. 音频设备（`scripts/audio_probe.py` 用内嵌解释器跑真实播放路由 + 录音电平）
 7. 个性化（城市 / **唤醒词编辑器** / DSH 开关 / 云端 key → `setx`）
 8. DSH 桥接安装（`install_dsh_bridge.py --install`，走捆绑运行时，无需 npm）
-9. 声纹注册（弹控制台跑 `winvoice.enroll`，可选）
+9. 声纹注册（弹控制台跑 `winvoice.enroll --force`，可选；已有档案时重录自动覆盖，
+   页面按档案 **mtime 变化**判定完成，注册进程退出而无新档案会如实报错——
+   升级保留的旧档案不再被误报成「注册成功」）
 10. 自检（`python -m winvoice --check`，退出码 0 才放行）
 11. 快捷方式（桌面/开始菜单/自启）+ 写安装标记 + 复制 setup exe 到安装目录
 
@@ -87,6 +89,8 @@ Release 资产名 `WinVoice-Setup-<版本>.exe` 对比版本，发版时保持�
 - [ ] 助手或 llama-server 正在运行时执行升级：在「安装运行时」页应看到「已停止 llama-server…」，解压不再停在 92 %
 - [ ] 一键卸载：选「卸载」→ 确认 → 运行时 / 快捷方式 / 安装标记删除；勾选保留时 `models/` 与 `config/config.yaml` 留存，安装目录在窗口关闭后被删掉
 - [ ] 勾选开机自启：`shell:startup` 出现 lnk；取消勾选后被移除
+- [ ] 音频设备页「播放测试音」出声（2026-10-03 起为立体声 buffer；`to_device_frames` 是公开函数，新开设备流的代码必须过它）
+- [ ] 声纹注册：已有 `models/sv/profiles/me.json` 的目录点「立即注册」→ 控制台完整走完 8 遍 → 向导在档案 mtime 变化后才显示成功；直接关掉控制台 → 向导报「没有生成新的声纹档案」
 - [ ] 中文/空格路径：出现黄色警告但可继续安装
 
 ## 已知限制

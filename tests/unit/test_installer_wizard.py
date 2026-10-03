@@ -29,6 +29,7 @@ if str(INSTALLER_DIR) not in sys.path:
     sys.path.insert(0, str(INSTALLER_DIR))
 
 from wizard.core import flow, marker, modelplan, payload, progress, systeminfo  # noqa: E402
+from wizard.core import runner as runner_module  # noqa: E402
 from wizard.core import template as template_mod  # noqa: E402
 from wizard.core import update, wakewords, wlog  # noqa: E402
 from wizard.core.state import InstallState, default_config_values  # noqa: E402
@@ -816,3 +817,46 @@ class TestUpdateEnv:
         state = InstallState()
         env = flow.update_env(state, base={"HTTP_PROXY": "http://x:1", "HTTPS_PROXY": "http://x:1"})
         assert "HTTP_PROXY" not in env and "HTTPS_PROXY" not in env
+
+
+# ──────────────────────────────────────────────────────────────
+# Enrollment (start_enroll argv + profile mtime snapshots)
+# ──────────────────────────────────────────────────────────────
+
+class TestEnrollFlow:
+    def test_start_enroll_asks_for_a_forced_re_enrollment(self, monkeypatch, work):
+        # An upgraded install keeps models/sv/profiles/me.json, and enroll_start
+        # refuses without force=True — v0.1.5's console died right after loading
+        # the models ("already enrolled") while the wizard kept saying success.
+        seen = {}
+
+        def fake_spawn(cmd, cwd, env=None):
+            seen["cmd"] = cmd
+            seen["cwd"] = cwd
+            return object()  # Popen stand-in; the page only polls it
+
+        monkeypatch.setattr(runner_module, "spawn_console", fake_spawn)
+        flow.start_enroll(work)
+        assert seen["cmd"][1:4] == ["-m", "winvoice.enroll", "--speaker"]
+        assert seen["cmd"][4] == "me"
+        assert seen["cmd"][-1] == "--force"
+        assert seen["cwd"] == work
+
+    def test_profile_mtime_ns_is_none_until_a_profile_exists(self, work):
+        assert flow.profile_mtime_ns(work) is None
+
+    def test_profile_mtime_ns_tracks_the_profile_file(self, work):
+        profile = flow.enroll_profile_path(work)
+        profile.parent.mkdir(parents=True)
+        profile.write_text("{}", encoding="utf-8")
+        assert flow.profile_mtime_ns(work) == profile.stat().st_mtime_ns
+
+    def test_a_rerecorded_profile_changes_the_mtime(self, work):
+        # The page's success rule: mtime must differ from the click-time
+        # snapshot — a leftover file from a previous install never passes.
+        profile = flow.enroll_profile_path(work)
+        profile.parent.mkdir(parents=True)
+        profile.write_text("old", encoding="utf-8")
+        before = flow.profile_mtime_ns(work)
+        profile.write_text("new", encoding="utf-8")
+        assert flow.profile_mtime_ns(work) != before

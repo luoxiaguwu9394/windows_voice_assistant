@@ -256,8 +256,22 @@ def start_enroll(install_dir: Path) -> subprocess.Popen:
     from .runner import spawn_console
 
     python = embedded_python(install_dir)
-    return spawn_console([str(python), "-m", "winvoice.enroll", "--speaker", "me"],
-                         cwd=install_dir)
+    # `--force`: an upgraded install keeps the previous profile, and without it
+    # enroll_start refuses with "already enrolled" the moment the engines have
+    # loaded — the console then closes itself and nothing tells the user why.
+    # Clicking 立即注册 means "record (again)", so re-enrolling overwrites.
+    return spawn_console(
+        [str(python), "-m", "winvoice.enroll", "--speaker", "me", "--force"],
+        cwd=install_dir,
+    )
+
+
+def profile_mtime_ns(install_dir: Path) -> Optional[int]:
+    """`me.json`'s mtime in ns, or None while there is no profile file."""
+    try:
+        return enroll_profile_path(install_dir).stat().st_mtime_ns
+    except OSError:
+        return None
 
 
 def install_dsh(install_dir: Path, state: InstallState, on_line: LINE_CALLBACK,

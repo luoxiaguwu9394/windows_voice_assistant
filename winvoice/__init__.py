@@ -8,7 +8,7 @@ Architecture:
 - Speaker Verification: CAM++ embeddings with 3-tier permissions
 """
 
-__version__ = "0.1.5-dev"
+__version__ = "0.1.6-dev"
 __author__ = "Windows Voice Assistant Team"
 
 from .config import get_config, ConfigManager
