@@ -14,6 +14,7 @@ import re
 from pathlib import Path
 
 import yaml
+import pytest
 
 from winvoice.config_edit import save_config, update_keys
 
@@ -150,3 +151,79 @@ def test_save_config_falls_back_to_full_dump_when_structure_is_unknown(tmp_path)
 
     assert result["mode"] == "full"
     assert yaml.safe_load(target.read_text(encoding="utf-8"))["tts"]["speed"] == 1.1
+
+
+# ── v0.1.6 field regression: the wizard renders `@KWS_KEYWORDS@` at column 0,
+#    so the installed config's keyword list is an *indentless* sequence (items
+#    at the key's own indent). Surgery used to stop the block at the key line,
+#    leaving the old items in place under the new ones — an unparseable file
+#    that blanked the settings page and killed the app on its next start.
+
+
+def wizard_rendered_template() -> str:
+    """The template rendered the way the wizard really renders it."""
+    import re
+    import sys
+
+    installer_dir = PROJECT_ROOT / "installer"
+    if str(installer_dir) not in sys.path:
+        sys.path.insert(0, str(installer_dir))
+    from wizard.core.template import render_template, yaml_keyword_block
+
+    text = TEMPLATE.read_text(encoding="utf-8")
+    values = {match: "x" for match in re.findall(r"@([A-Z_0-9]+)@", text)}
+    values["KWS_KEYWORDS"] = yaml_keyword_block(["你好小智", "在吗"])
+    return render_template(text, values)
+
+
+def test_indentless_keyword_block_from_the_real_renderer_is_replaced():
+    text = wizard_rendered_template()
+    # the shape the wizard actually writes: items at the key's own indent
+    assert '\n  - "你好小智"\n' in text
+
+    new = update_keys(text, {"kws.keywords": ["小云", "你好小云"]})
+
+    assert new is not None
+    data = yaml.safe_load(new)  # must parse — this used to be the field bug
+    assert data["kws"]["keywords"] == ["小云", "你好小云"]
+    assert data["kws"]["threshold"] == 0.25
+    # none of the previous words survive below the new block
+    assert "你好小智" not in new and '"在吗"' not in new
+
+
+def test_zombie_block_left_by_the_old_bug_is_repaired_by_the_next_save():
+    # exactly what v0.1.6 wrote to disk: new block at 4 spaces + the old
+    # indentless items still underneath — unparseable
+    mangled = (
+        "kws:\n"
+        '  model: "m"\n'
+        "  keywords:\n"
+        "    - 小云\n"
+        '  - "你好小智"\n'
+        '  - "在吗"\n'
+        "  threshold: 0.25\n"
+    )
+    with pytest.raises(Exception):
+        yaml.safe_load(mangled)
+
+    new = update_keys(mangled, {"kws.keywords": ["小云", "你好小云"]})
+
+    assert new is not None
+    data = yaml.safe_load(new)
+    assert data["kws"]["keywords"] == ["小云", "你好小云"]
+    assert data["kws"]["threshold"] == 0.25
+
+
+def test_save_config_refuses_to_write_unparseable_text(tmp_path, monkeypatch):
+    import winvoice.config_edit as ce
+
+    target = tmp_path / "config.yaml"
+    before = 'kws:\n  keywords:\n    - "你好小智"\n  threshold: 0.25\n'
+    target.write_text(before, encoding="utf-8")
+    monkeypatch.setattr(ce, "update_keys", lambda text, changes: "a: [unclosed\nb: {")
+
+    with pytest.raises(ce.ConfigEditError):
+        ce.save_config(target, {"kws.keywords": ["小云"]})
+
+    assert target.read_text(encoding="utf-8") == before  # disk untouched
+    assert [p.name for p in tmp_path.iterdir()] == ["config.yaml"]  # no temp file

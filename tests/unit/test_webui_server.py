@@ -160,6 +160,35 @@ def test_apps_scan_endpoint_returns_candidates(server, monkeypatch):
     assert status == 200 and payload["candidates"] == candidates
 
 
+def test_post_dedupes_wake_words(server):
+    status, payload = _post(server, "/api/v1/config",
+                            {"changes": {"kws.keywords": ["小云", "小云", "你好小云", " 小云 "]}})
+    assert status == 200
+
+    data = yaml.safe_load(server.config_path.read_text(encoding="utf-8"))
+    assert data["kws"]["keywords"] == ["小云", "你好小云"]
+
+
+def test_config_read_of_a_broken_file_is_a_readable_500(server):
+    server.config_path.write_text("kws:\n  keywords:\n  - 旧词\n  threshold: [", encoding="utf-8")
+
+    status, payload = _get(_api(server, "/api/v1/config"))
+
+    assert status == 500
+    assert "YAML" in payload["error"]
+
+
+def test_post_onto_a_broken_file_is_refused_and_writes_nothing(server):
+    server.config_path.write_text("kws:\n  keywords:\n  - 旧词\n  threshold: [", encoding="utf-8")
+    before = server.config_path.read_bytes()
+
+    status, payload = _post(server, "/api/v1/config", {"changes": {"weather.city": "上海"}})
+
+    assert status == 500
+    assert "error" in payload
+    assert server.config_path.read_bytes() == before  # disk untouched
+
+
 def test_static_index_is_served(server):
     with urllib.request.urlopen(server.url.split("?")[0], timeout=5) as response:
         body = response.read().decode("utf-8")

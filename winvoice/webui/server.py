@@ -30,8 +30,6 @@ import hmac
 import json
 import os
 import secrets
-import shutil
-import subprocess
 import threading
 import time
 import urllib.error
@@ -42,7 +40,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from winvoice.config import HOT_RELOADABLE, REQUIRES_RESTART
-from winvoice.config_edit import save_config
+from winvoice.config_edit import ConfigEditError, save_config
 from winvoice.logging import get_logger
 from winvoice.tools import appdiscovery
 
@@ -85,13 +83,21 @@ def effect_of(key: str) -> str:
 
 
 def read_managed_values(config_path: Path) -> dict:
-    """Current values for `MANAGED_KEYS`, read straight from the file."""
+    """
+    Current values for `MANAGED_KEYS`, read straight from the file.
+
+    Raises ConfigEditError when the file is not valid YAML — the caller turns
+    that into a 500 with a readable message (a bare connection drop here is
+    what made the page come up empty with just 「加载失败」).
+    """
     import yaml
 
     try:
         data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except FileNotFoundError:
         data = {}
+    except yaml.YAMLError as error:
+        raise ConfigEditError(f"config/config.yaml 不是合法 YAML: {error}") from error
 
     values: dict[str, Any] = {}
     for key in MANAGED_KEYS:
@@ -136,7 +142,13 @@ def sanitize_changes(changes: dict) -> tuple[dict, list[str]]:
         elif key == "weather.city":
             clean[key] = str(value or "").strip() or "北京"
         elif key == "kws.keywords":
-            words = [str(word).strip() for word in (value or []) if str(word).strip()]
+            # Dedupe order-preserving (the wizard's normalize) — the textarea
+            # round-trip must not be able to write the same word twice.
+            words: list[str] = []
+            for raw in value or []:
+                word = str(raw).strip()
+                if word and word not in words:
+                    words.append(word)
             if not words or len(words) > 8:
                 errors.append("kws.keywords needs 1-8 keywords")
                 continue
@@ -280,8 +292,13 @@ class SettingsServer:
                         ],
                     })
                 elif path == "/api/v1/config":
+                    try:
+                        values = read_managed_values(server.config_path)
+                    except ConfigEditError as error:
+                        self._json(500, {"error": str(error)})
+                        return
                     self._json(200, {
-                        "values": read_managed_values(server.config_path),
+                        "values": values,
                         "effects": {key: effect_of(key) for key in MANAGED_KEYS},
                     })
                 elif path == "/api/v1/apps/scan":
@@ -310,7 +327,15 @@ class SettingsServer:
                 if errors:
                     self._json(400, {"errors": errors})
                     return
-                result = save_config(server.config_path, clean)
+                try:
+                    result = save_config(server.config_path, clean)
+                except ConfigEditError as error:
+                    # The file on disk is untouched — say so, in words the
+                    # page can show verbatim, instead of dropping the
+                    # connection (that was the blank-page failure mode).
+                    logger.warning("settings_save_refused", error=str(error))
+                    self._json(500, {"error": str(error)})
+                    return
                 logger.info("settings_saved", mode=result["mode"], keys=result["keys"])
                 self._json(200, {
                     "saved": True,
@@ -347,20 +372,15 @@ def find_live_instance(state_path: Path = STATE_FILE) -> Optional[str]:
 
 
 def open_window(url: str) -> None:
-    """Edge `--app` mode when available (a chromeless window), else the browser."""
-    edge = shutil.which("msedge") or next(
-        (candidate for candidate in (
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        ) if Path(candidate).exists()),
-        None,
-    )
-    try:
-        if edge:
-            subprocess.Popen([edge, f"--app={url}"], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            return
-    except OSError:
-        pass
+    """
+    Open the settings page in the system default browser.
+
+    This used to prefer Edge `--app` mode for a chromeless window, but that
+    mode has no address bar and no reload (user feedback, 2026-10-03) — after
+    a failed load the only way to retry was closing and re-opening settings.
+    `webbrowser.open` on Windows hands the URL to the default handler, so the
+    page gets normal refresh/retry affordances.
+    """
     webbrowser.open(url)
 
 

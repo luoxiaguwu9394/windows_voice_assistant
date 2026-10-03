@@ -177,10 +177,19 @@ def _block_end(lines: list[str], key_index: int, key_indent: int) -> Optional[in
             continue
         if line.startswith(" " * (key_indent + 1)) or line.startswith("\t"):
             end = index + 1
+        elif key_indent and line.startswith(" " * key_indent) and line[key_indent:].startswith("- "):
+            # Indentless sequence: items at the key's own indent (`keywords:` /
+            # `  - x`) — valid YAML that config.template.yaml renders. Skipping
+            # these left the previous list in place under the new one.
+            end = index + 1
         else:
             end = index
             break
     return end
+
+
+class ConfigEditError(ValueError):
+    """The rendered config text would not parse — refused before touching disk."""
 
 
 def save_config(path: Path, changes: dict[str, Any]) -> dict:
@@ -190,13 +199,21 @@ def save_config(path: Path, changes: dict[str, Any]) -> dict:
     Returns `{"mode": "surgical" | "full", "keys": [...]}` — `surgical` kept
     every comment, `full` means the structure was not recognised and the file
     was rewritten from parsed data (values survive, comments do not; the UI
-    should say so). Raises only if the file cannot be read or written.
+    should say so). Raises ConfigEditError when the rendered text is not valid
+    YAML — verified *before* the write, because a broken config file does not
+    just fail the page: it kills the assistant's config watchdog thread and
+    the next app start. Raises only if the file cannot be read or written.
     """
     text = path.read_text(encoding="utf-8")
     new_text = update_keys(text, changes)
     mode = "surgical"
     if new_text is None:
-        data = yaml.safe_load(text) or {}
+        try:
+            data = yaml.safe_load(text) or {}
+        except yaml.YAMLError as error:
+            # The file itself is already unparseable, so there is nothing to
+            # fall back to — refuse instead of leaking a raw YAMLError.
+            raise ConfigEditError(f"config 文件不是合法 YAML，无法安全编辑: {error}") from error
         for dotted, value in changes.items():
             parts = dotted.split(".")
             section = data.get(parts[0])
@@ -212,6 +229,15 @@ def save_config(path: Path, changes: dict[str, Any]) -> dict:
                 data[dotted] = value
         new_text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
         mode = "full"
+
+    try:
+        yaml.safe_load(new_text)
+    except yaml.YAMLError as error:
+        # Surgical line surgery produced text the parser rejects (or the file
+        # itself was already unparseable). Refuse here: disk keeps the old
+        # bytes and the caller reports a real error instead of the page going
+        # blank and the app dying on its next start.
+        raise ConfigEditError(f"编辑结果不是合法 YAML，已放弃写入: {error}") from error
 
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(

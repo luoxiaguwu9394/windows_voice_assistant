@@ -209,12 +209,21 @@ $("sensitive-add").addEventListener("change", () => {
 /* ── 唤醒词 ───────────────────────────────────────────────────── */
 
 function renderKws() {
-  $("kws-input").value = (state.values["kws.keywords"] || []).join("\n");
+  // 手工编辑可能把 keywords 写成标量——按字符串兜底,别让渲染炸掉整页
+  const value = state.values["kws.keywords"];
+  const words = Array.isArray(value) ? value : (typeof value === "string" && value ? [value] : []);
+  $("kws-input").value = words.join("\n");
   $("kws-error").textContent = "";
 }
 
 function kwsFromInput() {
-  return $("kws-input").value.split("\n").map((line) => line.trim()).filter(Boolean);
+  // 去重保序:重复行不该被写进配置文件(服务端同样去重,这里是让所见即所存)
+  const seen = new Set();
+  const out = [];
+  $("kws-input").value.split("\n").map((line) => line.trim()).filter(Boolean).forEach((word) => {
+    if (!seen.has(word)) { seen.add(word); out.push(word); }
+  });
+  return out;
 }
 
 // 输入即标脏——漏了这一行,唤醒词的改动就永远进不了保存 payload
