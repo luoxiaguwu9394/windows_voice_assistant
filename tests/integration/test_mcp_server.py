@@ -174,6 +174,7 @@ def test_tools_list_exposes_the_registry(child: McpChild) -> None:
         "write_file",
         "run_script",
         "system_power",
+        "open_settings",
         "get_time",
         "get_weather",
     }
