@@ -906,9 +906,14 @@ class TestEnrollFlow:
     def test_a_rerecorded_profile_changes_the_mtime(self, work):
         # The page's success rule: mtime must differ from the click-time
         # snapshot — a leftover file from a previous install never passes.
+        import os
+
         profile = flow.enroll_profile_path(work)
         profile.parent.mkdir(parents=True)
         profile.write_text("old", encoding="utf-8")
         before = flow.profile_mtime_ns(work)
-        profile.write_text("new", encoding="utf-8")
+        # Two adjacent writes can land in the same Windows clock tick; set the
+        # new stamp explicitly so the assertion tests the rule, not the timer.
+        later = (before or 0) + 1_000_000_000  # +1 s, in ns
+        os.utime(profile, ns=(later, later))
         assert flow.profile_mtime_ns(work) != before

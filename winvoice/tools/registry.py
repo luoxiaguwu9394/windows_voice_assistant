@@ -108,7 +108,7 @@ class ToolRegistry:
     def _register_builtin_tools(self) -> None:
         """Register all builtin tools."""
         from .builtin import (
-            open_app, close_app, set_volume, media_control,
+            open_app, open_settings, close_app, set_volume, media_control,
             search_web, read_file, list_dir, write_file, run_script,
             get_time, system_power,
         )
@@ -283,6 +283,21 @@ class ToolRegistry:
         # ── read-only queries ──────────────────────────────────
         # No arguments, nothing to confirm, nothing to snapshot: they answer
         # with speech instead of acting on the machine, so a guest may ask.
+
+        self.register(ToolSpec(
+            name=ToolName.OPEN_SETTINGS,
+            description=(
+                "Open the assistant's settings page in a local browser window "
+                "(starts the winvoice.webui server on demand, reuses a live one)."
+            ),
+            schema=ToolSchema(properties={}, required=[]),
+            handler=open_settings,
+            destructive=False,
+            # The settings page edits the live config, so it is the owner's
+            # domain: a guest asking for it gets the standard tier refusal.
+            guest_allowed=False,
+            requires_confirmation=False,
+        ))
 
         self.register(ToolSpec(
             name=ToolName.GET_TIME,

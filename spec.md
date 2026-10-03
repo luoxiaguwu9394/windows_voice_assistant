@@ -244,6 +244,7 @@ and no 2 s deadline beyond the client's 60 s HTTP timeout.
 | `close_app` | `app: str` — as above; `force: bool` optional, force only on an explicit 「强制关闭」 request | ❌ | Non-sensitive only ✅ (`tools.sensitive_apps`) |
 | `set_volume` 🔶 | `delta: int` (relative) **or** `level: int` 0–100 (absolute); at least one required | ❌ | ✅ |
 | `media_control` | `action: Enum[play,pause,next,prev]` | ❌ | ✅ |
+| `open_settings` | no args — opens the assistant's settings page (winvoice.webui) in a browser window: reuses the live server via `runtime/webui.json`, else spawns `python -m winvoice.webui` and polls readiness before saying 「已经打开」 | ❌ | ❌ (the page edits the live config) |
 | `search_web` 🔶 | `query: str` — percent-encoded; the voice path asks 「你要我搜索…吗？」 first (`tools.search_web_confirm`), the agent's MCP path opens directly | ❌ | ✅ |
 | `read_file` 🔶 | `path: str` (must resolve under `C:\Users\<you>\`, ≤10 MB, UTF-8) | ❌ | ❌ |
 | `list_dir` | `path: str` optional (same confinement; default = the user directory). Answers count plus a few pronounceable names — Latin-bearing names are counted but never spoken | ❌ | ❌ |
@@ -788,6 +789,14 @@ small talk via `IntentName.ASK` with the tool-free `LocalLlmBackend.generate` pa
 deterministic greetings, ask-first `search_web` (`tools.search_web_confirm`), and the
 `IntentName.DISMISS` 「没事了」 fallback to waiting, and `system_power`
 (关机/重启/睡眠/休眠/锁屏/注销 — confirmation-gated, owner-only).
+
+Added 2026-10-03 (settings UI merge + voice entry): `open_settings` — 「打开配置」/
+「更改配置」/「打开设置」 open the local settings page (`winvoice.webui`) in a browser
+window, reusing a live server via `runtime/webui.json` or spawning one and polling
+readiness before claiming success (owner-only; the page edits the live config). The
+bare 「设置」 app alias moved out of `_EXTRA_APP_ALIASES` so `_open_target` does not
+hand 「打开设置」 to OPEN_APP; the Windows panel stays reachable as
+「打开系统设置」/「打开Windows设置」.
 
 Added 2026-09-27 (distribution, `installer/` + `docs/adr/0001`): the one-click setup
 wizard `WinVoice-Setup-<version>.exe` — embedded Python 3.12 runtime payload with all

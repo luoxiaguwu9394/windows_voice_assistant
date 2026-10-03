@@ -385,6 +385,8 @@ Say a wake word, wait for the acknowledgement, then speak one command.
 | `关闭记事本` (see the allowlist below) | asks 「你要我搜索…吗？」 first (see below) | `在桌面建立一个txt文件` · `写入文件 <path> 内容 …` · `运行脚本 <path>` (all ask 确认 first, see below) |
 | **Power** (owner only, asks 确认 first) | | |
 | `关机` · `重启` · `睡眠` · `休眠` · `锁屏` · `注销` | | |
+| **Settings** (owner only) | | |
+| `打开配置` · `更改配置` · `打开设置` — opens the settings page in a browser; `打开系统设置` opens the Windows panel | | |
 | **Time** | **Weather** | **Questions & small talk** |
 | `现在几点了` · `现在什么时间` | `今天天气怎么样` · `明天佛山天气怎么样` · `后天北京天气` | `什么是量子力学` · `你好` · `再见` |
 | answers e.g. 「现在是晚上 6 点整。」 | answers e.g. 「佛山明天晴，气温 27 到 35 度。」 (needs a network) | see below: answered in short spoken Chinese, never by running tools |

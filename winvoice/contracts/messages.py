@@ -74,6 +74,10 @@ class ToolName(str, Enum):
     # Power actions (shutdown/restart/…): confirmation-gated in the registry and
     # guest-denied, so a spoken 确认 from the owner is the only way through.
     SYSTEM_POWER = "system_power"
+    # 「打开配置/更改配置/打开设置」: opens the local settings page
+    # (winvoice.webui) in a browser window. Owner-only — the page edits the
+    # live config. 「打开系统设置」 stays OPEN_APP (the Windows ms-settings:).
+    OPEN_SETTINGS = "open_settings"
     # Read-only queries: no arguments, no confirmation, guest-allowed. They
     # answer with speech (`ToolResult.message`) instead of an action.
     GET_TIME = "get_time"
@@ -102,6 +106,9 @@ class IntentName(str, Enum):
     # Power actions (「关机/重启/锁屏」…). Routed by the rule tier and gated by
     # the spoken-confirmation loop; a guest can reach neither.
     SYSTEM_POWER = "system_power"
+    # 「打开配置/更改配置/打开设置」 — the assistant's own settings page
+    # (winvoice.webui), owner-only. The Windows panel is OPEN_APP + 系统设置.
+    OPEN_SETTINGS = "open_settings"
     # Free-form question / small talk. Text in, text out — the answering model
     # must never get tool capability (spec.md §6.5).
     ASK = "ask"

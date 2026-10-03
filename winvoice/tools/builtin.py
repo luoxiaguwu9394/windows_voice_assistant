@@ -23,6 +23,8 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
+import time
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
@@ -233,8 +235,10 @@ _EXTRA_APP_ALIASES = {
     # browsers
     "浏览器": "chrome", "谷哥浏览器": "chrome", "google": "chrome",
     "edge浏览器": "edge", "微软浏览器edge": "edge",
-    # settings
-    "设置": "settings", "系统设置面板": "settings",
+    # settings — the bare 「设置」 deliberately NOT here: 「打开设置」 belongs
+    # to the assistant's own settings page (OPEN_SETTINGS); the Windows panel
+    # needs its qualifier, which `_open_target` resolves strictly.
+    "系统设置": "settings", "系统设置面板": "settings", "windows设置": "settings",
 }
 
 
@@ -508,6 +512,61 @@ def open_app(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("open_app_failed", app=app, error=str(e))
         return {"success": False, "error": str(e), "message": f"打开{entry.label}的时候出错了。"}
+
+
+def open_settings(args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Open the assistant's settings page (winvoice.webui) in a browser window.
+
+    A live server is reused through its state file; otherwise a detached child
+    (`python -m winvoice.webui`) binds one and opens its own window — this
+    process never serves HTTP itself. The child takes a few seconds (importing
+    winvoice loads the audio stack), so success is polled, not assumed:
+    「已经打开」 must mean a window exists, mirroring open_app's honesty rule.
+    """
+    try:
+        from winvoice.webui.server import find_live_instance, open_window
+    except ImportError:
+        return {
+            "success": False,
+            "error": "winvoice.webui is not part of this build",
+            "message": "这个版本还没有带设置页面，请升级安装器。",
+        }
+
+    url = find_live_instance()
+    spawned = False
+    if url is None:
+        try:
+            subprocess.Popen(
+                [sys.executable, "-m", "winvoice.webui"],
+                cwd=os.getcwd(),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError as e:
+            logger.warning("open_settings_spawn_failed", error=str(e))
+            return {
+                "success": False,
+                "error": str(e),
+                "message": "设置页面没能启动，请看控制台里的日志。",
+            }
+        spawned = True
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            url = find_live_instance()
+            if url is not None:
+                break
+            time.sleep(0.5)
+    if url is None:
+        return {
+            "success": False,
+            "error": "settings server did not answer within 10s",
+            "message": "设置页面启动有点慢还没有就绪，请稍等几秒再看浏览器。",
+        }
+    if not spawned:
+        # The freshly spawned child opens its own window; opening one here too
+        # would put two identical windows on screen.
+        open_window(url)
+    return {"success": True, "message": "已经打开设置页面了，改完记得点保存。"}
 
 
 def close_app(args: Dict[str, Any]) -> Dict[str, Any]:

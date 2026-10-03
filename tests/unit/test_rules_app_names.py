@@ -39,6 +39,7 @@ def apps(monkeypatch):
         "vlc": builtin.AppEntry("vlc", "VLC media player", r"C:\fake\vlc.exe"),
         "volctl": builtin.AppEntry("volctl", "音量控制台", r"C:\fake\ctl.exe"),
         "weathertv": builtin.AppEntry("weathertv", "天气预报", r"C:\fake\weather.exe"),
+        "settings": builtin.BUILTIN_APPS["settings"],
     }
     monkeypatch.setattr(builtin, "current_apps", lambda: dict(table))
     return table
@@ -124,6 +125,55 @@ def test_weather_city_ignores_command_verbs() -> None:
     # 「打开天气预报」 used to ask wttr.in about the city 「打开」.
     assert rules_mod._weather_city("打开天气预报") is None
     assert rules_mod._weather_city("开封天气") == "开封"  # a real place, not a verb
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "打开设置",
+        "打开配置",
+        "更改配置",
+        "更改设置",
+        "修改配置",
+        "调整配置",
+        "配置设置",
+        "打开设置页面",
+        "打开设置界面",
+        "打开助手设置",
+        "帮我打开设置",
+    ],
+)
+def test_settings_phrases_open_the_assistant_page(text: str) -> None:
+    # 2026-10-03 user decision: 「打开设置」 means the assistant's own page
+    # (winvoice.webui), not the Windows panel — the bare 「设置」 alias is gone
+    # from the app table so `_open_target` steps aside and this rule wins.
+    result = match_rules(text)
+    assert result is not None, text
+    assert result.intent == IntentName.OPEN_SETTINGS, (text, result.intent)
+    assert result.args == {}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "打开系统设置",     # the Windows panel keeps a qualified name → OPEN_APP
+        "打开Windows设置",
+        "把音量设置到三十",  # 设置 inside the volume verb must not move
+        "打开浏览器搜索天气",
+    ],
+)
+def test_settings_rule_does_not_steal(text: str) -> None:
+    result = match_rules(text)
+    assert result is not None and result.intent != IntentName.OPEN_SETTINGS, (text, result.intent)
+
+
+def test_strict_resolution_leaves_settings_vocabulary_unresolved() -> None:
+    # The rule pre-check (`_open_target`, partial=False) must NOT map the bare
+    # nouns onto the ms-settings app — that would let OPEN_APP win over
+    # OPEN_SETTINGS before the table is even consulted.
+    assert builtin.resolve_app("设置", partial=False) is None
+    assert builtin.resolve_app("配置", partial=False) is None
+    assert builtin.resolve_app("系统设置", partial=False) == "settings"
 
 
 def test_open_app_asks_for_the_name_when_it_is_missing() -> None:

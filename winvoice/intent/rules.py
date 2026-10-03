@@ -206,6 +206,19 @@ RULE_PATTERNS: Dict[IntentName, List[str]] = {
     IntentName.SEARCH_WEB: [
         _SEARCH_VERBS,
     ],
+    # Before OPEN_APP, whose bare verbs would otherwise grab 「打开设置」 and
+    # open the Windows panel. The bare noun 「设置」 was removed from the app
+    # aliases for the same reason — the assistant's own settings page is what
+    # 「打开设置」 means; the Windows panel needs the qualifier
+    # (「打开系统设置」), whose name still resolves in `_open_target`.
+    # 「打开系统设置」/「打开Windows设置」 cannot match these patterns (the
+    # qualifier sits between the verb and 设置), so they fall through to the
+    # app table as intended.
+    IntentName.OPEN_SETTINGS: [
+        r"打开设置|打开配置|更改配置|更改设置|修改配置|修改设置|调整配置|改配置"
+        r"|配置设置|设置页面|设置界面"
+        r"|打开(?:助手|winvoice|语音助手)(?:的)?设置",
+    ],
     IntentName.OPEN_APP: [
         # `运行` alone is deliberately excluded to avoid stealing RUN_SCRIPT.
         r"打开|启动|open|launch|start",

@@ -823,6 +823,7 @@ class AudioPipeline:
             "write_file": ToolName.WRITE_FILE,
             "run_script": ToolName.RUN_SCRIPT,
             "system_power": ToolName.SYSTEM_POWER,
+            "open_settings": ToolName.OPEN_SETTINGS,
             "get_time": ToolName.GET_TIME,
             "get_weather": ToolName.GET_WEATHER,
         }

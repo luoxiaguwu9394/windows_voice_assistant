@@ -73,8 +73,24 @@ def assert_speakable(spoken: str, lexicon: set[str]) -> None:
     )
 
 
+@pytest.fixture
+def hermetic_apps(monkeypatch):
+    """open_app must not see the developer's real config.
+
+    The repo's own config/config.yaml carries the user's live app table — after
+    the settings-UI merge it allowlists 微信, and this test (which expects a
+    refusal for 微信) once really launched it. Pin a tiny table instead.
+    """
+    from winvoice.tools import builtin
+
+    apps = {"notepad": builtin.AppEntry("notepad", "记事本", "notepad.exe")}
+    monkeypatch.setattr(builtin, "current_apps", lambda: apps)
+
+
 @pytest.mark.asyncio
-async def test_app_outside_the_whitelist_names_the_alternatives_in_chinese(pipeline, lexicon):
+async def test_app_outside_the_whitelist_names_the_alternatives_in_chinese(
+    pipeline, lexicon, hermetic_apps
+):
     spoken = await spoken_reply(pipeline, ToolName.OPEN_APP, {"app": "微信"}, IntentName.OPEN_APP, "打开微信")
 
     assert_speakable(spoken, lexicon)
