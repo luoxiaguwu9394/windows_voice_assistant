@@ -228,6 +228,28 @@ upgrade / repair (models and config are preserved), including when you chose a
 custom install location. Updates are discovered from new release assets
 automatically. Details: `installer/README.md`.
 
+### WinVoice 设置（配置界面）
+
+The installer creates a second shortcut, **WinVoice 设置** (`WinVoice 设置.lnk`):
+a local web UI for the settings you will actually keep changing —
+
+* **应用白名单** — add the apps installed on *this* machine (「扫描本机程序」
+  finds them from the Start Menu and App Paths, so WeChat works wherever it was
+  installed), set the spoken Chinese name, the process image, and whether a
+  guest may open it. Say 「打开微信」 on the next utterance — no restart.
+  名字不必说得一字不差:只说一部分(「网易云」)、多说几个字(「微信电脑版」)、
+  或听错一个字都能对上,回复里会念出实际打开的应用;应用名里带「播放/搜索/
+  音量」这类词也不会被别的功能抢走——「打开百度网盘」就是打开网盘。
+  倒装说法同样有效:「把微信打开」。
+* **访客禁开名单** (`tools.sensitive_apps`, default: cmd/powershell).
+* **唤醒词** — takes effect after restarting the assistant.
+* **主人/访客语速、音调** — takes effect after restarting the assistant.
+* **天气城市/开关** — takes effect immediately.
+
+The server binds to 127.0.0.1 with a per-run token, exits by itself a few
+minutes after you close the page, and only ever reads/writes the managed keys
+of `config/config.yaml` (comments in the file are preserved).
+
 ### Requirements
 
 - Windows 10 / 11
@@ -710,9 +732,11 @@ The LLM cannot generate shell commands. It can only invoke the tools below. All 
 | `get_weather` | `city: str` (optional; defaults to `weather.city`) | ❌ | ✅ |
 
 **Speaker tiers are enforced at the tool layer.** `guest` may not read, write or
-run anything (`tools.guest_denied`), and `rejected` may run nothing at all. The
-tier is carried on the `ToolCall` and, for calls arriving from the agent, through
-the in-flight utterance record — so enabling DSH does not widen anyone's access.
+run anything, and `rejected` may run nothing at all. On top of that,
+`tools.sensitive_apps` (default: cmd, powershell; editable in the settings UI)
+is refused below the full tier for `open_app`/`close_app` alike. The tier is
+carried on the `ToolCall` and, for calls arriving from the agent, through the
+in-flight utterance record — so enabling DSH does not widen anyone's access.
 
 **Destructive flow**: spoken confirmation → snapshot target files → execute.
 The call is announced (「我将要写入一个文件，确认请说确认，取消请说取消。」) and the

@@ -405,6 +405,58 @@ class TestUpdate:
         assert len(releases) == 101
         assert len(asked) == 2 and "page=2" in asked[1]
 
+    def test_check_for_update_distinguishes_no_newer_from_failure(self):
+        """
+        `fetch_latest` collapses 「检查成功但没有更新」 and 「检查失败」 into
+        the same None — on the welcome page both then read as
+        「检测不到最新版本号」. `check_for_update` is the version the UI uses:
+        a healthy no-update check must carry a None error.
+        """
+        original = update.urllib.request.urlopen
+        update.urllib.request.urlopen = lambda request, timeout=None: _FakeResponse(b"[]")
+        try:
+            result = update.check_for_update(
+                "0.1.4-dev", api_url="https://api.github.com/repos/o/r/releases/latest")
+        finally:
+            update.urllib.request.urlopen = original
+
+        assert result.info is None
+        assert result.error is None
+
+    def test_check_for_update_reports_the_failure_reason(self):
+        def fake_urlopen(request, timeout=None):
+            raise urllib.error.URLError("name resolution failed")
+
+        original = update.urllib.request.urlopen
+        update.urllib.request.urlopen = fake_urlopen
+        try:
+            result = update.check_for_update(
+                "0.1.4-dev", api_url="https://api.github.com/repos/o/r/releases/latest")
+        finally:
+            update.urllib.request.urlopen = original
+
+        assert result.info is None
+        assert result.error is not None and "name resolution failed" in result.error
+
+    def test_check_for_update_returns_the_newer_release(self):
+        listed = [{
+            "tag_name": "v0.1.5-dev", "draft": False,
+            "assets": [{"name": "WinVoice-Setup-0.1.5-dev.exe",
+                        "browser_download_url": "http://x/setup.exe"}],
+        }]
+
+        original = update.urllib.request.urlopen
+        update.urllib.request.urlopen = (
+            lambda request, timeout=None: _FakeResponse(json.dumps(listed).encode()))
+        try:
+            result = update.check_for_update(
+                "0.1.4-dev", api_url="https://api.github.com/repos/o/r/releases/latest")
+        finally:
+            update.urllib.request.urlopen = original
+
+        assert result.error is None
+        assert result.info is not None and result.info.version == "0.1.5-dev"
+
 
 class _FakeResponse:
     """Stands in for `urlopen` results: chunked reads, dict headers."""

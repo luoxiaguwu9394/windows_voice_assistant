@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WinVoice 设置</title>
+<link rel="stylesheet" href="/static/vendor/fonts/ma-shan-zheng.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="desk">
+  <div class="stage" id="stage">
+
+    <div class="book" id="book">
+
+      <!-- 第 0 张:封面 / 目录 -->
+      <div class="sheet" data-index="0">
+        <div class="face front cover">
+          <div class="cover-frame">
+            <div class="cover-kicker">语音助手使用手册</div>
+            <h1 class="cover-title">WinVoice<br>设置</h1>
+            <div class="cover-rule"></div>
+            <p class="cover-sub">应用白名单 · 唤醒词 · 语速音调 · 天气城市</p>
+            <div class="cover-open-hint">点击翻开</div>
+          </div>
+        </div>
+        <div class="face back page">
+          <div class="page-head"><span class="folio">目录</span></div>
+          <ol class="toc">
+            <li><span class="toc-no">壹</span> 应用白名单 <em>说「打开微信」,谁能开、怎么开</em></li>
+            <li><span class="toc-no">贰</span> 唤醒词 <em>叫它什么,它答应什么</em></li>
+            <li><span class="toc-no">叁</span> 语音 <em>语速与音调</em></li>
+            <li><span class="toc-no">肆</span> 常规 <em>天气与城市</em></li>
+          </ol>
+          <div class="page-note">
+            <p>改动写进 <code>config/config.yaml</code>,注释与手工排版原样保留。</p>
+            <p class="legend"><span class="badge hot">✓ 即时生效</span> 下一次对话就能听到;
+               <span class="badge restart">↻ 重启后生效</span> 的项会如实标注——引擎只在启动时读一次。</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- 第 1 张:应用(右) / 应用说明(左) -->
+      <div class="sheet" data-index="1">
+        <div class="face front page form-page">
+          <div class="page-head"><span class="folio">壹 · 应用白名单</span></div>
+          <div class="row-actions">
+            <button id="scan" type="button">扫描本机程序…</button>
+            <button id="add-app" type="button">手动添加</button>
+          </div>
+          <div id="app-cards" class="app-cards"></div>
+          <button id="add-app-bottom" type="button" class="ghost-add">+ 再添加一个</button>
+        </div>
+        <div class="face back page">
+          <div class="page-head"><span class="folio">壹 · 续</span></div>
+          <p class="prose">内置九个应用——记事本、计算器、资源管理器、命令提示符、
+             命令行窗口、代码编辑器、谷歌浏览器、微软浏览器、系统设置——
+             始终可用,无需登记;它们按 App Paths 与 PATH 自适应,装在哪都能找到。</p>
+          <p class="prose">自定义应用来自开始菜单与 App Paths 的扫描,或手动登记。
+             「启动命令」填绝对路径(装在自定义目录的微信就是这样),或系统能找到的程序名;
+             若启动命令与进程映像不同(如微信的 Weixin.exe),请补映像名,关闭与验证靠它。</p>
+          <h2 class="section-title">访客禁开</h2>
+          <p class="prose">出现在下列名单中的应用,访客一律打不开——默认含命令提示符与命令行窗口。</p>
+          <div id="sensitive-chips" class="chips"></div>
+          <select id="sensitive-add" aria-label="添加访客禁开的应用">
+            <option value="">选择要禁开的应用…</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- 第 2 张:唤醒词 -->
+      <div class="sheet" data-index="2">
+        <div class="face front page form-page">
+          <div class="page-head"><span class="folio">贰 · 唤醒词</span></div>
+          <p class="prose small">每行一个,共 1–8 个,每个 2–12 个字;中英文都可以。</p>
+          <textarea id="kws-input" rows="8" spellcheck="false"></textarea>
+          <p class="page-error" id="kws-error"></p>
+          <p class="page-note"><span class="badge restart">↻ 重启助手后生效</span></p>
+        </div>
+        <div class="face back page">
+          <div class="page-head"><span class="folio">贰 · 续</span></div>
+          <p class="prose">唤醒词由本地 KWS 模型监听,改词不需要联网,也不动模型本身——
+             词表指纹变化时会自动重建发音缓存,重启助手时加载。</p>
+          <p class="prose">挑词的经验:三四个字、声调起伏大、日常口语里少见的组合最稳;
+             太短的词容易被日常对话误唤醒,太长的词喊起来累。</p>
+        </div>
+      </div>
+
+      <!-- 第 3 张:语音 -->
+      <div class="sheet" data-index="3">
+        <div class="face front page form-page">
+          <div class="page-head"><span class="folio">叁 · 语音</span></div>
+          <div class="slider-row">
+            <label>主人语速 <output id="speed-out"></output></label>
+            <input type="range" id="speed" min="0.5" max="2.0" step="0.05">
+          </div>
+          <div class="slider-row">
+            <label>访客语速 <output id="guest-speed-out"></output></label>
+            <input type="range" id="guest-speed" min="0.5" max="2.0" step="0.05">
+          </div>
+          <div class="slider-row">
+            <label>音调 <output id="pitch-out"></output></label>
+            <input type="range" id="pitch" min="0.5" max="2.0" step="0.05">
+          </div>
+          <p class="page-note"><span class="badge restart">↻ 三项都需要重启助手后生效</span></p>
+        </div>
+        <div class="face back page">
+          <div class="page-head"><span class="folio">叁 · 续</span></div>
+          <p class="prose">语速是强杠杆:时长与速度成反比。1.0 ≈ 播报腔,
+             0.9 ≈ 自然对话(当前默认),0.8 往下明显变慢。</p>
+          <p class="prose">音调以模型原声为 1.0:调低偏童声,调高偏中性沉稳。
+             两个旋钮互不影响——语速管快慢,音调管高低。</p>
+          <p class="prose small">访客语速是绝对值,不是相对主人的倍率;
+             单说话人模型下访客只靠它区分音色,别调成和主人一样。</p>
+        </div>
+      </div>
+
+      <!-- 第 4 张:常规 / 空白衬页 -->
+      <div class="sheet" data-index="4">
+        <div class="face front page form-page">
+          <div class="page-head"><span class="folio">肆 · 常规</span></div>
+          <div class="check-row">
+            <label><input type="checkbox" id="weather-enabled"> 启用天气查询</label>
+            <span class="badge hot">✓ 即时生效</span>
+          </div>
+          <div class="field-row">
+            <label for="city">默认城市</label>
+            <input type="text" id="city" placeholder="北京">
+          </div>
+          <p class="prose small">城市只在「今天天气怎么样」这类不带地名的话里使用;
+             你明确说了城市时,以句子里的为准。</p>
+          <p class="prose small">改动保存后即时生效——下一次天气问答就用新城市,
+             连助手都不用动。</p>
+        </div>
+        <div class="face back page">
+          <div class="page-head"><span class="folio">补页</span></div>
+          <p class="prose">这一页特意留白。</p>
+          <p class="prose">用下来的心得、想给助手加的本事、哪句话它总听岔——
+             都值得记在纸上。往后翻是封底。</p>
+        </div>
+      </div>
+
+      <!-- 第 5 张:封底内页 / 封底(朝上收尾) -->
+      <div class="sheet" data-index="5">
+        <div class="face front page endpaper-page">
+          <div class="page-head"><span class="folio">封底内页</span></div>
+          <dl class="colophon-list">
+            <dt>配置文件</dt><dd><code>config/config.yaml</code></dd>
+            <dt>服务日志</dt><dd><code>logs/main.jsonl</code></dd>
+            <dt>版本</dt><dd id="colophon-version">—</dd>
+          </dl>
+          <p class="prose small" style="margin-top: 22px;">用侧边的铅笔写下改动;
+             合上书,一切照旧运行。</p>
+          <button id="close-book" type="button" class="ghost-add">合上书</button>
+        </div>
+        <div class="face back cover-back">
+          <div class="back-blurb">把话说给机器听,<br>它把活儿做给你看。</div>
+          <div class="back-brand">WinVoice</div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- 翻页箭头热区(位置由 --book-w 对齐) -->
+    <button class="nav-arrow left" id="nav-left" aria-label="上一页">‹</button>
+    <button class="nav-arrow right" id="nav-right" aria-label="下一页">›</button>
+
+    <!-- 铅笔:与书脊平行,点它即静默保存 -->
+    <div class="pencil-zone">
+      <span id="status" class="status" role="status"></span>
+      <svg id="pen" class="pencil" viewBox="0 0 44 310" aria-label="保存(点击铅笔)">
+        <g>
+          <rect x="13" y="40" width="18" height="206" fill="#3a6ea8"/>
+          <line x1="18" y1="40" x2="18" y2="246" stroke="#2d5486" stroke-width="1.5"/>
+          <line x1="26" y1="40" x2="26" y2="246" stroke="#5d8ac2" stroke-width="1.5"/>
+          <path d="M13 246 L31 246 L22 282 Z" fill="#e0c194"/>
+          <path d="M19.5 274 L24.5 274 L22 292 Z" fill="#3a3a3a"/>
+          <rect x="13" y="24" width="18" height="16" fill="#b8bcc4"/>
+          <rect x="14" y="6" width="16" height="16" rx="6" fill="#e08f8f"/>
+        </g>
+      </svg>
+    </div>
+  </div>
+</div>
+
+<!-- 扫描弹层 -->
+<div id="scan-modal" class="modal hidden">
+  <div class="modal-card">
+    <h2>扫描本机程序</h2>
+    <p class="hint">来自开始菜单与 App Paths 注册表;卸载器等已自动过滤。</p>
+    <div id="scan-results" class="scan-results">正在扫描…</div>
+    <div class="row-actions">
+      <button id="scan-add" class="primary" type="button">添加所选</button>
+      <button id="scan-close" type="button">取消</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/vendor/gsap.min.js"></script>
+<script src="/static/flipbook.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

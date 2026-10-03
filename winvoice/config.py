@@ -40,7 +40,8 @@ HOT_RELOADABLE: Set[str] = {
     "llm.ask.max_chars",
     "llm.ask.max_tokens",
     "llm.ask.timeout_s",
-    "tools.whitelist",
+    "tools.apps",
+    "tools.sensitive_apps",
     # Read when a confirmation is armed / a search is intercepted, so the
     # window and the ask-first behaviour tune without a restart.
     "tools.confirm_timeout_s",
@@ -135,7 +136,6 @@ REQUIRES_RESTART: Set[str] = {
     "tts.trim_silence",
     "tts.trim_ratio",
     "tts.trim_guard_ms",
-    "tools.guest_denied",
     "tools.destructive",
     "tools.confirm_required",
     # Read once when the executor and the MCP server are constructed, so a change
@@ -281,11 +281,32 @@ class ConfigManager:
         if not self.config_path.exists():
             raise FileNotFoundError(f"Config not found: {self.config_path}")
 
-        with open(self.config_path, "r", encoding="utf-8") as f:
-            raw = f.read()
+        # `utf-8-sig` over `utf-8`: users edit this file with Notepad and patch
+        # it with PowerShell — both routinely leave a BOM (EF BB BF) that plain
+        # utf-8 turns into a ParserError at line 1 and a dead assistant.
+        try:
+            with open(self.config_path, "r", encoding="utf-8-sig") as f:
+                raw = f.read()
+        except UnicodeDecodeError as error:
+            # A GBK/ANSI save (Notepad's default "ANSI" on a Chinese system)
+            # is not recoverable here — say so instead of a codec traceback.
+            raise ValueError(
+                f"配置文件不是有效的 UTF-8：{self.config_path}\n"
+                f"  多半是被记事本以 ANSI/GBK 保存过。请用「重新配置」重新生成，"
+                f"或以 UTF-8（无 BOM）重新保存。\n  原始错误：{error}"
+            ) from error
 
-        expanded = os.path.expandvars(raw)
-        self._config = yaml.safe_load(expanded) or {}
+        try:
+            expanded = os.path.expandvars(raw)
+            self._config = yaml.safe_load(expanded) or {}
+        except yaml.YAMLError as error:
+            raise ValueError(
+                f"配置文件 YAML 无法解析：{self.config_path}\n"
+                f"  {error}\n"
+                f"  最近一次手工编辑（记事本 / PowerShell Set-Content）常是原因："
+                f"中文 Windows 下它们可能改变编码或破坏缩进。"
+                f"可重跑安装器选「重新配置此安装」重新生成（模型与声纹保留）。"
+            ) from error
 
         unresolved = self._find_unresolved(self._config)
         tolerated: List[str] = []
@@ -303,11 +324,26 @@ class ConfigManager:
         if tolerated:
             for path in tolerated:
                 self._blank_out(path)
-            _log.warning(
-                "config: unresolved env var(s) %s ignored because the owning "
-                "section is disabled; substituted empty string",
-                ", ".join(tolerated),
-            )
+            # The project logger renders to stdout. A stdlib-logging warning
+            # here lands on stderr, and Windows PowerShell 5.1 wraps every
+            # stderr line of `native.exe 2>&1 | Tee-Object` into a red
+            # NativeCommandError — a benign startup note read as a failure.
+            # (config.py cannot import .logging at module level: logging
+            # imports config.) The stdlib fallback keeps working when even the
+            # lazy import is impossible.
+            try:
+                from .logging import get_logger  # noqa: PLC0415 - see above
+
+                get_logger(__name__).warning(
+                    "config_unresolved_env_vars_tolerated",
+                    paths=", ".join(tolerated),
+                )
+            except Exception:
+                _log.warning(
+                    "config: unresolved env var(s) %s ignored because the owning "
+                    "section is disabled; substituted empty string",
+                    ", ".join(tolerated),
+                )
 
     @staticmethod
     def _find_unresolved(config: Dict[str, Any], prefix: str = "") -> List[str]:

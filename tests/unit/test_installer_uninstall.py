@@ -285,14 +285,22 @@ class TestUninstall:
             directory = work / f"folder{index}"
             directory.mkdir()
             (directory / shortcuts.SHORTCUT_NAME).write_text("", encoding="utf-8")
+            # The settings shortcut exists wherever the assistant one does,
+            # except Startup (it never autostarts).
+            if folder != shortcuts.FOLDER_STARTUP:
+                (directory / shortcuts.SETTINGS_SHORTCUT_NAME).write_text("", encoding="utf-8")
             folders[folder] = directory
         monkeypatch.setattr(uninstall, "special_folder", lambda folder: folders[folder])
 
         removed = uninstall._remove_shortcuts(lambda _m: None)
 
-        assert len(removed) == 3
-        assert all(not (directory / shortcuts.SHORTCUT_NAME).exists()
-                   for directory in folders.values())
+        assert len(removed) == 5
+        for index, folder in enumerate(
+                (shortcuts.FOLDER_DESKTOP, shortcuts.FOLDER_STARTMENU, shortcuts.FOLDER_STARTUP)):
+            directory = folders[folder]
+            assert not (directory / shortcuts.SHORTCUT_NAME).exists()
+            if folder != shortcuts.FOLDER_STARTUP:
+                assert not (directory / shortcuts.SETTINGS_SHORTCUT_NAME).exists()
 
     def test_a_missing_shortcut_is_not_an_error(self, work, monkeypatch):
         monkeypatch.setattr(uninstall, "special_folder", lambda folder: work)

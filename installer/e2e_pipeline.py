@@ -11,7 +11,8 @@ Steps verified:
   2. default config rendering (boots before any user input)
   3. model step idempotency (download_models --only skips present files)
   4. user config rendering (wake words / city / devices / DSH / cloud switch)
-  5. DSH bridge install via the bundled runtime (no PATH `dsh` needed)
+  5. DSH bridge install via the bundled runtime (--prefer-bundled ignores any
+     PATH `dsh`, so the bundled branch is what actually gets exercised)
   6. `python -m winvoice --check` exit code 0 against the generated config
   7. install marker + shortcuts module importability
 """
@@ -101,7 +102,7 @@ def main() -> int:
     backups = list((INSTALL / "config").glob("config.yaml.bak-*"))
     assert len(backups) == 1, "existing config was not backed up"
 
-    step(5, "DSH bridge install (bundled runtime, no PATH dsh)")
+    step(5, "DSH bridge install (bundled runtime, PATH dsh ignored)")
     lines: list = []
     code = flow.install_dsh(INSTALL, state, on_line=lambda line: lines.append(line))
     for line in lines[-6:]:

@@ -1,0 +1,276 @@
+/* WinVoice 设置手册 — 一本横线笔记本(视觉 v3)。
+ * 交互架构仿 howtotalktowhitekidsaboutracism.com(GSAP 时间线 + 拖拽擦洗,
+ * 库在 vendor/);纸面则是笔记本语言:横线、红色页边线、楷体手写、
+ * 段首空两格;保存 = 书旁的一支钢笔,点笔即在书上书写。零构建,零图片资产。 */
+
+:root {
+  --desk-1: #1a1410;
+  --desk-2: #0a0705;
+  --paper: #fbf7ea;
+  --paper-deep: #f3ecd8;
+  --rule: rgba(88, 124, 170, .22);        /* 横线 */
+  --margin-line: rgba(200, 90, 70, .45);  /* 红色页边线 */
+  --ink: #2b3350;                          /* 钢笔蓝黑 */
+  --ink-soft: #6f6a58;
+  --cover-1: #26365c;
+  --cover-2: #16203a;
+  --gilt: #c9a86a;
+  --seal: #b5442d;
+  --ok: #2f7d4f;
+  --warn: #9a6b1f;
+  --line: #d8d0ba;
+  --hand: "Ma Shan Zheng", "Kaiti SC", "KaiTi", STKaiti, "楷体", "Noto Serif SC", serif;
+  --sans: "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: radial-gradient(130% 100% at 50% 24%, #241b12 0%, var(--desk-1) 45%, var(--desk-2) 100%);
+  color: var(--ink);
+  font-family: var(--hand);
+  overflow: hidden;
+}
+
+.desk { height: 100vh; position: relative; }
+.desk::before {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: radial-gradient(46% 60% at 50% 38%, rgba(255, 214, 150, .13), transparent 70%);
+}
+.desk::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: radial-gradient(120% 120% at 50% 50%, transparent 55%, rgba(0,0,0,.55) 100%);
+}
+.desk { display: flex; align-items: center; justify-content: center; }
+
+/* ── 舞台:合上的书居中;打开后书脊对中(JS 管 translateX)──── */
+.stage {
+  position: relative;
+  width: 980px; height: 660px;
+  transform-origin: center center;
+}
+/* 封底内衬:布面包着一张衬纸 */
+
+.book {
+  position: absolute; left: 50%; top: 40px;
+  width: var(--book-w, 420px); height: 580px;
+  transform-style: preserve-3d; perspective: 2600px;
+}
+.book.turning .page { pointer-events: none; }
+.book.dragging { cursor: grabbing; }
+.book.dragging .face { user-select: none; }
+
+.sheet {
+  position: absolute; inset: 0;
+  transform-origin: left center;
+  transform-style: preserve-3d;
+  will-change: transform;
+}
+.face {
+  position: absolute; inset: 0; overflow: hidden;
+  backface-visibility: hidden;
+  border-radius: 2px 7px 7px 2px;
+}
+.face.back { transform: rotateY(180deg); }
+
+/* ── 笔记本纸面:横线(字压在线上)+ 红页边线 + 纸纹 ─────────── */
+.page {
+  background-image:
+    linear-gradient(100deg, rgba(70,50,25,.13), rgba(70,50,25,.02) 10%, transparent 18%, transparent 86%, rgba(70,50,25,.10) 97%),
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2'/></filter><rect width='240' height='240' filter='url(%23n)'/></svg>"),
+    repeating-linear-gradient(180deg, transparent 0 27px, var(--rule) 27px 28px),
+    linear-gradient(180deg, #fcf8ee, #f5eeda);
+  background-origin: border-box, border-box, content-box, border-box;
+  padding: 30px 32px 24px 62px;
+  box-shadow: inset -3px 0 10px rgba(90, 68, 40, .10), inset 0 0 34px rgba(115, 90, 55, .12);
+}
+/* 红色页边线 + 纸纹 */
+.page::before {
+  content: ""; position: absolute; top: 0; bottom: 0; left: 48px; width: 1px;
+  background: var(--margin-line);
+  box-shadow: 1px 0 0 rgba(200, 90, 70, .18);
+  pointer-events: none;
+}
+.page::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: #221a10; opacity: var(--flip-shade, 0);
+}
+.sheet { box-shadow: 0 12px 30px rgba(0,0,0,.45); }
+
+.page-head {
+  display: flex; align-items: baseline;
+  border-bottom: 1px double var(--margin-line);
+  margin: 0 0 16px -14px; padding: 0 0 8px 14px;
+}
+.folio { color: var(--ink-soft); font-size: 14px; letter-spacing: .2em; }
+
+/* 手写体正文:段首空两格,字落在横线上 */
+.prose {
+  font-size: 16px; line-height: 28px; margin: 0 0 14px;
+  text-align: justify; text-indent: 2em;
+}
+.prose.small { font-size: 14px; color: var(--ink-soft); }
+.section-title { font-size: 16px; margin: 18px 0 8px; letter-spacing: .06em; text-indent: 0; }
+.page-note { margin-top: 14px; font-family: var(--hand); }
+.page-note .prose, .page-note p { text-indent: 0; }
+.page-error { color: #a33; font-size: 14px; min-height: 20px; margin: 6px 0; }
+
+code {
+  background: rgba(120,96,60,.12); border-radius: 4px;
+  font: 13px/1.4 Consolas, monospace; padding: 1px 6px;
+}
+
+/* ── 封面(笔记本布面 + 松紧带)────────────────────────────── */
+.cover {
+  background:
+    repeating-linear-gradient(45deg, rgba(255,255,255,.022) 0 2px, transparent 2px 4px),
+    repeating-linear-gradient(-45deg, rgba(0,0,0,.03) 0 2px, transparent 2px 4px),
+    radial-gradient(130% 110% at 24% 6%, rgba(120,140,190,.20), transparent 52%),
+    linear-gradient(155deg, var(--cover-1), var(--cover-2));
+  color: #e9e2cf; cursor: pointer;
+  box-shadow: inset 0 0 80px rgba(0,0,0,.38);
+}
+.cover-frame {
+  position: absolute; inset: 18px;
+  border: 1px solid rgba(201,168,106,.5); outline: 1px solid rgba(201,168,106,.2);
+  outline-offset: 6px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  text-align: center; padding: 20px 56px 20px 20px;
+}
+.cover-kicker { letter-spacing: .5em; font-size: 13px; color: var(--gilt); text-indent: .5em; }
+.cover-title {
+  font-size: 46px; font-weight: normal; margin: 20px 0 12px; line-height: 1.2;
+  text-shadow: 0 2px 14px rgba(0,0,0,.45); font-family: var(--hand);
+}
+.cover-rule { width: 70px; height: 1px; background: linear-gradient(to right, transparent, var(--gilt), transparent); margin: 8px 0 18px; }
+.cover-sub { font-size: 14px; color: rgba(233,226,207,.78); letter-spacing: .14em; }
+.cover-open-hint { margin-top: 46px; font-size: 13px; color: var(--gilt); letter-spacing: .32em;
+                   animation: breathe 2.6s ease-in-out infinite; }
+@keyframes breathe { 0%,100% { opacity: .4 } 50% { opacity: 1 } }
+
+/* ── 目录 ───────────────────────────────────────────────────── */
+.toc { list-style: none; margin: 8px 0 0; padding: 0; }
+.toc li { border-bottom: 1px dotted var(--line); padding: 12px 2px; font-size: 16px; }
+.toc em { color: var(--ink-soft); font-style: normal; font-size: 13px; float: right; margin-top: 4px; }
+.toc-no {
+  color: #fff; background: var(--seal); border-radius: 3px;
+  display: inline-block; width: 25px; height: 25px; line-height: 25px;
+  text-align: center; margin-right: 12px; font-size: 13px;
+}
+
+/* ── 表单(手写体,写在本子上)────────────────────────────── */
+.form-page input, .form-page select, .form-page textarea,
+input[type="text"], select, textarea {
+  background: rgba(255,255,255,.55); border: none;
+  border-bottom: 1px dashed rgba(120, 100, 70, .45);
+  color: var(--ink); font: 15px/1.5 var(--hand); padding: 2px 8px; width: 100%;
+}
+textarea { resize: vertical; line-height: 28px; }
+input:focus, textarea:focus, select:focus { outline: none; border-bottom: 1px solid var(--seal); }
+input[type="range"] { accent-color: var(--seal); width: 100%; padding: 0; }
+
+button {
+  background: rgba(255,255,255,.4); border: 1px solid var(--line); border-radius: 5px;
+  color: var(--ink); cursor: pointer; font: 14px var(--hand); padding: 5px 13px;
+}
+button:hover { border-color: var(--seal); color: var(--seal); }
+button.primary { background: var(--seal); border-color: var(--seal); color: #fff; }
+.ghost-add { width: 100%; margin-top: 10px; border-style: dashed; color: var(--ink-soft); }
+
+.row-actions { display: flex; gap: 8px; margin: 4px 0 12px; }
+
+.app-cards { display: flex; flex-direction: column; gap: 10px; max-height: 366px; overflow: auto; padding-right: 3px; }
+.app-card {
+  background: rgba(255,255,255,.5); border: 1px solid var(--line); border-radius: 7px;
+  padding: 9px 11px; display: grid; grid-template-columns: 1fr 16px; gap: 5px 10px;
+}
+.app-card .app-main { display: grid; grid-template-columns: 94px 1fr; gap: 6px; align-items: center; }
+.app-card .app-extra { grid-column: 1 / -1; display: grid; grid-template-columns: 94px 1fr auto auto; gap: 6px; align-items: center; }
+.app-card .app-extra input[type="text"] { font-size: 14px; }
+.app-card .app-extra .guest-label { font-size: 13.5px; color: var(--ink-soft); display: flex; gap: 5px; align-items: center; white-space: nowrap; }
+.app-card .delete { border: none; color: #a33; font-size: 15px; padding: 2px 6px; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 7px; margin: 8px 0; }
+.chip { align-items: center; background: rgba(255,255,255,.5); border: 1px solid var(--line);
+  border-radius: 13px; display: inline-flex; gap: 6px; padding: 2px 10px; font-size: 13.5px; }
+.chip button { border: none; color: #a33; padding: 0; font-size: 13px; }
+#sensitive-add { max-width: 280px; }
+
+.slider-row { margin: 20px 0; }
+.slider-row label { display: flex; justify-content: space-between; font-size: 15px; margin-bottom: 7px; }
+.slider-row output { color: var(--seal); font-variant-numeric: tabular-nums; }
+.check-row { align-items: center; display: flex; gap: 12px; margin: 16px 0; font-size: 15px; }
+.field-row { align-items: center; display: flex; gap: 12px; margin: 14px 0; }
+.field-row input { max-width: 220px; }
+.field-row label { font-size: 15px; }
+
+.badge { border-radius: 10px; display: inline-block; font-size: 12.5px; padding: 1px 8px; font-family: var(--hand); }
+.badge.hot { background: rgba(47,125,79,.14); color: var(--ok); }
+.badge.restart { background: rgba(154,107,31,.16); color: var(--warn); }
+
+/* ── 封底(最后一张纸的背面:朝上收尾)──────────────────────── */
+.cover-back {
+  background:
+    repeating-linear-gradient(45deg, rgba(255,255,255,.022) 0 2px, transparent 2px 4px),
+    radial-gradient(130% 110% at 24% 6%, rgba(120,140,190,.18), transparent 52%),
+    linear-gradient(155deg, var(--cover-1), var(--cover-2));
+  color: #e9e2cf;
+  box-shadow: inset 0 0 80px rgba(0,0,0,.38);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+}
+.colophon-list dt { color: var(--ink-soft); font-size: 14px; margin-top: 10px; }
+.colophon-list dd { margin: 2px 0 0; font-size: 15px; }
+
+.back-blurb {
+  font-size: 22px; line-height: 2; text-align: center; letter-spacing: .1em;
+  color: rgba(233,226,207,.85);
+}
+.back-brand {
+  margin-top: 34px; font-size: 15px; letter-spacing: .5em; text-indent: .5em;
+  color: var(--gilt); text-orientation: upright; writing-mode: vertical-rl;
+  max-height: 150px;
+}
+
+/* ── 箭头 ───────────────────────────────────────────────────── */
+.nav-arrow {
+  position: absolute; top: 296px; z-index: 40;
+  width: 54px; height: 54px; border-radius: 50%;
+  background: rgba(246,239,223,.04); border: 1px solid rgba(246,239,223,.16);
+  color: rgba(246,239,223,.55);
+  font-size: 26px; font-family: var(--serif, Georgia, serif); cursor: pointer;
+  transition: all .25s ease;
+}
+.nav-arrow:hover { color: #f6efdf; border-color: rgba(201,168,106,.6); background: rgba(201,168,106,.08); }
+.nav-arrow.left { left: calc(50% - var(--book-w, 420px) - 92px); }
+.nav-arrow.right { left: calc(50% + var(--book-w, 420px) + 38px); }
+
+/* ── 铅笔:书右侧,与书脊平行;点它即静默保存 ────────────────── */
+.pencil-zone {
+  position: absolute; left: calc(50% + var(--book-w, 420px) + 26px); top: 150px;
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  pointer-events: none;
+}
+.pencil {
+  width: 40px; height: 310px; cursor: pointer; pointer-events: auto;
+  filter: drop-shadow(6px 10px 12px rgba(0,0,0,.55));
+  transition: filter .2s ease;
+}
+.pencil:hover { filter: drop-shadow(8px 12px 16px rgba(0,0,0,.7)) brightness(1.12); }
+.pencil:active { filter: drop-shadow(4px 6px 8px rgba(0,0,0,.6)); }
+.status {
+  color: rgba(246,239,223,.9); font: 14px/1.6 var(--hand);
+  width: 190px; text-align: center; text-shadow: 0 1px 3px rgba(0,0,0,.4);
+}
+.status.err { color: #e5a09a; }
+
+/* ── 弹层 ───────────────────────────────────────────────────── */
+.modal { align-items: center; background: rgba(0,0,0,.55); display: flex; inset: 0; position: fixed; z-index: 50; }
+.modal.hidden { display: none; }
+.modal-card { background: var(--paper); border-radius: 10px; max-height: 72vh; max-width: 620px;
+  overflow: auto; padding: 18px 22px; width: 90%; box-shadow: 0 30px 80px rgba(0,0,0,.55); }
+.modal-card h2 { font-size: 17px; margin: 0 0 6px; font-family: var(--hand); }
+.scan-results { display: flex; flex-direction: column; gap: 4px; margin: 12px 0; max-height: 320px; overflow: auto; }
+.scan-results label { display: flex; gap: 8px; align-items: center; padding: 4px 2px; }
+.scan-results .path { color: var(--ink-soft); font-size: 12.5px; }
+.hint { color: var(--ink-soft); font-size: 13.5px; }

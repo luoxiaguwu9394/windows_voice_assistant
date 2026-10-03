@@ -277,8 +277,12 @@ def profile_mtime_ns(install_dir: Path) -> Optional[int]:
 def install_dsh(install_dir: Path, state: InstallState, on_line: LINE_CALLBACK,
                 cancel: Cancel = None) -> int:
     python = embedded_python(install_dir)
+    # --prefer-bundled: the staged .pylibs runtime is the version the plugin
+    # grammar was validated against; a dsh on the user's PATH could be any
+    # version, and on dev machines it would also mask the bundled route from
+    # the e2e pipeline.
     return run_streaming(
-        [str(python), "scripts/install_dsh_bridge.py", "--install"],
+        [str(python), "scripts/install_dsh_bridge.py", "--install", "--prefer-bundled"],
         cwd=install_dir, on_line=on_line, env=update_env(state), cancel=cancel,
     )
 

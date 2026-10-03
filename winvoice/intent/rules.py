@@ -233,6 +233,53 @@ _PATH_ARGUMENT_INTENTS: tuple[IntentName, ...] = (
 
 
 # ──────────────────────────────────────────────────────────────
+# App-name aware opening (checked before every other family)
+# ──────────────────────────────────────────────────────────────
+
+# An utterance that *begins* by asking to open something that is actually on
+# the app list must outrank the whole table, because the name itself may
+# contain another family's trigger words — 「打开百度网盘」 was answered by the
+# search tool, 「打开VLC media player」 pressed play, 「打开音量控制台」 raised
+# the volume, and 「打开文件管理器」 reached read_file (which then read the
+# fragment 「管理器」 as a file). The check is narrow on purpose: it fires only
+# when the captured name resolves against the live app table, and it steps
+# aside for an explicit search verb (「打开浏览器搜索天气」 is a search).
+# 百度 counts as a search word only in the weak tier that this check
+# overrides — it is also half of 百度网盘.
+_OPEN_LEAD = r"^(?:帮我|请|麻烦|给我|我要|我想|现在|快|来)?(?:打开|启动|open|launch|start)"
+_OPEN_INVERTED = r"^把(.+?)(?:打开|启动)(?:(?:一下|吧|了|啦))*$"
+_STRONG_SEARCH = r"用浏览器|搜索|搜一下|搜一搜|google|bing|\bsearch\b"
+
+
+def _open_target(text: str) -> Optional[str]:
+    """
+    The app named by an "open X" / "把 X 打开" sentence, or None.
+
+    Only returns a name `resolve_app` accepts, so a sentence the app table
+    does not recognise falls through to the normal order and the classifier
+    still gets its chance. The tools import is lazy: the rule tier must stay
+    usable (and importable) without the tools package.
+    """
+    if re.search(_STRONG_SEARCH, text, re.IGNORECASE):
+        return None
+    match = re.match(rf"{_OPEN_LEAD}\s*(?:一下)?\s*(.+?)\s*[，,。.!！?？]*$", text, re.IGNORECASE)
+    if not match:
+        match = re.match(_OPEN_INVERTED, text)
+    if not match:
+        return None
+    name = match.group(1).strip(" ，,。.!！?？")
+    if not name:
+        return None
+    try:
+        from winvoice.tools.builtin import resolve_app
+    except Exception:  # pragma: no cover - tools unavailable in a bare install
+        return None
+    # Strict mode: no partial-name matching here, or a generic 「文件」 would
+    # steal 「打开文件」 from READ_FILE, whose rules are deliberate.
+    return name if resolve_app(name, partial=False) else None
+
+
+# ──────────────────────────────────────────────────────────────
 # Weather city extraction
 # ──────────────────────────────────────────────────────────────
 
@@ -246,6 +293,12 @@ _WEATHER_NOISE = (
 # Rejecting is safe — the configured city is the default answer — whereas a
 # wrong city silently gives the user a forecast for the wrong place.
 _WEATHER_NOT_A_CITY = set("看查问帮我知道想要了解说讲下吗呢么呀的了")
+
+# A candidate that *starts* with a command verb is the verb half of a sentence
+# like 「打开天气预报」, not a place: the 2-4 character window in front of
+# 「天气」 grabbed 「打开」 and wttr.in was asked about the city 打开. Matched on
+# the word, not single characters — 开封 and 嘉峪关 are real places.
+_WEATHER_VERB_HEAD = re.compile(r"^(?:打开|关闭|启动|运行|退出|播放|暂停|开启|帮我|请)")
 
 
 # A city named in a weather question is the run of characters immediately
@@ -309,6 +362,8 @@ def _weather_city(text: str) -> Optional[str]:
     candidate = re.sub(rf"(?:{_WEATHER_NOISE})+$", "", candidate).strip(" 的.")
     if not candidate or any(ch in _WEATHER_NOT_A_CITY for ch in candidate):
         return None
+    if _WEATHER_VERB_HEAD.match(candidate):
+        return None
     return candidate
 
 
@@ -347,6 +402,17 @@ def match_rules(text: str) -> Optional[IntentResult]:
     Returns IntentResult if matched, None otherwise.
     """
     text_lower = text.lower()
+
+    open_target = _open_target(text)
+    if open_target:
+        return IntentResult(
+            trace_id="",
+            intent=IntentName.OPEN_APP,
+            args={"app": open_target},
+            confidence=0.95,
+            source="rules",
+            raw_text=text,
+        )
 
     for intent in _PATH_ARGUMENT_INTENTS:
         if _matches(intent, text_lower):

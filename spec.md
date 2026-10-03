@@ -135,9 +135,11 @@ call `read_file` / `write_file` / `run_script`; `rejected` cannot call anything;
 and the read-only queries (`get_time`, `get_weather`) remain available to a guest,
 as their `guest_allowed=True` registration always claimed.
 
-🔶 Two gaps remain, both in the README's Known limitations: there is still no
-sensitive-app list, so a guest may open any allowlisted app; and a guest can reach
-the cloud tier if `dsh.cloud.guest_allowed` is turned on.
+✅ **The sensitive-app list exists (2026-09-29).** `tools.sensitive_apps` (default
+`[cmd, powershell]`) is enforced in `ToolRegistry.validate_call`: below the full
+tier, `open_app`/`close_app` on a listed id are refused, and the settings UI
+edits the list. One gap remains from this paragraph: a guest can still reach the
+cloud tier if `dsh.cloud.guest_allowed` is turned on.
 
 🔶 **The tier crosses a process boundary.** Because the DSH agent runs tools in a
 process DSH spawns, the audio process publishes the in-flight tier to
@@ -238,8 +240,8 @@ and no 2 s deadline beyond the client's 60 s HTTP timeout.
 
 | Tool | Arguments | Destructive | Guest |
 |------|-----------|-------------|-------|
-| `open_app` 🔶 | `app: str` — allowlisted id or Chinese name, fuzzy-matched (`记事本`, `notepad`, `Notpa` all resolve) | ❌ | Non-sensitive only ⛔ |
-| `close_app` 🔶 | `app: str` — as above; `force: bool` optional, force only on an explicit 「强制关闭」 request | ❌ | Non-sensitive only ⛔ |
+| `open_app` | `app: str` — built-in id/Chinese label, fuzzy-matched (`记事本`, `notepad`, `Notpa` all resolve), plus `tools.apps` entries from the settings UI (absolute paths + optional process image) | ❌ | Non-sensitive only ✅ (`tools.sensitive_apps`) |
+| `close_app` | `app: str` — as above; `force: bool` optional, force only on an explicit 「强制关闭」 request | ❌ | Non-sensitive only ✅ (`tools.sensitive_apps`) |
 | `set_volume` 🔶 | `delta: int` (relative) **or** `level: int` 0–100 (absolute); at least one required | ❌ | ✅ |
 | `media_control` | `action: Enum[play,pause,next,prev]` | ❌ | ✅ |
 | `search_web` 🔶 | `query: str` — percent-encoded; the voice path asks 「你要我搜索…吗？」 first (`tools.search_web_confirm`), the agent's MCP path opens directly | ❌ | ✅ |
@@ -824,6 +826,7 @@ PowerShell helper.
 | TTS speech is Chinese-only (§8) | English in any spoken string is dropped |
 | A guest's voice is the owner's voice at a different pace (single-speaker Matcha model) | the tier is not audible as a different voice (§8.2) |
 | Playback diagnostics see application PCM and WASAPI loopback, but not acoustic phone-mic clicks; the repeat check compares 20 ms frames | sub-ms transients can be averaged away; a phone recording alone cannot locate whether the speaker, room, or phone/mic produced the click |
+| Opening a custom app whose name contains another intent's keyword was claimed by that intent (`打开百度网盘` searched the web, `打开VLC media player` pressed play, `打开音量控制台` raised the volume, `打开文件管理器` answered 「没有找到这个文件」; the inverted 把微信打开 carried no name) — ✅ **fixed 2026-10-01**: the rule tier now resolves the name against the live app table first (strict mode; explicit search verbs and 「打开文件」 step aside), and app names tolerate a slip or a fragment (`tests/unit/test_rules_app_names.py`) | the wrong action ran silently instead of opening the app; resolved |
 
 ### Verified numbers (2026-09-19, this machine)
 | Metric | Value |

@@ -335,6 +335,18 @@ class ToolRegistry:
         if tier == "rejected":
             return "Speaker rejected"
 
+        # Sensitive applications: below the full tier, whatever
+        # `tools.sensitive_apps` names may be neither opened nor closed,
+        # regardless of the app table's guest flags. Resolved through the same
+        # table the handlers use, so a spoken name and its id cannot disagree
+        # (the error string keeps the executor's tier-refusal wording).
+        if tier != "full" and tool in (ToolName.OPEN_APP, ToolName.CLOSE_APP) and "app" in args:
+            from .builtin import current_apps, resolve_app, sensitive_app_ids
+
+            app_id = resolve_app(str(args["app"]))
+            if app_id and app_id in current_apps() and app_id in sensitive_app_ids():
+                return f"Tool {tool.value} not allowed for guest tier: {app_id} is sensitive"
+
         # Schema validation (basic)
         for required in spec.schema.required:
             if required not in args:
